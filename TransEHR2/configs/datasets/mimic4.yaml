@@ -1,0 +1,78 @@
+# MIMIC-IV Dataset Configuration
+# Configuration file for extracting and preprocessing MIMIC-IV data
+
+# Data directory containing fold subdirectories with CSV listfiles
+DATA_DIR: "/uhome/pr3/projects/p60290_2/TransEHR2/data"
+
+# Path to variable properties YAML file
+VARIABLE_PROPERTIES_PATH: "/uhome/pr3/projects/p60290_2/TransEHR2/data/variable_properties.yaml"
+
+# Feature definitions
+VALUED_FEATS:
+  - "Diastolic arterial blood pressure"
+  - "Glucose" 
+  - "Heart rate"
+  - "Height"
+  - "Mean arterial blood pressure"
+  - "Respiration rate"
+  - "SpO2"
+  - "Systolic arterial blood pressure"
+  - "Temperature"
+  - "Weight"
+
+EVENT_FEATS:
+  - "Albumin"
+  - "ALP"
+  - "ALT"
+  - "Arterial pCO2"
+  - "Arterial pH"
+  - "Arterial pO2"
+  - "AST"
+  - "Bicarbonate"
+  - "Blood urea nitrogen"
+  - "Capillary refill rate"
+  - "Fraction inspired oxygen"
+  - "GCS eye opening"
+  - "GCS motor response"
+  - "GCS verbal response"
+  - "Hematocrit"
+  - "Hemoglobin"
+  - "Lactate"
+  - "Lactate dehydrogenase"
+  - "Platelet count"
+  - "Serum creatinine"
+  - "Serum magnesium"
+  - "Serum sodium"
+  - "SaO2"
+  - "Total bilirubin"
+  - "Total cholesterol"
+  - "Troponin I"
+  - "Troponin T"
+  - "Urine output"
+  - "Venous pCO2"
+  - "Venous pO2"
+  - "White blood cell count"
+
+TEXT_FEATS:
+  - "Discharge Summary"
+  - "Diagnosis Descriptions"
+
+STATIC_FEATS:
+  - "Age"
+  - "Gender"
+
+# Data preprocessing parameters
+# Maximum number of timesteps per episode (default: 500)
+MAX_EPISODE_LEN_STEPS: 500
+
+# Maximum number of timesteps in patient history (default: 5000)
+MAX_HISTORY_LEN_STEPS: 5000
+
+# Minimum episode length in timesteps for inclusion (default: 10)
+MIN_EPISODE_LEN_STEPS: 10
+
+# Minimum episode length in hours for inclusion (default: 48)
+MIN_EPISODE_LEN_HOURS: 48
+
+# Maximum episode length in hours for inclusion (default: 48)
+MAX_EPISODE_LEN_HOURS: 48

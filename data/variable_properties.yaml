@@ -1,0 +1,198 @@
+Diastolic arterial blood pressure:
+  type: numeric
+  size: 1
+  category_map: {}
+Glucose:
+  type: numeric
+  size: 1
+  category_map: {}
+Heart rate:
+  type: numeric
+  size: 1
+  category_map: {}
+Mean arterial blood pressure:
+  type: numeric
+  size: 1
+  category_map: {}
+SpO2:
+  type: numeric
+  size: 1
+  category_map: {}
+Respiration rate:
+  type: numeric
+  size: 1
+  category_map: {}
+Systolic arterial blood pressure:
+  type: numeric
+  size: 1
+  category_map: {}
+Temperature:
+  type: numeric
+  size: 1
+  category_map: {}
+Height:
+  type: numeric
+  size: 1
+  category_map: {}
+Weight:
+  type: numeric
+  size: 1
+  category_map: {}
+Albumin:
+  type: numeric
+  size: 1
+  category_map: {}
+ALP:
+  type: numeric
+  size: 1
+  category_map: {}
+ALT:
+  type: numeric
+  size: 1
+  category_map: {}
+Arterial pCO2:
+  type: numeric
+  size: 1
+  category_map: {}
+Arterial pH:
+  type: numeric
+  size: 1
+  category_map: {}
+Arterial pO2:
+  type: numeric
+  size: 1
+  category_map: {}
+AST:
+  type: numeric
+  size: 1
+  category_map: {}
+Bicarbonate:
+  type: numeric
+  size: 1
+  category_map: {}
+Blood urea nitrogen:
+  type: numeric
+  size: 1
+  category_map: {}
+Capillary refill rate:
+  type: numeric
+  size: 1
+  category_map: {}
+Fraction inspired oxygen:
+  type: numeric
+  size: 1
+  category_map: {}
+GCS eye opening:
+  type: categorical
+  size: 1
+  category_map:
+    0: 1
+    1: 2
+    2: 3
+    3: 4
+GCS motor response:
+  type: categorical
+  size: 1
+  category_map:
+    0: 1
+    1: 2
+    2: 3
+    3: 4
+    4: 5
+    5: 6
+GCS verbal response:
+  type: categorical
+  size: 1
+  category_map:
+    0: 1
+    1: 2
+    2: 3
+    3: 4
+    4: 5
+Hematocrit:
+  type: numeric
+  size: 1
+  category_map: {}
+Hemoglobin:
+  type: numeric
+  size: 1
+  category_map: {}
+Lactate:
+  type: numeric
+  size: 1
+  category_map: {}
+Lactate dehydrogenase:
+  type: numeric
+  size: 1
+  category_map: {}
+Platelet count:
+  type: numeric
+  size: 1
+  category_map: {}
+Serum creatinine:
+  type: numeric
+  size: 1
+  category_map: {}
+Serum magnesium:
+  type: numeric
+  size: 1
+  category_map: {}
+Serum sodium:
+  type: numeric
+  size: 1
+  category_map: {}
+SaO2:
+  type: numeric
+  size: 1
+  category_map: {}
+Total bilirubin:
+  type: numeric
+  size: 1
+  category_map: {}
+Total cholesterol:
+  type: numeric
+  size: 1
+  category_map: {}
+Troponin I:
+  type: numeric
+  size: 1
+  category_map: {}
+Troponin T:
+  type: numeric
+  size: 1
+  category_map: {}
+Urine output:
+  type: numeric
+  size: 1
+  category_map: {}
+Venous pCO2:
+  type: numeric
+  size: 1
+  category_map: {}
+Venous pO2:
+  type: numeric
+  size: 1
+  category_map: {}
+White blood cell count:
+  type: numeric
+  size: 1
+  category_map: {}
+Discharge Summary:
+  type: text
+  size: 1
+  category_map: {}
+Diagnosis Descriptions:
+  type: text
+  size: 1
+  category_map: {}
+Gender:
+  type: categorical
+  size: 1
+  category_map:
+    0: Other
+    1: F
+    2: M
+Age:
+  type: numeric
+  size: 1
+  category_map: {}
