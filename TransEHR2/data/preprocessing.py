@@ -14,7 +14,7 @@ from transformers import AutoTokenizer
 from typing import Any, Dict, List, Optional, Tuple, Union
 from warnings import warn
 
-from TransEHR2.constants import HF_API_TOKEN, LLM_NAME, TOKENIZER_PAD_TOKEN
+from TransEHR2.constants import HF_API_TOKEN, LLM_NAME, MAX_TOKEN_LENGTH, TOKENIZER_PAD_TOKEN
 from TransEHR2.data.custom_types import EventAssociatedDataEntry, StaticDataEntry, ValueAssociatedDataEntry
 from TransEHR2.data.custom_types import MixedTensorDataset
 from TransEHR2.data.datareaders import MIMICDataReader
@@ -24,7 +24,7 @@ from TransEHR2.data.datasets import MixedDataset
 
 class LlamaTextProcessor:
 
-    def __init__(self, model_name: str = LLM_NAME, max_length: int = 4096):
+    def __init__(self, model_name: str = LLM_NAME, max_length: int = MAX_TOKEN_LENGTH):
         """
         Initialize the LLAMA text processor.
         
