@@ -894,7 +894,6 @@ def extract_mimic(
     print(f"Processing {total_episodes} episodes using {n_workers} workers...")
 
     # Create partial function with fixed arguments
-    from functools import partial
     process_fn = partial(
         _process_single_episode,
         reader=reader,
@@ -911,24 +910,23 @@ def extract_mimic(
     all_static_data = []
     all_target_data = []
     ids = []
+    n_episodes_ignored = 0
     
     with mp.Pool(processes=n_workers, initializer=_init_worker, initargs=(max_ts_len,)) as pool:
-        results = list(tqdm(
-            pool.imap(process_fn, range(total_episodes)),
+        for result in tqdm(
+            pool.imap(process_fn, range(total_episodes), chunksize=10),
             total=total_episodes,
             desc=f"Extracting {suffix} patient records from {reader.data_root_path}"
-        ))
-    
-    # Filter out None results and collect data
-    n_episodes_ignored = sum(1 for r in results if r is None)
-    for result in results:
-        if result is not None:
-            i, val_data, event_data, static_data, targets = result
-            ids.append(i)
-            all_val_data.append(val_data)
-            all_event_data.append(event_data)
-            all_static_data.append(static_data)
-            all_target_data.append(targets)
+        ):
+            if result is None:
+                n_episodes_ignored += 1
+            else:
+                i, val_data, event_data, static_data, targets = result
+                ids.append(i)
+                all_val_data.append(val_data)
+                all_event_data.append(event_data)
+                all_static_data.append(static_data)
+                all_target_data.append(targets)
     
     print(f"Extracted records from {total_episodes-n_episodes_ignored} ICU stay episodes, ignored {n_episodes_ignored} "
           f"episodes that didn't meet filtering criteria.")
