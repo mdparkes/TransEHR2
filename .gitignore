@@ -65,6 +65,8 @@ Thumbs.db
 # Project Specific
 # ======================
 
+.cache/
+
 # mimic4dataprep library
 mimic4dataprep/
 
