@@ -807,6 +807,8 @@ def extract_mimic(
     n_episodes_ignored = 0  # For reporting
     tqdm_desc = f"Extracting {suffix} patient records from {reader.data_root_path}"
 
+    processor = DataProcessor(max_timeseries_length=max_ts_len, tokenizer=LlamaTextProcessor())
+
     for i in tqdm(range(total_episodes), desc=tqdm_desc):
         # Unpack the extracted data for the i-th patient-episode
         _, statics, val_data, event_data, text_data, targets = reader[i]
@@ -862,8 +864,6 @@ def extract_mimic(
                                 for col in val_data.columns]
 
         # Get numeric value-associated timeseries data for the current patient-episode
-        processor = DataProcessor(max_timeseries_length=max_ts_len, tokenizer=LlamaTextProcessor())
-
         val_data = processor('value', val_data, reader.valued_feats + reader.text_feats)
         event_data = processor('event', event_data, reader.event_feats)
         static_data = processor('static', statics, reader.static_feats)
