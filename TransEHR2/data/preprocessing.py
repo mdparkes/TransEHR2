@@ -1,3 +1,4 @@
+import multiprocessing as mp
 import numpy as np
 import os
 import pandas as pd
@@ -7,6 +8,7 @@ import torch
 import yaml
 
 from collections import namedtuple
+from functools import partial
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, default_collate
 from tqdm import tqdm
@@ -20,6 +22,8 @@ from TransEHR2.data.custom_types import MixedTensorDataset
 from TransEHR2.data.datareaders import MIMICDataReader
 from TransEHR2.data.datasets import MixedDataset
 
+
+_worker_processor = None  # Global variable to hold DataProcessor instance in each worker in parallel processing
 
 
 class LlamaTextProcessor:
@@ -758,6 +762,90 @@ def filter_timeseries_records(
     return numeric_data, event_data, text_data
 
 
+def _init_worker(max_timeseries_length: int):
+    """Initialize worker process with a DataProcessor instance."""
+    global _worker_processor
+    _worker_processor = DataProcessor(max_timeseries_length, tokenizer=LlamaTextProcessor())
+
+
+def _process_single_episode(
+    i: int,
+    reader: MIMICDataReader,
+    max_history_len_steps: int,
+    max_episode_len_steps: int,
+    max_episode_len_hours: Optional[int],
+    min_episode_len_steps: Optional[int],
+    min_episode_len_hours: Optional[int]
+) -> Optional[Tuple[int, dict, dict, list, dict]]:
+    """Process a single patient episode using the worker's processor."""
+    
+    global _worker_processor
+    processor = _worker_processor
+    
+    try:
+        _, statics, val_data, event_data, text_data, targets = reader[i]
+        targets = dict(zip(['mortality', 'length_of_stay', 'phenotype'], [np.array(t) for t in targets]))
+        
+        # ...existing filtering and processing logic...
+        
+        # Skip episodes with length of stay < minimum number of hours
+        if min_episode_len_hours is not None:
+            if targets['length_of_stay'] < min_episode_len_hours:
+                return None
+
+        # Skip episodes with fewer than minimum records
+        if min_episode_len_steps is not None:
+            min_timestamp = np.timedelta64(0, 'h')
+            if max_episode_len_hours is not None:
+                max_timestamp = np.timedelta64(max_episode_len_hours, 'h')
+                if text_data is not None:
+                    merged = val_data.merge(text_data, how='outer', left_index=True, right_index=True)
+                    is_current_record = (min_timestamp <= merged.index) & (merged.index < max_timestamp)
+                else:
+                    is_current_record = (min_timestamp <= val_data.index) & (val_data.index < max_timestamp)
+            else:
+                if text_data is not None:
+                    merged = val_data.merge(text_data, how='outer', left_index=True, right_index=True)
+                    is_current_record = (min_timestamp <= merged.index)
+                else:
+                    is_current_record = (min_timestamp <= val_data.index)
+            n_current_records = is_current_record.sum()
+            if n_current_records < min_episode_len_steps:
+                return None
+        
+        # Resample value-associated data
+        val_data = val_data.set_index(val_data.index.ceil('h')).resample('1h', closed='right', label='right').mean()
+        val_data = val_data.dropna(axis=0, how='all')
+
+        val_data, event_data, text_data = filter_timeseries_records(
+            val_data, event_data, text_data, max_history_len_steps, max_episode_len_steps, max_episode_len_hours
+        )
+
+        if text_data is not None:
+            val_data = val_data.merge(text_data, how='outer', left_index=True, right_index=True)
+            val_data.columns = [col.rsplit('_', 1)[0] if col.endswith(('_left', '_right')) else col 
+                                for col in val_data.columns]
+
+        val_data = processor('value', val_data, reader.valued_feats + reader.text_feats)
+        event_data = processor('event', event_data, reader.event_feats)
+        static_data = processor('static', statics, reader.static_feats)
+
+        # Normalize length of stay
+        if max_episode_len_hours is not None:
+            targets['length_of_stay'] = targets['length_of_stay'] - max_episode_len_hours
+        else:
+            max_val_ts_timestamp = max(val_data['times'])
+            max_event_ts_timestamp = max(event_data['times'])
+            max_observed_timestamp = max(max_val_ts_timestamp, max_event_ts_timestamp)
+            targets['length_of_stay'] = targets['length_of_stay'] - max_observed_timestamp
+
+        return (i, val_data, event_data, static_data, targets)
+        
+    except Exception as e:
+        print(f"Error processing episode {i}: {e}")
+        return None
+
+
 def extract_mimic(
         reader: MIMICDataReader, 
         suffix: str,
@@ -766,7 +854,8 @@ def extract_mimic(
         max_history_len_steps: int = 0,
         min_episode_len_steps: Optional[int] = 10,
         min_episode_len_hours: Optional[int] = 48,
-        max_episode_len_hours: Optional[int] = 48
+        max_episode_len_hours: Optional[int] = 48,
+        n_workers: Optional[int] = None
 ) -> None:
     """
     Reads MIMIC ICU stay timeseries data from CSV files and pickles it in a format compatible with downstream predictive models. The pickled object is a dictionary with five keys: 'id', which is a list of patient-episode IDs; 'val_data', which stores value-associated data; 'event_data', which stores event-associated data; 'static_data', which stores time-invariant patient parameters; and 'targets', which stores in-hospital mortality, length of stay, and phenotype data for downstream prediction. This function trims the data contained in the CSV files to the desired records, extracts them, and standardizes the values of value-associated data (see the `standardize_feats` function) before dumping the restructured data to disk.
@@ -785,6 +874,8 @@ def extract_mimic(
             included in the dataset. Defaults to 48. If None, there is no restriction on the minimum length of ICU stay.
         max_episode_len_hours (int, optional): The latest timestamp, in hours, which can be included in the extracted 
             data. For example, if `max_episode_len_hours` is set to 48 (the default), only the records collected within the first 48 hours of the ICU stay are included. If None, all records will be included subject to the other restrictions.
+        n_workers (int, optional): The number of parallel worker processes to use for data extraction. If None, 
+            defaults to 1.
     """
     
     if not os.path.exists(output_dir):
@@ -793,98 +884,52 @@ def extract_mimic(
     if reader.prediction_task != 'all':
         raise ValueError(f'reader.prediction_task: Expected "all", got {reader.prediction_task}')
 
-    total_episodes = len(reader.patient_episode_ids)  # Total number of ICU stays across all patients
+    total_episodes = len(reader.patient_episode_ids)
     max_ts_len = max_history_len_steps + max_episode_len_steps
 
-    # Initialize the lists of patient-episode data
-    # For timeseries these are lists of dictionaries containing all the data from a single episode.
+    # Set number of workers
+    if n_workers is None:
+        n_workers = 1
+    
+    print(f"Processing {total_episodes} episodes using {n_workers} workers...")
+
+    # Create partial function with fixed arguments
+    from functools import partial
+    process_fn = partial(
+        _process_single_episode,
+        reader=reader,
+        max_history_len_steps=max_history_len_steps,
+        max_episode_len_steps=max_episode_len_steps,
+        max_episode_len_hours=max_episode_len_hours,
+        min_episode_len_steps=min_episode_len_steps,
+        min_episode_len_hours=min_episode_len_hours
+    )
+
+    # Process episodes in parallel with per-worker processor initialization
     all_val_data = []
     all_event_data = []
     all_static_data = []
     all_target_data = []
-
-    ids = []  # Indices of patient-episode IDs that survive filtering
-    n_episodes_ignored = 0  # For reporting
-    tqdm_desc = f"Extracting {suffix} patient records from {reader.data_root_path}"
-
-    processor = DataProcessor(max_timeseries_length=max_ts_len, tokenizer=LlamaTextProcessor())
-
-    for i in tqdm(range(total_episodes), desc=tqdm_desc):
-        # Unpack the extracted data for the i-th patient-episode
-        _, statics, val_data, event_data, text_data, targets = reader[i]
-        targets = dict(zip(['mortality', 'length_of_stay', 'phenotype'], [np.array(t) for t in targets]))
-        
-        # Skip episodes with length of stay < minimum number of hours
-        if min_episode_len_hours is not None:
-            if targets['length_of_stay'] < min_episode_len_hours:
-                n_episodes_ignored += 1
-                continue
-
-        # Skip episodes with fewer than 10 value-associated records collected within the time limit during the episode
-        # This must include text-associated features because they will eventually become numeric embeddings
-        if min_episode_len_steps is not None:
-            min_timestamp = np.timedelta64(0, 'h')
-            if max_episode_len_hours is not None:
-                max_timestamp = np.timedelta64(max_episode_len_hours, 'h')
-                if text_data is not None:
-                    merged = val_data.merge(text_data, how='outer', left_index=True, right_index=True)
-                    is_current_record = (min_timestamp <= merged.index) & (merged.index < max_timestamp)
-                else:
-                    is_current_record = (min_timestamp <= val_data.index) & (val_data.index < max_timestamp)
-            else:
-                if text_data is not None:
-                    merged = val_data.merge(text_data, how='outer', left_index=True, right_index=True)
-                    is_current_record = (min_timestamp <= merged.index)
-                else:
-                    is_current_record = (min_timestamp <= val_data.index)
-            n_current_records = is_current_record.sum()
-            if n_current_records < min_episode_len_steps:
-                n_episodes_ignored += 1
-                continue
-        
-        ids.append(i)  # Store the indices of patient-episode IDs that survive filtering
-        
-        # Resample value-associated data to hourly means calculated over the previous hour
-        val_data = val_data.set_index(val_data.index.ceil('h')).resample('1h', closed='right', label='right').mean()
-        val_data = val_data.dropna(axis=0, how='all')  # Drop rows only if all values are missing
-
-        val_data, event_data, text_data = filter_timeseries_records(
-            val_data, event_data, text_data, max_history_len_steps, max_episode_len_steps, max_episode_len_hours
-        )
-
-        # Could argue that the filter_timeseries_records function should output the merged val_data directly, thereby
-        # eliminating a redundant merge operation, but I prefer it when the filter function returns filtered versions
-        # of the input dataframes.
-        if text_data is not None:
-            # Merge text and numeric value-associated data on timestamps
-            val_data = val_data.merge(text_data, how='outer', left_index=True, right_index=True)
-            # Convert merged column names back to original feature names by removing the left/right suffixes
-            # The filter function ensured that there are no overlapping columns between the numeric and text data
-            val_data.columns = [col.rsplit('_', 1)[0] if col.endswith(('_left', '_right')) else col 
-                                for col in val_data.columns]
-
-        # Get numeric value-associated timeseries data for the current patient-episode
-        val_data = processor('value', val_data, reader.valued_feats + reader.text_feats)
-        event_data = processor('event', event_data, reader.event_feats)
-        static_data = processor('static', statics, reader.static_feats)
-        
-
-        # Normalize the length of stay
-        if max_episode_len_hours is not None:
-            targets['length_of_stay'] = targets['length_of_stay'] - max_episode_len_hours
-        else:
-            # Get the max timesteps for normalizing LOS if max_episode_len_hours is None
-            max_val_ts_timestamp = max(val_data['times'])
-            max_event_ts_timestamp = max(event_data['times'])
-            max_observed_timestamp = max(max_val_ts_timestamp, max_event_ts_timestamp)
-            targets['length_of_stay'] = targets['length_of_stay'] - max_observed_timestamp
-
-        # Append the list of records for this episode
-        all_val_data.append(val_data)
-        all_event_data.append(event_data)
-        all_static_data.append(static_data)
-        all_target_data.append(targets)
-        
+    ids = []
+    
+    with mp.Pool(processes=n_workers, initializer=_init_worker, initargs=(max_ts_len,)) as pool:
+        results = list(tqdm(
+            pool.imap(process_fn, range(total_episodes)),
+            total=total_episodes,
+            desc=f"Extracting {suffix} patient records from {reader.data_root_path}"
+        ))
+    
+    # Filter out None results and collect data
+    n_episodes_ignored = sum(1 for r in results if r is None)
+    for result in results:
+        if result is not None:
+            i, val_data, event_data, static_data, targets = result
+            ids.append(i)
+            all_val_data.append(val_data)
+            all_event_data.append(event_data)
+            all_static_data.append(static_data)
+            all_target_data.append(targets)
+    
     print(f"Extracted records from {total_episodes-n_episodes_ignored} ICU stay episodes, ignored {n_episodes_ignored} "
           f"episodes that didn't meet filtering criteria.")
 

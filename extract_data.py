@@ -107,5 +107,6 @@ if __name__ == "__main__":
                 max_history_len_steps=MAX_HISTORY_LEN_STEPS,
                 min_episode_len_steps=MIN_EPISODE_LEN_STEPS,
                 min_episode_len_hours=MIN_EPISODE_LEN_HOURS,
-                max_episode_len_hours=MAX_EPISODE_LEN_HOURS
+                max_episode_len_hours=MAX_EPISODE_LEN_HOURS,
+                n_workers=2  # Adjust according to your system capabilities
             )
