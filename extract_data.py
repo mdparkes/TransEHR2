@@ -46,6 +46,10 @@ if __name__ == "__main__":
         '--n_examples', '-n', type=int, default=None,
         help="Number of examples to process. If not specified, all examples will be processed."
     )
+    parser.add_argument(
+        '--n_workers', '-w', type=int, default=1,
+        help="Number of parallel worker processes to use for data extraction. Default is 1."
+    )
     args = vars(parser.parse_args())
     n_examples = args['n_examples']
     with open(args['dataset_config'], 'r') as f_in:
@@ -108,5 +112,5 @@ if __name__ == "__main__":
                 min_episode_len_steps=MIN_EPISODE_LEN_STEPS,
                 min_episode_len_hours=MIN_EPISODE_LEN_HOURS,
                 max_episode_len_hours=MAX_EPISODE_LEN_HOURS,
-                n_workers=2  # Adjust according to your system capabilities
+                n_workers=args['n_workers']
             )
