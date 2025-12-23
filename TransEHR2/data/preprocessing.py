@@ -35,7 +35,7 @@ class LlamaTextProcessor:
 
         # Use local files to avoid making too many requests and hitting rate limits
         try:
-            self.tokenizer = AutoTokenizer.from_pretrained(model_name, token=HF_API_TOKEN, local_file_only=True)
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name, token=HF_API_TOKEN, local_files_only=True)
         except OSError:
             self.tokenizer = AutoTokenizer.from_pretrained(model_name, token=HF_API_TOKEN)
 
