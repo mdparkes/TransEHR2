@@ -32,6 +32,13 @@ class LlamaTextProcessor:
             model_name (str): The LLAMA model name to use for tokenization
             max_length (int): Maximum sequence length for tokenized text
         """
+
+        # Use local files to avoid making too many requests and hitting rate limits
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name, token=HF_API_TOKEN, local_file_only=True)
+        except OSError:
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name, token=HF_API_TOKEN)
+
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, token=HF_API_TOKEN)
         self.tokenizer.add_special_tokens({'pad_token': TOKENIZER_PAD_TOKEN})
         self.max_length = max_length

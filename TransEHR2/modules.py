@@ -17,11 +17,20 @@ class GradientTraceableLLM(torch.nn.Module):
 
         super().__init__()
         # Initialize the model on CPU to avoid GPU memory issues during FSDP wrapping
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            model_name, 
-            token=HF_API_TOKEN, 
-            device_map='cpu'
-        )
+        # Try to load from local files to avoid hitting rate limits on Hugging Face
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                model_name, 
+                token=HF_API_TOKEN, 
+                device_map='cpu',
+                local_files_only=True
+            )
+        except OSError:
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                model_name,
+                token=HF_API_TOKEN,
+                device_map='cpu'
+            )
         # Using add_special_tokens so that pad_token_id is set automatically
         self.tokenizer.add_special_tokens({'pad_token': TOKENIZER_PAD_TOKEN})
         self.model = AutoModel.from_pretrained(
