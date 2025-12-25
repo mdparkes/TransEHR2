@@ -4,6 +4,7 @@ import os
 import pandas as pd
 import pickle
 import re
+import sys
 import torch
 import yaml
 
@@ -655,21 +656,26 @@ def standardize_feats(
     """
 
     if load_path is not None:
-        # Load the 5th, 95th, and 50th percentiles and means of feature values
+        # Load the 5th, 95th percentiles and means of feature values
         data = np.load(load_path) 
         p5 = data['p5']
         p95 = data['p95']
         means = data['means']
     else:
-        num_ind_data = []  # EpisodeList[TimstepList[FeatList[np.ndarray]]]
-        num_val_data = []  # EpisodeList[TimstepList[FeatList[np.ndarray]]]
+        num_ind_data = []  # EpisodeList[TimestepList[FeatList[np.ndarray]]]
+        num_val_data = []  # EpisodeList[TimestepList[FeatList[np.ndarray]]]
         for episode in x:
             num_ind_data.append(episode['numeric']['indicators'])
             num_val_data.append(episode['numeric']['values'])
 
         n_features = len(num_val_data[0][0])  # Number of features is the same for all records
-        feature_vals = []  # Initialize a list to hold concatenated values of each feature across all records
         
+        # Pre-allocate arrays to avoid memory fragmentation
+        means = np.zeros(n_features)
+        p5 = np.zeros(n_features)
+        p95 = np.zeros(n_features)
+        
+        # Process one feature at a time to minimize memory usage
         for i in range(n_features):
             obs_values = []  # Store (feat_dim, ) value arrays for feature i across all episodes and timesteps
             # Iterate over patient-episodes
@@ -678,16 +684,22 @@ def standardize_feats(
                 for record_indicators, record_values in zip(episode_indicators, episode_values):
                     if record_indicators[i] == 1:  # Only append values of features that were actually observed
                         obs_values.append(record_values[i])
-            # Concatenate the values into an array with shape (total_feature_observations, feature_dim)
-            # Append the concatenated array for feature ft to the values list
-            feature_vals.append(np.stack(obs_values, axis=0) if obs_values else np.array([]))
-        
-        # Calculate the means of the feature values
-        means = np.array([np.mean(values, axis=0) for values in feature_vals])
-        # Calculate the 5th and 95th percentiles of the L2 norms of the feature values
-        norms = [np.linalg.norm(values, ord=2, axis=1) for values in feature_vals]
-        p5 = np.array([np.percentile(n, 5, axis=0) for n in norms])
-        p95 = np.array([np.percentile(n, 95, axis=0) for n in norms])
+            
+            if obs_values:
+                # Stack and compute statistics immediately, then discard the array
+                obs_array = np.stack(obs_values, axis=0)
+                means[i] = np.mean(obs_array)
+                norms = np.linalg.norm(obs_array, ord=2, axis=0 if obs_array.ndim > 1 else None)
+                if np.isscalar(norms):
+                    norms = np.array([norms])
+                p5[i] = np.percentile(norms, 5)
+                p95[i] = np.percentile(norms, 95)
+                # Free memory immediately
+                del obs_array, obs_values, norms
+            else:
+                means[i] = 0
+                p5[i] = 0
+                p95[i] = 0
 
     if save_path is not None:
         # Save arrays of feature-wise percentiles and means to a .npz file
@@ -927,13 +939,22 @@ def extract_mimic(
                 all_event_data.append(event_data)
                 all_static_data.append(static_data)
                 all_target_data.append(targets)
-    
+    print(f"DEBUG: Pool context exited. Processing results...", flush=True)
+    sys.stdout.flush()
+
     print(f"Extracted records from {total_episodes-n_episodes_ignored} ICU stay episodes, ignored {n_episodes_ignored} "
           f"episodes that didn't meet filtering criteria.")
+    sys.stdout.flush()
+
+    print(f"DEBUG: Converting patient episode IDs...", flush=True)
+    sys.stdout.flush()
 
     # Restrict the data to the patient-episode IDs that survived filtering
     patient_episode_ids = np.array(reader.patient_episode_ids)[ids]
     patient_episode_ids = patient_episode_ids.tolist()
+    
+    print(f"DEBUG: Starting standardization...", flush=True)
+    sys.stdout.flush()
 
     # Standardize the numeric value-associated data
     # NOTE: Xu et al. standardized the training, validation, and test set data each with their own summary statistics,
@@ -943,6 +964,8 @@ def extract_mimic(
     # summary statistics for the unseen data, the training set is larger and better approximates the true distribution.
     summary_statistic_path = os.path.join(output_dir, 'summary_statistics_train.npz')
     if suffix == 'train':
+        print(f"DEBUG: Calculating smmary statistics...", flush=True)
+        sys.stdout.flush()
         # Calculate summary statistics for the training set data and write to disk
         all_val_data = standardize_feats(all_val_data, save_path=summary_statistic_path)
     else:
@@ -952,8 +975,14 @@ def extract_mimic(
                 'set data, but summary_statistics_train.npz was not found. Please run the training data extraction '
                 'first to generate the summary statistics.'
             )
+        print(f"DEBUG: Loading and applying summary statistics...", flush=True)
+        sys.stdout.flush()
         # Standardize the validation and test set data using the summary statistics calculated from the training set
         all_val_data = standardize_feats(all_val_data, load_path=summary_statistic_path)
+
+
+    print(f"DEBUG: Writing to disk...", flush=True)
+    sys.stdout.flush()
 
     # Write to disk
     file_out = os.path.join(output_dir, f'{suffix}.pkl')
