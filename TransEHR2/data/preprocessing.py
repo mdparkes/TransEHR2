@@ -939,23 +939,14 @@ def extract_mimic(
                 all_event_data.append(event_data)
                 all_static_data.append(static_data)
                 all_target_data.append(targets)
-    print(f"DEBUG: Pool context exited. Processing results...", flush=True)
-    sys.stdout.flush()
-
     print(f"Extracted records from {total_episodes-n_episodes_ignored} ICU stay episodes, ignored {n_episodes_ignored} "
           f"episodes that didn't meet filtering criteria.")
-    sys.stdout.flush()
-
-    print(f"DEBUG: Converting patient episode IDs...", flush=True)
     sys.stdout.flush()
 
     # Restrict the data to the patient-episode IDs that survived filtering
     patient_episode_ids = np.array(reader.patient_episode_ids)[ids]
     patient_episode_ids = patient_episode_ids.tolist()
     
-    print(f"DEBUG: Starting standardization...", flush=True)
-    sys.stdout.flush()
-
     # Standardize the numeric value-associated data
     # NOTE: Xu et al. standardized the training, validation, and test set data each with their own summary statistics,
     # but instead I use the summary statistics from the training data for everything. This makes more sense because
@@ -964,7 +955,7 @@ def extract_mimic(
     # summary statistics for the unseen data, the training set is larger and better approximates the true distribution.
     summary_statistic_path = os.path.join(output_dir, 'summary_statistics_train.npz')
     if suffix == 'train':
-        print(f"DEBUG: Calculating smmary statistics...", flush=True)
+        print(f"Calculating smmary statistics...", flush=True)
         sys.stdout.flush()
         # Calculate summary statistics for the training set data and write to disk
         all_val_data = standardize_feats(all_val_data, save_path=summary_statistic_path)
@@ -975,14 +966,10 @@ def extract_mimic(
                 'set data, but summary_statistics_train.npz was not found. Please run the training data extraction '
                 'first to generate the summary statistics.'
             )
-        print(f"DEBUG: Loading and applying summary statistics...", flush=True)
+        print(f"Loading and applying summary statistics...", flush=True)
         sys.stdout.flush()
         # Standardize the validation and test set data using the summary statistics calculated from the training set
         all_val_data = standardize_feats(all_val_data, load_path=summary_statistic_path)
-
-
-    print(f"DEBUG: Writing to disk...", flush=True)
-    sys.stdout.flush()
 
     # Write to disk
     file_out = os.path.join(output_dir, f'{suffix}.pkl')
