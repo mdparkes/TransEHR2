@@ -37,7 +37,6 @@ class GradientTraceableLLM(torch.nn.Module):
             model_name,
             token=HF_API_TOKEN,
             device_map='cpu'
-            # Note: Using default dtype (float32) to ensure consistency with FSDP
         )
         # Resize to account for padding token
         self.model.resize_token_embeddings(len(self.tokenizer))

@@ -43,8 +43,6 @@ class LlamaTextProcessor:
             self.tokenizer = AutoTokenizer.from_pretrained(model_name, token=HF_API_TOKEN, local_files_only=True)
         except OSError:
             self.tokenizer = AutoTokenizer.from_pretrained(model_name, token=HF_API_TOKEN)
-
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, token=HF_API_TOKEN)
         self.tokenizer.add_special_tokens({'pad_token': TOKENIZER_PAD_TOKEN})
         self.max_length = max_length
 
