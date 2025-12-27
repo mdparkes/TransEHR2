@@ -21,7 +21,7 @@ from TransEHR2.constants import HF_API_TOKEN, LLM_NAME, MAX_TOKEN_LENGTH, TOKENI
 from TransEHR2.data.custom_types import EventAssociatedDataEntry, StaticDataEntry, ValueAssociatedDataEntry
 from TransEHR2.data.custom_types import MixedTensorDataset
 from TransEHR2.data.datareaders import MIMICDataReader
-from TransEHR2.data.datasets import MixedDataset
+from TransEHR2.data.datasets import MixedDataset, HDF5Dataset
 
 
 _worker_processor = None  # Global variable to hold DataProcessor instance in each worker in parallel processing
@@ -1062,6 +1062,83 @@ def prepare_dataloaders(
             )
         )
 
+    return dataloader_list
+
+
+def prepare_dataloaders_hdf5(
+    data_dir: str,
+    batch_size: int,
+    preload: bool = True,
+    pretrain_ratio: Optional[float] = None,
+    collate_fn: Optional[callable] = None,
+    num_workers: int = 0,
+    pin_memory: bool = False,
+    prefetch_factor: int = 2
+) -> List:
+    """
+    Prepare training, validation, and test dataloaders using HDF5 datasets.
+    
+    This is a drop-in replacement for prepare_dataloaders that uses HDF5 files instead of pickle files, which is far more efficient for large datasets.
+    
+    Args:
+        data_dir (str): Directory containing .h5 files
+        batch_size (int): Batch size for DataLoader
+        preload (bool): If True (default), load all data into RAM at initialization. Much faster than pickle and 
+            eliminates per-batch I/O. Set to False only if RAM is limited.
+        pretrain_ratio (float): Ratio of training data for pretraining (not yet supported)
+        collate_fn (callable): Custom collate function
+        num_workers (int): Number of worker processes for data loading. With preload=True, workers share data via 
+            copy-on-write after fork.
+        pin_memory (bool): Whether to pin memory for faster GPU transfer
+        prefetch_factor (int): Number of batches to prefetch per worker
+        
+    Returns:
+        List of DataLoader instances
+    """
+    from torch.utils.data import DataLoader
+    
+    if pretrain_ratio is not None:
+        raise NotImplementedError(
+            "pretrain_ratio is not yet supported with HDF5 datasets. "
+            "Consider creating separate pretrain/train HDF5 files."
+        )
+    
+    datasets = {}
+    
+    for partition in ['train', 'val', 'test']:
+        h5_path = os.path.join(data_dir, f'{partition}.h5')
+        
+        if not os.path.exists(h5_path):
+            if partition == 'val':
+                datasets['val'] = None
+                continue
+            else:
+                raise FileNotFoundError(f'{partition}.h5 not found in {data_dir}')
+        
+        datasets[partition] = HDF5Dataset(h5_path, preload=preload)
+    
+    datasets_list = [datasets['train']]
+    
+    if datasets['val'] is not None:
+        datasets_list.append(datasets['val'])
+    
+    datasets_list.append(datasets['test'])
+    
+    dataloader_list = []
+    for ds in datasets_list:
+        dataloader_list.append(
+            DataLoader(
+                ds,
+                batch_size=batch_size,
+                shuffle=True,
+                collate_fn=collate_fn,
+                num_workers=num_workers,
+                pin_memory=pin_memory,
+                prefetch_factor=prefetch_factor if num_workers > 0 else None,
+                persistent_workers=num_workers > 0
+            )
+        )
+    
     return dataloader_list
 
 
