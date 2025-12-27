@@ -1,3 +1,4 @@
+import h5py
 import multiprocessing as mp
 import numpy as np
 import os
@@ -1340,3 +1341,433 @@ def collate_as_tensors(
     prepared_batch = prepare_input_tensors(batch, device)
 
     return prepared_batch
+
+
+
+
+def _get_feature_dims_from_config(
+    var_properties_path: str,
+    valued_feats: List[str],
+    event_feats: List[str],
+    text_feats: List[str],
+    static_feats: List[str],
+    max_ts_len_val: int,
+    max_ts_len_event: int,
+    max_token_length: int,
+    phenotype_dim: int
+) -> Dict:
+    """
+    Derive feature dimensions from configuration files.
+    
+    Args:
+        var_properties_path: Path to variable_properties.yaml
+        valued_feats: List of value-associated feature names
+        event_feats: List of event-associated feature names  
+        text_feats: List of text feature names
+        static_feats: List of static feature names
+        max_ts_len_val: Maximum timeseries length for value-associated data
+        max_ts_len_event: Maximum timeseries length for event-associated data
+        max_token_length: Maximum token sequence length for text features
+        phenotype_dim: Number of phenotype labels
+        
+    Returns:
+        Dictionary with all dimension information for HDF5 pre-allocation
+    """
+    with open(var_properties_path, 'r') as f:
+        var_properties = yaml.safe_load(f)
+    
+    # Separate valued_feats into numeric, categorical, text based on their types
+    numeric_feats = []
+    categorical_feats = []
+    for feat in valued_feats:
+        feat_type = var_properties[feat]['type']
+        if feat_type == 'numeric':
+            numeric_feats.append(feat)
+        elif feat_type == 'categorical':
+            categorical_feats.append(feat)
+    
+    # Get dimensions for numeric features
+    n_numeric_feats = len(numeric_feats)
+    numeric_feat_dims = [var_properties[f]['size'] for f in numeric_feats]
+    
+    # Get dimensions for categorical features
+    n_categorical_feats = len(categorical_feats)
+    categorical_feat_dims = [var_properties[f]['size'] for f in categorical_feats]
+    
+    # Get dimensions for text features (token sequences)
+    n_text_feats = len(text_feats)
+    text_feat_dims = [max_token_length for _ in text_feats]
+    
+    # Get dimensions for event features (indicators only, size is always 1)
+    n_event_feats = len(event_feats)
+    
+    # Get dimensions for static features
+    static_feat_dims = []
+    for feat in static_feats:
+        feat_type = var_properties[feat]['type']
+        if feat_type == 'text':
+            static_feat_dims.append(max_token_length)
+        else:
+            static_feat_dims.append(var_properties[feat]['size'])
+    static_total_dim = sum(static_feat_dims)
+    
+    return {
+        'max_ts_len_val': max_ts_len_val,
+        'max_ts_len_event': max_ts_len_event,
+        'n_numeric_feats': n_numeric_feats,
+        'n_categorical_feats': n_categorical_feats,
+        'n_text_feats': n_text_feats,
+        'n_event_feats': n_event_feats,
+        'numeric_feat_dims': numeric_feat_dims,
+        'categorical_feat_dims': categorical_feat_dims,
+        'text_feat_dims': text_feat_dims,
+        'static_total_dim': static_total_dim,
+        'static_feat_dims': static_feat_dims,
+        'phenotype_dim': phenotype_dim,
+    }
+
+
+def _get_phenotype_dim_from_listfile(phenotypes_listfile: str) -> int:
+    """
+    Get the number of phenotype labels from the phenotype listfile header.
+    
+    Args:
+        phenotypes_listfile: Path to phenotyping_<partition>_listfile.csv
+        
+    Returns:
+        Number of phenotype columns (excludes 'stay' and 'period_length' columns)
+    """
+    with open(phenotypes_listfile, 'r') as f:
+        header = f.readline().strip()
+    columns = header.split(',')
+    # Header format: "stay,period_length,<phenotype1>,<phenotype2>,..."
+    # Subtract 2 for 'stay' and 'period_length' columns
+    return len(columns) - 2
+
+
+def _write_to_hdf5(
+    h5_path: str,
+    patient_episode_ids: List,
+    all_val_data: List[Dict],
+    all_event_data: List[Dict],
+    all_static_data: List[List],
+    all_target_data: List[Dict],
+    dims: Dict,
+    compression: str = 'gzip',
+    compression_opts: int = 4
+) -> None:
+    """
+    Write extracted episode data directly to HDF5 format.
+    
+    This is much faster to load than pickle because HDF5 stores contiguous
+    arrays that can be read directly into memory without object reconstruction.
+    
+    Args:
+        h5_path: Output path for the HDF5 file
+        patient_episode_ids: List of episode IDs
+        all_val_data: List of value-associated data dicts
+        all_event_data: List of event-associated data dicts
+        all_static_data: List of static data lists
+        all_target_data: List of target dicts
+        dims: Dictionary with pre-computed dimension information
+        compression: Compression algorithm ('gzip', 'lzf', or None)
+        compression_opts: Compression level (1-9 for gzip)
+    """
+    
+    n_episodes = len(patient_episode_ids)
+    
+    print(f"Writing {n_episodes} episodes to {h5_path}...")
+    sys.stdout.flush()
+    
+    # Compression settings
+    comp_kwargs = {}
+    if compression:
+        comp_kwargs = {'compression': compression, 'compression_opts': compression_opts}
+    
+    with h5py.File(h5_path, 'w') as h5f:
+        # Store metadata
+        meta = h5f.create_group('metadata')
+        meta.attrs['n_episodes'] = n_episodes
+        for key, value in dims.items():
+            if isinstance(value, list):
+                meta.create_dataset(key, data=np.array(value, dtype=np.int32))
+            else:
+                meta.attrs[key] = value
+        
+        # Store IDs
+        if isinstance(patient_episode_ids[0], str):
+            dt = h5py.special_dtype(vlen=str)
+            h5f.create_dataset('ids', data=patient_episode_ids, dtype=dt)
+        else:
+            h5f.create_dataset('ids', data=np.array(patient_episode_ids))
+        
+        # Create groups
+        val_grp = h5f.create_group('val_data')
+        event_grp = h5f.create_group('event_data')
+        
+        # Pre-allocate and fill value-associated data: numeric
+        if dims['n_numeric_feats'] > 0:
+            numeric_grp = val_grp.create_group('numeric')
+            # Indicators: (n_episodes, max_ts_len, n_features)
+            ind_array = np.zeros((n_episodes, dims['max_ts_len_val'], dims['n_numeric_feats']), dtype=np.uint8)
+            for i, val_data in enumerate(all_val_data):
+                for t in range(dims['max_ts_len_val']):
+                    for f in range(dims['n_numeric_feats']):
+                        ind_array[i, t, f] = val_data['numeric']['indicators'][t][f][0]
+            numeric_grp.create_dataset('indicators', data=ind_array, **comp_kwargs)
+            del ind_array
+            
+            # Values: per-feature datasets
+            for f, feat_dim in enumerate(dims['numeric_feat_dims']):
+                val_array = np.zeros((n_episodes, dims['max_ts_len_val'], feat_dim), dtype=np.float32)
+                for i, val_data in enumerate(all_val_data):
+                    for t in range(dims['max_ts_len_val']):
+                        arr = val_data['numeric']['values'][t][f]
+                        val_array[i, t, :len(arr)] = arr
+                numeric_grp.create_dataset(f'values_{f}', data=val_array, **comp_kwargs)
+                del val_array
+        
+        # Pre-allocate and fill value-associated data: categorical
+        if dims['n_categorical_feats'] > 0:
+            categorical_grp = val_grp.create_group('categorical')
+            ind_array = np.zeros((n_episodes, dims['max_ts_len_val'], dims['n_categorical_feats']), dtype=np.uint8)
+            for i, val_data in enumerate(all_val_data):
+                for t in range(dims['max_ts_len_val']):
+                    for f in range(dims['n_categorical_feats']):
+                        ind_array[i, t, f] = val_data['categorical']['indicators'][t][f][0]
+            categorical_grp.create_dataset('indicators', data=ind_array, **comp_kwargs)
+            del ind_array
+            
+            for f, feat_dim in enumerate(dims['categorical_feat_dims']):
+                val_array = np.zeros((n_episodes, dims['max_ts_len_val'], feat_dim), dtype=np.int32)
+                for i, val_data in enumerate(all_val_data):
+                    for t in range(dims['max_ts_len_val']):
+                        arr = val_data['categorical']['values'][t][f]
+                        val_array[i, t, :len(arr)] = arr
+                categorical_grp.create_dataset(f'values_{f}', data=val_array, **comp_kwargs)
+                del val_array
+        
+        # Pre-allocate and fill value-associated data: text
+        if dims['n_text_feats'] > 0:
+            text_grp = val_grp.create_group('text')
+            ind_array = np.zeros((n_episodes, dims['max_ts_len_val'], dims['n_text_feats']), dtype=np.uint8)
+            for i, val_data in enumerate(all_val_data):
+                for t in range(dims['max_ts_len_val']):
+                    for f in range(dims['n_text_feats']):
+                        ind_array[i, t, f] = val_data['text']['indicators'][t][f][0]
+            text_grp.create_dataset('indicators', data=ind_array, **comp_kwargs)
+            del ind_array
+            
+            for f, feat_dim in enumerate(dims['text_feat_dims']):
+                val_array = np.zeros((n_episodes, dims['max_ts_len_val'], feat_dim), dtype=np.int32)
+                mask_array = np.zeros((n_episodes, dims['max_ts_len_val'], feat_dim), dtype=np.uint8)
+                for i, val_data in enumerate(all_val_data):
+                    for t in range(dims['max_ts_len_val']):
+                        arr = val_data['text']['values'][t][f]
+                        val_array[i, t, :len(arr)] = arr
+                        mask = val_data['text']['masks'][t][f]
+                        mask_array[i, t, :len(mask)] = mask
+                text_grp.create_dataset(f'values_{f}', data=val_array, **comp_kwargs)
+                text_grp.create_dataset(f'masks_{f}', data=mask_array, **comp_kwargs)
+                del val_array, mask_array
+        
+        # Value-associated times and masks
+        times_array = np.zeros((n_episodes, dims['max_ts_len_val']), dtype=np.float32)
+        masks_array = np.zeros((n_episodes, dims['max_ts_len_val']), dtype=np.uint8)
+        for i, val_data in enumerate(all_val_data):
+            for t in range(dims['max_ts_len_val']):
+                times_array[i, t] = val_data['times'][t][0]
+                masks_array[i, t] = val_data['masks'][t][0]
+        val_grp.create_dataset('times', data=times_array, **comp_kwargs)
+        val_grp.create_dataset('masks', data=masks_array, **comp_kwargs)
+        del times_array, masks_array
+        
+        # Event-associated data
+        if dims['n_event_feats'] > 0:
+            ind_array = np.zeros((n_episodes, dims['max_ts_len_event'], dims['n_event_feats']), dtype=np.uint8)
+            for i, event_data in enumerate(all_event_data):
+                for t in range(dims['max_ts_len_event']):
+                    for f in range(dims['n_event_feats']):
+                        ind_array[i, t, f] = event_data['indicators'][t][f][0]
+            event_grp.create_dataset('indicators', data=ind_array, **comp_kwargs)
+            del ind_array
+        
+        times_array = np.zeros((n_episodes, dims['max_ts_len_event']), dtype=np.float32)
+        masks_array = np.zeros((n_episodes, dims['max_ts_len_event']), dtype=np.uint8)
+        for i, event_data in enumerate(all_event_data):
+            for t in range(dims['max_ts_len_event']):
+                times_array[i, t] = event_data['times'][t][0]
+                masks_array[i, t] = event_data['masks'][t][0]
+        event_grp.create_dataset('times', data=times_array, **comp_kwargs)
+        event_grp.create_dataset('masks', data=masks_array, **comp_kwargs)
+        del times_array, masks_array
+        
+        # Static data
+        static_array = np.zeros((n_episodes, dims['static_total_dim']), dtype=np.float32)
+        for i, static_data in enumerate(all_static_data):
+            offset = 0
+            for arr in static_data:
+                static_array[i, offset:offset + len(arr)] = arr
+                offset += len(arr)
+        h5f.create_dataset('static_data', data=static_array, **comp_kwargs)
+        del static_array
+        
+        # Targets
+        targets_grp = h5f.create_group('targets')
+        mortality_array = np.zeros(n_episodes, dtype=np.float32)
+        los_array = np.zeros(n_episodes, dtype=np.float32)
+        phenotype_array = np.zeros((n_episodes, dims['phenotype_dim']), dtype=np.float32)
+        for i, targets in enumerate(all_target_data):
+            mortality_array[i] = targets['mortality']
+            los_array[i] = targets['length_of_stay']
+            phenotype_array[i, :] = targets['phenotype']
+        targets_grp.create_dataset('mortality', data=mortality_array, **comp_kwargs)
+        targets_grp.create_dataset('length_of_stay', data=los_array, **comp_kwargs)
+        targets_grp.create_dataset('phenotype', data=phenotype_array, **comp_kwargs)
+    
+    print(f"HDF5 file written: {h5_path}")
+
+
+def extract_mimic_hdf5(
+        reader: MIMICDataReader, 
+        suffix: str,
+        output_dir: str,
+        var_properties_path: str,
+        max_episode_len_steps: int, 
+        max_history_len_steps: int = 0,
+        min_episode_len_steps: Optional[int] = 10,
+        min_episode_len_hours: Optional[int] = 48,
+        max_episode_len_hours: Optional[int] = 48,
+        n_workers: Optional[int] = None,
+        compression: str = 'gzip',
+        compression_opts: int = 4
+) -> None:
+    """
+    Extract MIMIC data and write directly to HDF5 format.
+    
+    This is a drop-in replacement for extract_mimic that writes HDF5 files
+    instead of pickle files. HDF5 files load much faster because they store
+    contiguous arrays that can be read directly into memory without the
+    overhead of Python object reconstruction.
+    
+    Args:
+        reader: MIMICDataReader instance
+        suffix: Data partition ('train', 'val', or 'test')
+        output_dir: Directory for output files
+        var_properties_path: Path to variable_properties.yaml for dimension info
+        max_episode_len_steps: Maximum timesteps to include from ICU episode
+        max_history_len_steps: Maximum historic timesteps before ICU admission
+        min_episode_len_steps: Minimum required timesteps (episodes with fewer are skipped)
+        min_episode_len_hours: Minimum ICU stay duration in hours
+        max_episode_len_hours: Maximum hours of data to include
+        n_workers: Number of parallel workers for processing
+        compression: HDF5 compression ('gzip', 'lzf', or None)
+        compression_opts: Compression level (1-9 for gzip)
+    """
+    from TransEHR2.constants import MAX_TOKEN_LENGTH
+    
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    if reader.prediction_task != 'all':
+        raise ValueError(f'reader.prediction_task: Expected "all", got {reader.prediction_task}')
+
+    total_episodes = len(reader.patient_episode_ids)
+    max_ts_len = max_history_len_steps + max_episode_len_steps
+
+    if n_workers is None:
+        n_workers = 1
+    
+    print(f"Processing {total_episodes} episodes using {n_workers} workers...")
+
+    # Get phenotype dimension from listfile header
+    phenotype_dim = _get_phenotype_dim_from_listfile(reader.phenotypes_listfile)
+    
+    # Get feature dimensions from config
+    dims = _get_feature_dims_from_config(
+        var_properties_path=var_properties_path,
+        valued_feats=reader.valued_feats,
+        event_feats=reader.event_feats,
+        text_feats=reader.text_feats if reader.text_feats else [],
+        static_feats=reader.static_feats,
+        max_ts_len_val=max_ts_len,
+        max_ts_len_event=max_ts_len,
+        max_token_length=MAX_TOKEN_LENGTH,
+        phenotype_dim=phenotype_dim
+    )
+
+    # Create partial function with fixed arguments
+    process_fn = partial(
+        _process_single_episode,
+        reader=reader,
+        max_history_len_steps=max_history_len_steps,
+        max_episode_len_steps=max_episode_len_steps,
+        max_episode_len_hours=max_episode_len_hours,
+        min_episode_len_steps=min_episode_len_steps,
+        min_episode_len_hours=min_episode_len_hours
+    )
+
+    # Process episodes in parallel
+    all_val_data = []
+    all_event_data = []
+    all_static_data = []
+    all_target_data = []
+    ids = []
+    n_episodes_ignored = 0
+    
+    with mp.Pool(processes=n_workers, initializer=_init_worker, initargs=(max_ts_len,)) as pool:
+        for result in tqdm(
+            pool.imap(process_fn, range(total_episodes), chunksize=10),
+            total=total_episodes,
+            desc=f"Extracting {suffix} patient records from {reader.data_root_path}"
+        ):
+            if result is None:
+                n_episodes_ignored += 1
+            else:
+                i, val_data, event_data, static_data, targets = result
+                ids.append(i)
+                all_val_data.append(val_data)
+                all_event_data.append(event_data)
+                all_static_data.append(static_data)
+                all_target_data.append(targets)
+    
+    print(f"Extracted records from {total_episodes-n_episodes_ignored} ICU stay episodes, "
+          f"ignored {n_episodes_ignored} episodes that didn't meet filtering criteria.")
+    sys.stdout.flush()
+
+    # Restrict to patient-episode IDs that survived filtering
+    patient_episode_ids = np.array(reader.patient_episode_ids)[ids]
+    patient_episode_ids = patient_episode_ids.tolist()
+    
+    # Standardize the numeric value-associated data
+    summary_statistic_path = os.path.join(output_dir, 'summary_statistics_train.npz')
+    if suffix == 'train':
+        print(f"Calculating summary statistics...", flush=True)
+        sys.stdout.flush()
+        all_val_data = standardize_feats(all_val_data, save_path=summary_statistic_path)
+    else:
+        if not os.path.exists(summary_statistic_path):
+            raise FileNotFoundError(
+                'Validation and test set data are standardized with summary statistics calculated from the training '
+                'set data, but summary_statistics_train.npz was not found. Please run the training data extraction '
+                'first to generate the summary statistics.'
+            )
+        print(f"Loading and applying summary statistics...", flush=True)
+        sys.stdout.flush()
+        all_val_data = standardize_feats(all_val_data, load_path=summary_statistic_path)
+
+    # Write to HDF5 instead of pickle
+    h5_path = os.path.join(output_dir, f'{suffix}.h5')
+    _write_to_hdf5(
+        h5_path=h5_path,
+        patient_episode_ids=patient_episode_ids,
+        all_val_data=all_val_data,
+        all_event_data=all_event_data,
+        all_static_data=all_static_data,
+        all_target_data=all_target_data,
+        dims=dims,
+        compression=compression,
+        compression_opts=compression_opts
+    )
+    
+    print(f"Extracted {suffix} data written to {h5_path}\n")
