@@ -84,22 +84,16 @@ class MixedDataset(object):
 
 class HDF5Dataset:
     """
-    HDF5-backed datasets for TransEHR2 with lazy loading and optional preloading. This class is a drop-in replacement for MixedDataset that can load data lazily from HDF5 files (in RAM-constrained environments) or preload everything into RAM for maximum throughput. Use it for large datasets where the MixedDataset's pickle-based storage is inefficient.
+    A dataset backed by HDF5 files with hybrid sparse storage.
     
-    This class provides the same interface as MixedDataset but loads data from HDF5 files. It supports two modes:
+    Numeric, categorical, and event features are stored without right-padding.
+    Text features are stored sparsely (only timesteps with actual text).
+    On read, data is reconstructed to the dense padded format expected by
+    the collation and model code.
     
-    - preload=False (lazy): Data is loaded on-demand from disk. Good for memory-constrained environments or very large datasets.
-    
-    - preload=True: All data is loaded into RAM at initialization. This is much faster than pickle deserialization and eliminates per-batch I/O overhead. Recommended when you have sufficient RAM.
-    
-    For use with PyTorch DataLoader with num_workers > 0:
-    - In lazy mode, each worker opens its own file handle.
-    - In preload mode, data is shared via copy-on-write after fork.
-    
-    Attributes:
-        h5_path: Path to the HDF5 file
-        n_episodes: Number of episodes in the dataset
-        preload: Whether data is preloaded into RAM
+    Supports two modes:
+    - preload=True: Load all data into RAM at init (recommended with sufficient RAM)
+    - preload=False: Load data lazily per __getitem__ call
     """
     
     def __init__(self, h5_path: str, preload: bool = True):
@@ -107,16 +101,16 @@ class HDF5Dataset:
         Initialize the HDF5Dataset.
         
         Args:
-            h5_path: Path to the HDF5 file created by convert_pkl_to_hdf5.py
-            preload: If True, load all data into RAM at initialization (default; fast startup, zero per-batch I/O). If 
-              False, load data lazily on each __getitem__ call (slow per-batch, low memory).
+            h5_path: Path to HDF5 file created by extract_mimic_hdf5
+            preload: If True, load all data into RAM at initialization
         """
+        
         self.h5_path = h5_path
         self.preload = preload
-        self._h5_file = None  # For lazy mode
-        self._cache = None    # For preload mode
+        self._h5_file = None
+        self._cache = None
         
-        # Read metadata (always fast)
+        # Read metadata
         with h5py.File(h5_path, 'r') as f:
             meta = f['metadata']
             self.n_episodes = meta.attrs['n_episodes']
@@ -129,16 +123,17 @@ class HDF5Dataset:
             self.static_total_dim = meta.attrs['static_total_dim']
             self.phenotype_dim = meta.attrs['phenotype_dim']
             
-            # Load list-type metadata
             self.numeric_feat_dims = list(meta['numeric_feat_dims'][:]) if 'numeric_feat_dims' in meta else []
             self.categorical_feat_dims = list(meta['categorical_feat_dims'][:]) if 'categorical_feat_dims' in meta else []
             self.text_feat_dims = list(meta['text_feat_dims'][:]) if 'text_feat_dims' in meta else []
             self.static_feat_dims = list(meta['static_feat_dims'][:]) if 'static_feat_dims' in meta else []
+        
         if preload:
             self._preload_all_data()
     
     def _preload_all_data(self):
-        """Load all data from HDF5 into memory as contiguous numpy arrays."""
+        """Load all data from HDF5 into memory."""
+        
         print(f"Preloading {self.h5_path} into RAM...")
         
         self._cache = {}
@@ -146,52 +141,44 @@ class HDF5Dataset:
         with h5py.File(self.h5_path, 'r') as f:
             # IDs
             ids_data = f['ids'][:]
-            # Handle byte strings
             if len(ids_data) > 0 and isinstance(ids_data[0], bytes):
                 self._cache['ids'] = [id_.decode('utf-8') for id_ in ids_data]
             else:
                 self._cache['ids'] = list(ids_data)
             
-            # Value-associated data: numeric
+            # Val data
+            self._cache['val_episode_offsets'] = f['val_data/episode_offsets'][:]
+            self._cache['val_times'] = f['val_data/times'][:]
+            
             if self.n_numeric_feats > 0:
                 self._cache['val_numeric_indicators'] = f['val_data/numeric/indicators'][:]
                 self._cache['val_numeric_values'] = []
                 for feat_idx in range(self.n_numeric_feats):
-                    self._cache['val_numeric_values'].append(
-                        f[f'val_data/numeric/values_{feat_idx}'][:]
-                    )
+                    self._cache['val_numeric_values'].append(f[f'val_data/numeric/values_{feat_idx}'][:])
             
-            # Value-associated data: categorical
             if self.n_categorical_feats > 0:
                 self._cache['val_categorical_indicators'] = f['val_data/categorical/indicators'][:]
                 self._cache['val_categorical_values'] = []
                 for feat_idx in range(self.n_categorical_feats):
-                    self._cache['val_categorical_values'].append(
-                        f[f'val_data/categorical/values_{feat_idx}'][:]
-                    )
+                    self._cache['val_categorical_values'].append(f[f'val_data/categorical/values_{feat_idx}'][:])
             
-            # Value-associated data: text
             if self.n_text_feats > 0:
                 self._cache['val_text_indicators'] = f['val_data/text/indicators'][:]
-                self._cache['val_text_values'] = []
-                self._cache['val_text_masks'] = []
+                self._cache['val_text_feats'] = []
                 for feat_idx in range(self.n_text_feats):
-                    self._cache['val_text_values'].append(
-                        f[f'val_data/text/values_{feat_idx}'][:]
-                    )
-                    self._cache['val_text_masks'].append(
-                        f[f'val_data/text/masks_{feat_idx}'][:]
-                    )
+                    feat_data = {
+                        'episode_offsets': f[f'val_data/text/feat_{feat_idx}/episode_offsets'][:],
+                        'timestep_indices': f[f'val_data/text/feat_{feat_idx}/timestep_indices'][:],
+                        'values': f[f'val_data/text/feat_{feat_idx}/values'][:],
+                        'masks': f[f'val_data/text/feat_{feat_idx}/masks'][:]
+                    }
+                    self._cache['val_text_feats'].append(feat_data)
             
-            # Value-associated times and masks
-            self._cache['val_times'] = f['val_data/times'][:]
-            self._cache['val_masks'] = f['val_data/masks'][:]
-            
-            # Event-associated data
+            # Event data
+            self._cache['event_episode_offsets'] = f['event_data/episode_offsets'][:]
+            self._cache['event_times'] = f['event_data/times'][:]
             if self.n_event_feats > 0:
                 self._cache['event_indicators'] = f['event_data/indicators'][:]
-            self._cache['event_times'] = f['event_data/times'][:]
-            self._cache['event_masks'] = f['event_data/masks'][:]
             
             # Static data
             self._cache['static_data'] = f['static_data'][:]
@@ -204,11 +191,9 @@ class HDF5Dataset:
         print(f"Preload complete: {self.n_episodes} episodes loaded")
     
     @property
-    def h5_file(self) -> h5py.File:
-        """
-        Lazy file handle initialization for multiprocessing compatibility.
-        Only used when preload=False.
-        """
+    def h5_file(self):
+        """Lazy file handle for non-preloaded access."""
+
         if self._h5_file is None:
             self._h5_file = h5py.File(self.h5_path, 'r', swmr=True)
         return self._h5_file
@@ -218,20 +203,9 @@ class HDF5Dataset:
     
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         """
-        Load a single episode and reconstruct the nested structure.
+        Load and reconstruct a single episode to dense padded format.
         
-        Args:
-            idx: Episode index
-            
-        Returns:
-            Dictionary with the same structure as MixedDataset.__getitem__:
-            {
-                'id': episode_id,
-                'val_data': ValueAssociatedDataEntry,
-                'event_data': EventAssociatedDataEntry,
-                'static_data': StaticDataEntry,
-                'targets': TargetDataEntry
-            }
+        Returns dictionary matching MixedDataset.__getitem__ structure.
         """
         if self.preload:
             return self._getitem_preloaded(idx)
@@ -239,17 +213,26 @@ class HDF5Dataset:
             return self._getitem_lazy(idx)
     
     def _getitem_preloaded(self, idx: int) -> Dict[str, Any]:
-        """Get item from preloaded cache - just array slicing, very fast."""
+        """Get item from preloaded cache."""
         cache = self._cache
         
-        # Episode ID
         episode_id = cache['ids'][idx]
         
+        # Get val_data slice boundaries
+        val_start = cache['val_episode_offsets'][idx]
+        val_end = cache['val_episode_offsets'][idx + 1]
+        val_len = val_end - val_start
+        
         # Reconstruct val_data
-        val_data = self._reconstruct_val_data_preloaded(idx)
+        val_data = self._reconstruct_val_data_preloaded(idx, val_start, val_end, val_len)
+        
+        # Get event_data slice boundaries
+        event_start = cache['event_episode_offsets'][idx]
+        event_end = cache['event_episode_offsets'][idx + 1]
+        event_len = event_end - event_start
         
         # Reconstruct event_data
-        event_data = self._reconstruct_event_data_preloaded(idx)
+        event_data = self._reconstruct_event_data_preloaded(event_start, event_end, event_len)
         
         # Reconstruct static_data
         static_data = self._reconstruct_static_data_preloaded(idx)
@@ -269,9 +252,10 @@ class HDF5Dataset:
             'targets': targets
         }
     
-    def _reconstruct_val_data_preloaded(self, idx: int) -> Dict:
-        """Reconstruct value-associated data from preloaded cache."""
+    def _reconstruct_val_data_preloaded(self, idx: int, val_start: int, val_end: int, val_len: int) -> Dict:
+        """Reconstruct dense padded val_data from sparse storage."""
         cache = self._cache
+        max_ts = self.max_ts_len_val
         
         val_data = {
             'numeric': {'indicators': [], 'values': []},
@@ -281,70 +265,117 @@ class HDF5Dataset:
             'masks': []
         }
         
-        # Numeric
+        # Get times for real timesteps
+        real_times = cache['val_times'][val_start:val_end]
+        
+        # Reconstruct numeric
         if self.n_numeric_feats > 0:
-            indicators = cache['val_numeric_indicators'][idx]  # (max_ts_len, n_feats)
-            for t in range(self.max_ts_len_val):
-                feat_indicators = []
-                feat_values = []
-                for f in range(self.n_numeric_feats):
-                    feat_indicators.append(np.array([indicators[t, f]], dtype=np.uint8))
-                    feat_values.append(cache['val_numeric_values'][f][idx, t].astype(np.float32))
+            real_indicators = cache['val_numeric_indicators'][val_start:val_end]
+            real_values = [cache['val_numeric_values'][f][val_start:val_end] for f in range(self.n_numeric_feats)]
+            
+            for t in range(max_ts):
+                if t < val_len:
+                    feat_indicators = [np.array([real_indicators[t, f]], dtype=np.uint8) 
+                                       for f in range(self.n_numeric_feats)]
+                    feat_values = [real_values[f][t].astype(np.float32) 
+                                   for f in range(self.n_numeric_feats)]
+                else:
+                    feat_indicators = [np.array([0], dtype=np.uint8) for _ in range(self.n_numeric_feats)]
+                    feat_values = [np.zeros(self.numeric_feat_dims[f], dtype=np.float32) 
+                                   for f in range(self.n_numeric_feats)]
                 val_data['numeric']['indicators'].append(feat_indicators)
                 val_data['numeric']['values'].append(feat_values)
         else:
-            for t in range(self.max_ts_len_val):
+            for t in range(max_ts):
                 val_data['numeric']['indicators'].append([])
                 val_data['numeric']['values'].append([])
         
-        # Categorical
+        # Reconstruct categorical
         if self.n_categorical_feats > 0:
-            indicators = cache['val_categorical_indicators'][idx]
-            for t in range(self.max_ts_len_val):
-                feat_indicators = []
-                feat_values = []
-                for f in range(self.n_categorical_feats):
-                    feat_indicators.append(np.array([indicators[t, f]], dtype=np.uint8))
-                    feat_values.append(cache['val_categorical_values'][f][idx, t].astype(np.int32))
+            real_indicators = cache['val_categorical_indicators'][val_start:val_end]
+            real_values = [cache['val_categorical_values'][f][val_start:val_end] for f in range(self.n_categorical_feats)]
+            
+            for t in range(max_ts):
+                if t < val_len:
+                    feat_indicators = [np.array([real_indicators[t, f]], dtype=np.uint8) 
+                                       for f in range(self.n_categorical_feats)]
+                    feat_values = [real_values[f][t].astype(np.int32) 
+                                   for f in range(self.n_categorical_feats)]
+                else:
+                    feat_indicators = [np.array([0], dtype=np.uint8) for _ in range(self.n_categorical_feats)]
+                    feat_values = [np.zeros(self.categorical_feat_dims[f], dtype=np.int32) 
+                                   for f in range(self.n_categorical_feats)]
                 val_data['categorical']['indicators'].append(feat_indicators)
                 val_data['categorical']['values'].append(feat_values)
         else:
-            for t in range(self.max_ts_len_val):
+            for t in range(max_ts):
                 val_data['categorical']['indicators'].append([])
                 val_data['categorical']['values'].append([])
         
-        # Text
+        # Reconstruct text (sparse within timesteps)
         if self.n_text_feats > 0:
-            indicators = cache['val_text_indicators'][idx]
-            for t in range(self.max_ts_len_val):
-                feat_indicators = []
-                feat_values = []
-                feat_masks = []
-                for f in range(self.n_text_feats):
-                    feat_indicators.append(np.array([indicators[t, f]], dtype=np.uint8))
-                    feat_values.append(cache['val_text_values'][f][idx, t].astype(np.int32))
-                    feat_masks.append(cache['val_text_masks'][f][idx, t].astype(np.uint8))
+            real_indicators = cache['val_text_indicators'][val_start:val_end]
+            
+            # Build per-feature maps of timestep -> text data
+            text_maps = []
+            for f in range(self.n_text_feats):
+                feat_data = cache['val_text_feats'][f]
+                text_start = feat_data['episode_offsets'][idx]
+                text_end = feat_data['episode_offsets'][idx + 1]
+                
+                timestep_indices = feat_data['timestep_indices'][text_start:text_end]
+                values = feat_data['values'][text_start:text_end]
+                masks = feat_data['masks'][text_start:text_end]
+                
+                # Map timestep index -> (values, masks)
+                ts_map = {}
+                for j, ts_idx in enumerate(timestep_indices):
+                    ts_map[ts_idx] = (values[j], masks[j])
+                text_maps.append(ts_map)
+            
+            for t in range(max_ts):
+                if t < val_len:
+                    feat_indicators = [np.array([real_indicators[t, f]], dtype=np.uint8) 
+                                       for f in range(self.n_text_feats)]
+                    feat_values = []
+                    feat_masks = []
+                    for f in range(self.n_text_feats):
+                        if t in text_maps[f]:
+                            feat_values.append(text_maps[f][t][0].astype(np.int32))
+                            feat_masks.append(text_maps[f][t][1].astype(np.uint8))
+                        else:
+                            feat_values.append(np.zeros(self.text_feat_dims[f], dtype=np.int32))
+                            feat_masks.append(np.zeros(self.text_feat_dims[f], dtype=np.uint8))
+                else:
+                    feat_indicators = [np.array([0], dtype=np.uint8) for _ in range(self.n_text_feats)]
+                    feat_values = [np.zeros(self.text_feat_dims[f], dtype=np.int32) 
+                                   for f in range(self.n_text_feats)]
+                    feat_masks = [np.zeros(self.text_feat_dims[f], dtype=np.uint8) 
+                                  for f in range(self.n_text_feats)]
                 val_data['text']['indicators'].append(feat_indicators)
                 val_data['text']['values'].append(feat_values)
                 val_data['text']['masks'].append(feat_masks)
         else:
-            for t in range(self.max_ts_len_val):
+            for t in range(max_ts):
                 val_data['text']['indicators'].append([])
                 val_data['text']['values'].append([])
                 val_data['text']['masks'].append([])
         
-        # Times and masks
-        times = cache['val_times'][idx]
-        masks = cache['val_masks'][idx]
-        for t in range(self.max_ts_len_val):
-            val_data['times'].append(np.array([times[t]], dtype=np.float32))
-            val_data['masks'].append(np.array([masks[t]], dtype=np.uint8))
+        # Reconstruct times and masks
+        for t in range(max_ts):
+            if t < val_len:
+                val_data['times'].append(np.array([real_times[t]], dtype=np.float32))
+                val_data['masks'].append(np.array([1], dtype=np.uint8))
+            else:
+                val_data['times'].append(np.array([0.0], dtype=np.float32))
+                val_data['masks'].append(np.array([0], dtype=np.uint8))
         
         return val_data
     
-    def _reconstruct_event_data_preloaded(self, idx: int) -> Dict:
-        """Reconstruct event-associated data from preloaded cache."""
+    def _reconstruct_event_data_preloaded(self, event_start: int, event_end: int, event_len: int) -> Dict:
+        """Reconstruct dense padded event_data from sparse storage."""
         cache = self._cache
+        max_ts = self.max_ts_len_event
         
         event_data = {
             'indicators': [],
@@ -352,29 +383,34 @@ class HDF5Dataset:
             'masks': []
         }
         
-        # Indicators
+        real_times = cache['event_times'][event_start:event_end]
+        
         if self.n_event_feats > 0:
-            indicators = cache['event_indicators'][idx]
-            for t in range(self.max_ts_len_event):
-                feat_indicators = []
-                for f in range(self.n_event_feats):
-                    feat_indicators.append(np.array([indicators[t, f]], dtype=np.uint8))
+            real_indicators = cache['event_indicators'][event_start:event_end]
+            
+            for t in range(max_ts):
+                if t < event_len:
+                    feat_indicators = [np.array([real_indicators[t, f]], dtype=np.uint8) 
+                                       for f in range(self.n_event_feats)]
+                else:
+                    feat_indicators = [np.array([0], dtype=np.uint8) for _ in range(self.n_event_feats)]
                 event_data['indicators'].append(feat_indicators)
         else:
-            for t in range(self.max_ts_len_event):
+            for t in range(max_ts):
                 event_data['indicators'].append([])
         
-        # Times and masks
-        times = cache['event_times'][idx]
-        masks = cache['event_masks'][idx]
-        for t in range(self.max_ts_len_event):
-            event_data['times'].append(np.array([times[t]], dtype=np.float32))
-            event_data['masks'].append(np.array([masks[t]], dtype=np.uint8))
+        for t in range(max_ts):
+            if t < event_len:
+                event_data['times'].append(np.array([real_times[t]], dtype=np.float32))
+                event_data['masks'].append(np.array([1], dtype=np.uint8))
+            else:
+                event_data['times'].append(np.array([0.0], dtype=np.float32))
+                event_data['masks'].append(np.array([0], dtype=np.uint8))
         
         return event_data
     
     def _reconstruct_static_data_preloaded(self, idx: int) -> List[np.ndarray]:
-        """Reconstruct static data from preloaded cache."""
+        """Reconstruct static_data list from flat array."""
         static_flat = self._cache['static_data'][idx]
         
         static_data = []
@@ -389,16 +425,28 @@ class HDF5Dataset:
         """Get item with lazy loading from HDF5 file."""
         f = self.h5_file
         
-        # Episode ID
+        # Get episode ID
         episode_id = f['ids'][idx]
         if isinstance(episode_id, bytes):
             episode_id = episode_id.decode('utf-8')
         
+        # Get val_data slice boundaries
+        val_offsets = f['val_data/episode_offsets'][:]
+        val_start = val_offsets[idx]
+        val_end = val_offsets[idx + 1]
+        val_len = val_end - val_start
+        
         # Reconstruct val_data
-        val_data = self._reconstruct_val_data_lazy(f, idx)
+        val_data = self._reconstruct_val_data_lazy(f, idx, val_start, val_end, val_len)
+        
+        # Get event_data slice boundaries
+        event_offsets = f['event_data/episode_offsets'][:]
+        event_start = event_offsets[idx]
+        event_end = event_offsets[idx + 1]
+        event_len = event_end - event_start
         
         # Reconstruct event_data
-        event_data = self._reconstruct_event_data_lazy(f, idx)
+        event_data = self._reconstruct_event_data_lazy(f, event_start, event_end, event_len)
         
         # Reconstruct static_data
         static_data = self._reconstruct_static_data_lazy(f, idx)
@@ -418,8 +466,10 @@ class HDF5Dataset:
             'targets': targets
         }
     
-    def _reconstruct_val_data_lazy(self, f: h5py.File, idx: int) -> Dict:
-        """Reconstruct value-associated data with lazy loading."""
+    def _reconstruct_val_data_lazy(self, f, idx: int, val_start: int, val_end: int, val_len: int) -> Dict:
+        """Reconstruct dense padded val_data with lazy loading."""
+        max_ts = self.max_ts_len_val
+        
         val_data = {
             'numeric': {'indicators': [], 'values': []},
             'categorical': {'indicators': [], 'values': []},
@@ -428,100 +478,150 @@ class HDF5Dataset:
             'masks': []
         }
         
+        real_times = f['val_data/times'][val_start:val_end]
+        
         # Numeric
         if self.n_numeric_feats > 0:
-            indicators = f['val_data/numeric/indicators'][idx]
-            for t in range(self.max_ts_len_val):
-                feat_indicators = []
-                feat_values = []
-                for feat_idx in range(self.n_numeric_feats):
-                    feat_indicators.append(np.array([indicators[t, feat_idx]], dtype=np.uint8))
-                    values = f[f'val_data/numeric/values_{feat_idx}'][idx, t]
-                    feat_values.append(values.astype(np.float32))
+            real_indicators = f['val_data/numeric/indicators'][val_start:val_end]
+            real_values = [f[f'val_data/numeric/values_{feat}'][val_start:val_end] 
+                           for feat in range(self.n_numeric_feats)]
+            
+            for t in range(max_ts):
+                if t < val_len:
+                    feat_indicators = [np.array([real_indicators[t, feat]], dtype=np.uint8) 
+                                       for feat in range(self.n_numeric_feats)]
+                    feat_values = [real_values[feat][t].astype(np.float32) 
+                                   for feat in range(self.n_numeric_feats)]
+                else:
+                    feat_indicators = [np.array([0], dtype=np.uint8) for _ in range(self.n_numeric_feats)]
+                    feat_values = [np.zeros(self.numeric_feat_dims[feat], dtype=np.float32) 
+                                   for feat in range(self.n_numeric_feats)]
                 val_data['numeric']['indicators'].append(feat_indicators)
                 val_data['numeric']['values'].append(feat_values)
         else:
-            for t in range(self.max_ts_len_val):
+            for t in range(max_ts):
                 val_data['numeric']['indicators'].append([])
                 val_data['numeric']['values'].append([])
         
         # Categorical
         if self.n_categorical_feats > 0:
-            indicators = f['val_data/categorical/indicators'][idx]
-            for t in range(self.max_ts_len_val):
-                feat_indicators = []
-                feat_values = []
-                for feat_idx in range(self.n_categorical_feats):
-                    feat_indicators.append(np.array([indicators[t, feat_idx]], dtype=np.uint8))
-                    values = f[f'val_data/categorical/values_{feat_idx}'][idx, t]
-                    feat_values.append(values.astype(np.int32))
+            real_indicators = f['val_data/categorical/indicators'][val_start:val_end]
+            real_values = [f[f'val_data/categorical/values_{feat}'][val_start:val_end] 
+                           for feat in range(self.n_categorical_feats)]
+            
+            for t in range(max_ts):
+                if t < val_len:
+                    feat_indicators = [np.array([real_indicators[t, feat]], dtype=np.uint8) 
+                                       for feat in range(self.n_categorical_feats)]
+                    feat_values = [real_values[feat][t].astype(np.int32) 
+                                   for feat in range(self.n_categorical_feats)]
+                else:
+                    feat_indicators = [np.array([0], dtype=np.uint8) for _ in range(self.n_categorical_feats)]
+                    feat_values = [np.zeros(self.categorical_feat_dims[feat], dtype=np.int32) 
+                                   for feat in range(self.n_categorical_feats)]
                 val_data['categorical']['indicators'].append(feat_indicators)
                 val_data['categorical']['values'].append(feat_values)
         else:
-            for t in range(self.max_ts_len_val):
+            for t in range(max_ts):
                 val_data['categorical']['indicators'].append([])
                 val_data['categorical']['values'].append([])
         
-        # Text
+        # Text (sparse)
         if self.n_text_feats > 0:
-            indicators = f['val_data/text/indicators'][idx]
-            for t in range(self.max_ts_len_val):
-                feat_indicators = []
-                feat_values = []
-                feat_masks = []
-                for feat_idx in range(self.n_text_feats):
-                    feat_indicators.append(np.array([indicators[t, feat_idx]], dtype=np.uint8))
-                    values = f[f'val_data/text/values_{feat_idx}'][idx, t]
-                    feat_values.append(values.astype(np.int32))
-                    masks = f[f'val_data/text/masks_{feat_idx}'][idx, t]
-                    feat_masks.append(masks.astype(np.uint8))
+            real_indicators = f['val_data/text/indicators'][val_start:val_end]
+            
+            text_maps = []
+            for feat in range(self.n_text_feats):
+                text_offsets = f[f'val_data/text/feat_{feat}/episode_offsets'][:]
+                text_start = text_offsets[idx]
+                text_end = text_offsets[idx + 1]
+                
+                timestep_indices = f[f'val_data/text/feat_{feat}/timestep_indices'][text_start:text_end]
+                values = f[f'val_data/text/feat_{feat}/values'][text_start:text_end]
+                masks = f[f'val_data/text/feat_{feat}/masks'][text_start:text_end]
+                
+                ts_map = {}
+                for j, ts_idx in enumerate(timestep_indices):
+                    ts_map[ts_idx] = (values[j], masks[j])
+                text_maps.append(ts_map)
+            
+            for t in range(max_ts):
+                if t < val_len:
+                    feat_indicators = [np.array([real_indicators[t, feat]], dtype=np.uint8) 
+                                       for feat in range(self.n_text_feats)]
+                    feat_values = []
+                    feat_masks = []
+                    for feat in range(self.n_text_feats):
+                        if t in text_maps[feat]:
+                            feat_values.append(text_maps[feat][t][0].astype(np.int32))
+                            feat_masks.append(text_maps[feat][t][1].astype(np.uint8))
+                        else:
+                            feat_values.append(np.zeros(self.text_feat_dims[feat], dtype=np.int32))
+                            feat_masks.append(np.zeros(self.text_feat_dims[feat], dtype=np.uint8))
+                else:
+                    feat_indicators = [np.array([0], dtype=np.uint8) for _ in range(self.n_text_feats)]
+                    feat_values = [np.zeros(self.text_feat_dims[feat], dtype=np.int32) 
+                                   for feat in range(self.n_text_feats)]
+                    feat_masks = [np.zeros(self.text_feat_dims[feat], dtype=np.uint8) 
+                                  for feat in range(self.n_text_feats)]
                 val_data['text']['indicators'].append(feat_indicators)
                 val_data['text']['values'].append(feat_values)
                 val_data['text']['masks'].append(feat_masks)
         else:
-            for t in range(self.max_ts_len_val):
+            for t in range(max_ts):
                 val_data['text']['indicators'].append([])
                 val_data['text']['values'].append([])
                 val_data['text']['masks'].append([])
         
         # Times and masks
-        times = f['val_data/times'][idx]
-        masks = f['val_data/masks'][idx]
-        for t in range(self.max_ts_len_val):
-            val_data['times'].append(np.array([times[t]], dtype=np.float32))
-            val_data['masks'].append(np.array([masks[t]], dtype=np.uint8))
+        for t in range(max_ts):
+            if t < val_len:
+                val_data['times'].append(np.array([real_times[t]], dtype=np.float32))
+                val_data['masks'].append(np.array([1], dtype=np.uint8))
+            else:
+                val_data['times'].append(np.array([0.0], dtype=np.float32))
+                val_data['masks'].append(np.array([0], dtype=np.uint8))
         
         return val_data
     
-    def _reconstruct_event_data_lazy(self, f: h5py.File, idx: int) -> Dict:
-        """Reconstruct event-associated data with lazy loading."""
+    def _reconstruct_event_data_lazy(self, f, event_start: int, event_end: int, event_len: int) -> Dict:
+        """Reconstruct dense padded event_data with lazy loading."""
+        max_ts = self.max_ts_len_event
+        
         event_data = {
             'indicators': [],
             'times': [],
             'masks': []
         }
         
+        real_times = f['event_data/times'][event_start:event_end]
+        
         if self.n_event_feats > 0:
-            indicators = f['event_data/indicators'][idx]
-            for t in range(self.max_ts_len_event):
-                feat_indicators = []
-                for feat_idx in range(self.n_event_feats):
-                    feat_indicators.append(np.array([indicators[t, feat_idx]], dtype=np.uint8))
+            real_indicators = f['event_data/indicators'][event_start:event_end]
+            
+            for t in range(max_ts):
+                if t < event_len:
+                    feat_indicators = [np.array([real_indicators[t, feat]], dtype=np.uint8) 
+                                       for feat in range(self.n_event_feats)]
+                else:
+                    feat_indicators = [np.array([0], dtype=np.uint8) for _ in range(self.n_event_feats)]
                 event_data['indicators'].append(feat_indicators)
         else:
-            for t in range(self.max_ts_len_event):
+            for t in range(max_ts):
                 event_data['indicators'].append([])
         
-        times = f['event_data/times'][idx]
-        masks = f['event_data/masks'][idx]
-        for t in range(self.max_ts_len_event):
-            event_data['times'].append(np.array([times[t]], dtype=np.float32))
-            event_data['masks'].append(np.array([masks[t]], dtype=np.uint8))
+        for t in range(max_ts):
+            if t < event_len:
+                event_data['times'].append(np.array([real_times[t]], dtype=np.float32))
+                event_data['masks'].append(np.array([1], dtype=np.uint8))
+            else:
+                event_data['times'].append(np.array([0.0], dtype=np.float32))
+                event_data['masks'].append(np.array([0], dtype=np.uint8))
         
         return event_data
     
-    def _reconstruct_static_data_lazy(self, f: h5py.File, idx: int) -> List[np.ndarray]:
-        """Reconstruct static data with lazy loading."""
+    def _reconstruct_static_data_lazy(self, f, idx: int) -> List[np.ndarray]:
+        """Reconstruct static_data list with lazy loading."""
         static_flat = f['static_data'][idx]
         
         static_data = []
@@ -533,7 +633,7 @@ class HDF5Dataset:
         return static_data
     
     def __del__(self):
-        """Clean up file handle on deletion."""
+        """Clean up file handle."""
         if self._h5_file is not None:
             try:
                 self._h5_file.close()
@@ -541,9 +641,8 @@ class HDF5Dataset:
                 pass
     
     def close(self):
-        """Explicitly close the HDF5 file handle and free cache."""
+        """Explicitly close file handle and free cache."""
         if self._h5_file is not None:
             self._h5_file.close()
             self._h5_file = None
         self._cache = None
-        

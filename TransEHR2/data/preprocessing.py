@@ -1096,7 +1096,6 @@ def prepare_dataloaders_hdf5(
     Returns:
         List of DataLoader instances
     """
-    from torch.utils.data import DataLoader
     
     if pretrain_ratio is not None:
         raise NotImplementedError(
@@ -1457,10 +1456,11 @@ def _write_to_hdf5(
     compression_opts: int = 4
 ) -> None:
     """
-    Write extracted episode data directly to HDF5 format.
+    Write extracted episode data to HDF5 format using hybrid sparse storage.
     
-    This is much faster to load than pickle because HDF5 stores contiguous
-    arrays that can be read directly into memory without object reconstruction.
+    Numeric, categorical, and event features are stored without right-padding.
+    Text features are stored sparsely (only timesteps with actual text).
+    This dramatically reduces storage requirements while maintaining fast loading.
     
     Args:
         h5_path: Output path for the HDF5 file
@@ -1476,7 +1476,58 @@ def _write_to_hdf5(
     
     n_episodes = len(patient_episode_ids)
     
-    print(f"Writing {n_episodes} episodes to {h5_path}...")
+    print(f"Preparing sparse storage for {n_episodes} episodes...")
+    sys.stdout.flush()
+    
+    # First pass: count real timesteps and text occurrences to pre-allocate arrays
+    val_episode_lengths = []
+    event_episode_lengths = []
+    text_counts = [[] for _ in range(dims['n_text_feats'])]  # Per-feature counts per episode
+    
+    for i in range(n_episodes):
+        val_data = all_val_data[i]
+        event_data = all_event_data[i]
+        
+        # Count real (non-padded) timesteps for val_data by checking masks
+        val_real_len = sum(1 for t in range(len(val_data['masks'])) if val_data['masks'][t][0] == 1)
+        val_episode_lengths.append(val_real_len)
+        
+        # Count real timesteps for event_data
+        event_real_len = sum(1 for t in range(len(event_data['masks'])) if event_data['masks'][t][0] == 1)
+        event_episode_lengths.append(event_real_len)
+        
+        # Count text occurrences per feature (within real timesteps only)
+        for f in range(dims['n_text_feats']):
+            text_count = 0
+            for t in range(val_real_len):
+                if val_data['text']['indicators'][t][f][0] == 1:
+                    text_count += 1
+            text_counts[f].append(text_count)
+    
+    # Compute offsets
+    val_offsets = np.zeros(n_episodes + 1, dtype=np.int64)
+    val_offsets[1:] = np.cumsum(val_episode_lengths)
+    total_val_timesteps = val_offsets[-1]
+    
+    event_offsets = np.zeros(n_episodes + 1, dtype=np.int64)
+    event_offsets[1:] = np.cumsum(event_episode_lengths)
+    total_event_timesteps = event_offsets[-1]
+    
+    text_offsets = []
+    total_text_occurrences = []
+    for f in range(dims['n_text_feats']):
+        offsets = np.zeros(n_episodes + 1, dtype=np.int64)
+        offsets[1:] = np.cumsum(text_counts[f])
+        text_offsets.append(offsets)
+        total_text_occurrences.append(offsets[-1])
+    
+    print(f"  Total val timesteps (unpadded): {total_val_timesteps} "
+          f"(vs {n_episodes * dims['max_ts_len_val']} if dense)")
+    print(f"  Total event timesteps (unpadded): {total_event_timesteps} "
+          f"(vs {n_episodes * dims['max_ts_len_event']} if dense)")
+    for f in range(dims['n_text_feats']):
+        print(f"  Total text occurrences (feature {f}): {total_text_occurrences[f]} "
+              f"(vs {total_val_timesteps} if dense within unpadded)")
     sys.stdout.flush()
     
     # Compression settings
@@ -1484,10 +1535,15 @@ def _write_to_hdf5(
     if compression:
         comp_kwargs = {'compression': compression, 'compression_opts': compression_opts}
     
+    print(f"Writing to {h5_path}...")
+    sys.stdout.flush()
+    
     with h5py.File(h5_path, 'w') as h5f:
         # Store metadata
         meta = h5f.create_group('metadata')
         meta.attrs['n_episodes'] = n_episodes
+        meta.attrs['total_val_timesteps'] = total_val_timesteps
+        meta.attrs['total_event_timesteps'] = total_event_timesteps
         for key, value in dims.items():
             if isinstance(value, list):
                 meta.create_dataset(key, data=np.array(value, dtype=np.int32))
@@ -1495,135 +1551,226 @@ def _write_to_hdf5(
                 meta.attrs[key] = value
         
         # Store IDs
-        if isinstance(patient_episode_ids[0], str):
+        if len(patient_episode_ids) > 0 and isinstance(patient_episode_ids[0], str):
             dt = h5py.special_dtype(vlen=str)
             h5f.create_dataset('ids', data=patient_episode_ids, dtype=dt)
         else:
             h5f.create_dataset('ids', data=np.array(patient_episode_ids))
         
-        # Create groups
+        # Create val_data group
         val_grp = h5f.create_group('val_data')
-        event_grp = h5f.create_group('event_data')
+        val_grp.create_dataset('episode_offsets', data=val_offsets)
+        val_grp.create_dataset('times', shape=(total_val_timesteps,), dtype=np.float32, **comp_kwargs)
         
-        # Pre-allocate and fill value-associated data: numeric
+        # Numeric
         if dims['n_numeric_feats'] > 0:
             numeric_grp = val_grp.create_group('numeric')
-            # Indicators: (n_episodes, max_ts_len, n_features)
-            ind_array = np.zeros((n_episodes, dims['max_ts_len_val'], dims['n_numeric_feats']), dtype=np.uint8)
-            for i, val_data in enumerate(all_val_data):
-                for t in range(dims['max_ts_len_val']):
-                    for f in range(dims['n_numeric_feats']):
-                        ind_array[i, t, f] = val_data['numeric']['indicators'][t][f][0]
-            numeric_grp.create_dataset('indicators', data=ind_array, **comp_kwargs)
-            del ind_array
-            
-            # Values: per-feature datasets
+            numeric_grp.create_dataset(
+                'indicators', 
+                shape=(total_val_timesteps, dims['n_numeric_feats']), 
+                dtype=np.uint8, 
+                **comp_kwargs
+            )
             for f, feat_dim in enumerate(dims['numeric_feat_dims']):
-                val_array = np.zeros((n_episodes, dims['max_ts_len_val'], feat_dim), dtype=np.float32)
-                for i, val_data in enumerate(all_val_data):
-                    for t in range(dims['max_ts_len_val']):
-                        arr = val_data['numeric']['values'][t][f]
-                        val_array[i, t, :len(arr)] = arr
-                numeric_grp.create_dataset(f'values_{f}', data=val_array, **comp_kwargs)
-                del val_array
+                numeric_grp.create_dataset(
+                    f'values_{f}',
+                    shape=(total_val_timesteps, feat_dim),
+                    dtype=np.float32,
+                    **comp_kwargs
+                )
         
-        # Pre-allocate and fill value-associated data: categorical
+        # Categorical
         if dims['n_categorical_feats'] > 0:
             categorical_grp = val_grp.create_group('categorical')
-            ind_array = np.zeros((n_episodes, dims['max_ts_len_val'], dims['n_categorical_feats']), dtype=np.uint8)
-            for i, val_data in enumerate(all_val_data):
-                for t in range(dims['max_ts_len_val']):
-                    for f in range(dims['n_categorical_feats']):
-                        ind_array[i, t, f] = val_data['categorical']['indicators'][t][f][0]
-            categorical_grp.create_dataset('indicators', data=ind_array, **comp_kwargs)
-            del ind_array
-            
+            categorical_grp.create_dataset(
+                'indicators',
+                shape=(total_val_timesteps, dims['n_categorical_feats']),
+                dtype=np.uint8,
+                **comp_kwargs
+            )
             for f, feat_dim in enumerate(dims['categorical_feat_dims']):
-                val_array = np.zeros((n_episodes, dims['max_ts_len_val'], feat_dim), dtype=np.int32)
-                for i, val_data in enumerate(all_val_data):
-                    for t in range(dims['max_ts_len_val']):
-                        arr = val_data['categorical']['values'][t][f]
-                        val_array[i, t, :len(arr)] = arr
-                categorical_grp.create_dataset(f'values_{f}', data=val_array, **comp_kwargs)
-                del val_array
+                categorical_grp.create_dataset(
+                    f'values_{f}',
+                    shape=(total_val_timesteps, feat_dim),
+                    dtype=np.int32,
+                    **comp_kwargs
+                )
         
-        # Pre-allocate and fill value-associated data: text
+        # Text (sparse within unpadded timesteps)
         if dims['n_text_feats'] > 0:
             text_grp = val_grp.create_group('text')
-            ind_array = np.zeros((n_episodes, dims['max_ts_len_val'], dims['n_text_feats']), dtype=np.uint8)
-            for i, val_data in enumerate(all_val_data):
-                for t in range(dims['max_ts_len_val']):
-                    for f in range(dims['n_text_feats']):
-                        ind_array[i, t, f] = val_data['text']['indicators'][t][f][0]
-            text_grp.create_dataset('indicators', data=ind_array, **comp_kwargs)
-            del ind_array
-            
+            text_grp.create_dataset(
+                'indicators',
+                shape=(total_val_timesteps, dims['n_text_feats']),
+                dtype=np.uint8,
+                **comp_kwargs
+            )
             for f, feat_dim in enumerate(dims['text_feat_dims']):
-                val_array = np.zeros((n_episodes, dims['max_ts_len_val'], feat_dim), dtype=np.int32)
-                mask_array = np.zeros((n_episodes, dims['max_ts_len_val'], feat_dim), dtype=np.uint8)
-                for i, val_data in enumerate(all_val_data):
-                    for t in range(dims['max_ts_len_val']):
-                        arr = val_data['text']['values'][t][f]
-                        val_array[i, t, :len(arr)] = arr
-                        mask = val_data['text']['masks'][t][f]
-                        mask_array[i, t, :len(mask)] = mask
-                text_grp.create_dataset(f'values_{f}', data=val_array, **comp_kwargs)
-                text_grp.create_dataset(f'masks_{f}', data=mask_array, **comp_kwargs)
-                del val_array, mask_array
+                feat_grp = text_grp.create_group(f'feat_{f}')
+                feat_grp.create_dataset('episode_offsets', data=text_offsets[f])
+                feat_grp.create_dataset(
+                    'values',
+                    shape=(total_text_occurrences[f], feat_dim),
+                    dtype=np.int32,
+                    **comp_kwargs
+                )
+                feat_grp.create_dataset(
+                    'masks',
+                    shape=(total_text_occurrences[f], feat_dim),
+                    dtype=np.uint8,
+                    **comp_kwargs
+                )
+                # Store which timestep (relative to episode start) each text occurrence belongs to
+                feat_grp.create_dataset(
+                    'timestep_indices',
+                    shape=(total_text_occurrences[f],),
+                    dtype=np.int32,
+                    **comp_kwargs
+                )
         
-        # Value-associated times and masks
-        times_array = np.zeros((n_episodes, dims['max_ts_len_val']), dtype=np.float32)
-        masks_array = np.zeros((n_episodes, dims['max_ts_len_val']), dtype=np.uint8)
-        for i, val_data in enumerate(all_val_data):
-            for t in range(dims['max_ts_len_val']):
-                times_array[i, t] = val_data['times'][t][0]
-                masks_array[i, t] = val_data['masks'][t][0]
-        val_grp.create_dataset('times', data=times_array, **comp_kwargs)
-        val_grp.create_dataset('masks', data=masks_array, **comp_kwargs)
-        del times_array, masks_array
-        
-        # Event-associated data
+        # Event data group
+        event_grp = h5f.create_group('event_data')
+        event_grp.create_dataset('episode_offsets', data=event_offsets)
+        event_grp.create_dataset('times', shape=(total_event_timesteps,), dtype=np.float32, **comp_kwargs)
         if dims['n_event_feats'] > 0:
-            ind_array = np.zeros((n_episodes, dims['max_ts_len_event'], dims['n_event_feats']), dtype=np.uint8)
-            for i, event_data in enumerate(all_event_data):
-                for t in range(dims['max_ts_len_event']):
+            event_grp.create_dataset(
+                'indicators',
+                shape=(total_event_timesteps, dims['n_event_feats']),
+                dtype=np.uint8,
+                **comp_kwargs
+            )
+        
+        # Static data (dense, one per episode)
+        h5f.create_dataset(
+            'static_data',
+            shape=(n_episodes, dims['static_total_dim']),
+            dtype=np.float32,
+            **comp_kwargs
+        )
+        
+        # Targets (dense, one per episode)
+        targets_grp = h5f.create_group('targets')
+        targets_grp.create_dataset('mortality', shape=(n_episodes,), dtype=np.float32, **comp_kwargs)
+        targets_grp.create_dataset('length_of_stay', shape=(n_episodes,), dtype=np.float32, **comp_kwargs)
+        targets_grp.create_dataset(
+            'phenotype',
+            shape=(n_episodes, dims['phenotype_dim']),
+            dtype=np.float32,
+            **comp_kwargs
+        )
+        
+        # Second pass: write data
+        # Track current write positions for text features
+        text_write_pos = [0 for _ in range(dims['n_text_feats'])]
+        
+        for i in tqdm(range(n_episodes), desc="Writing episodes"):
+            val_data = all_val_data[i]
+            event_data = all_event_data[i]
+            static_data = all_static_data[i]
+            targets = all_target_data[i]
+            
+            val_start = val_offsets[i]
+            val_end = val_offsets[i + 1]
+            val_len = val_end - val_start
+            
+            event_start = event_offsets[i]
+            event_end = event_offsets[i + 1]
+            event_len = event_end - event_start
+            
+            # Write val_data times (only real timesteps)
+            times_array = np.array([val_data['times'][t][0] for t in range(val_len)], dtype=np.float32)
+            h5f['val_data/times'][val_start:val_end] = times_array
+            
+            # Write numeric data
+            if dims['n_numeric_feats'] > 0:
+                ind_array = np.zeros((val_len, dims['n_numeric_feats']), dtype=np.uint8)
+                for t in range(val_len):
+                    for f in range(dims['n_numeric_feats']):
+                        ind_array[t, f] = val_data['numeric']['indicators'][t][f][0]
+                h5f['val_data/numeric/indicators'][val_start:val_end] = ind_array
+                
+                for f, feat_dim in enumerate(dims['numeric_feat_dims']):
+                    val_array = np.zeros((val_len, feat_dim), dtype=np.float32)
+                    for t in range(val_len):
+                        arr = val_data['numeric']['values'][t][f]
+                        val_array[t, :len(arr)] = arr
+                    h5f[f'val_data/numeric/values_{f}'][val_start:val_end] = val_array
+            
+            # Write categorical data
+            if dims['n_categorical_feats'] > 0:
+                ind_array = np.zeros((val_len, dims['n_categorical_feats']), dtype=np.uint8)
+                for t in range(val_len):
+                    for f in range(dims['n_categorical_feats']):
+                        ind_array[t, f] = val_data['categorical']['indicators'][t][f][0]
+                h5f['val_data/categorical/indicators'][val_start:val_end] = ind_array
+                
+                for f, feat_dim in enumerate(dims['categorical_feat_dims']):
+                    val_array = np.zeros((val_len, feat_dim), dtype=np.int32)
+                    for t in range(val_len):
+                        arr = val_data['categorical']['values'][t][f]
+                        val_array[t, :len(arr)] = arr
+                    h5f[f'val_data/categorical/values_{f}'][val_start:val_end] = val_array
+            
+            # Write text data (sparse)
+            if dims['n_text_feats'] > 0:
+                ind_array = np.zeros((val_len, dims['n_text_feats']), dtype=np.uint8)
+                for t in range(val_len):
+                    for f in range(dims['n_text_feats']):
+                        ind_array[t, f] = val_data['text']['indicators'][t][f][0]
+                h5f['val_data/text/indicators'][val_start:val_end] = ind_array
+                
+                for f, feat_dim in enumerate(dims['text_feat_dims']):
+                    # Collect text occurrences for this episode
+                    text_timesteps = []
+                    text_values = []
+                    text_masks = []
+                    for t in range(val_len):
+                        if val_data['text']['indicators'][t][f][0] == 1:
+                            text_timesteps.append(t)
+                            text_values.append(val_data['text']['values'][t][f])
+                            text_masks.append(val_data['text']['masks'][t][f])
+                    
+                    n_texts = len(text_timesteps)
+                    if n_texts > 0:
+                        write_start = text_write_pos[f]
+                        write_end = write_start + n_texts
+                        
+                        h5f[f'val_data/text/feat_{f}/timestep_indices'][write_start:write_end] = \
+                            np.array(text_timesteps, dtype=np.int32)
+                        
+                        values_array = np.zeros((n_texts, feat_dim), dtype=np.int32)
+                        masks_array = np.zeros((n_texts, feat_dim), dtype=np.uint8)
+                        for j, (v, m) in enumerate(zip(text_values, text_masks)):
+                            values_array[j, :len(v)] = v
+                            masks_array[j, :len(m)] = m
+                        h5f[f'val_data/text/feat_{f}/values'][write_start:write_end] = values_array
+                        h5f[f'val_data/text/feat_{f}/masks'][write_start:write_end] = masks_array
+                        
+                        text_write_pos[f] = write_end
+            
+            # Write event data
+            event_times = np.array([event_data['times'][t][0] for t in range(event_len)], dtype=np.float32)
+            h5f['event_data/times'][event_start:event_end] = event_times
+            
+            if dims['n_event_feats'] > 0:
+                ind_array = np.zeros((event_len, dims['n_event_feats']), dtype=np.uint8)
+                for t in range(event_len):
                     for f in range(dims['n_event_feats']):
-                        ind_array[i, t, f] = event_data['indicators'][t][f][0]
-            event_grp.create_dataset('indicators', data=ind_array, **comp_kwargs)
-            del ind_array
-        
-        times_array = np.zeros((n_episodes, dims['max_ts_len_event']), dtype=np.float32)
-        masks_array = np.zeros((n_episodes, dims['max_ts_len_event']), dtype=np.uint8)
-        for i, event_data in enumerate(all_event_data):
-            for t in range(dims['max_ts_len_event']):
-                times_array[i, t] = event_data['times'][t][0]
-                masks_array[i, t] = event_data['masks'][t][0]
-        event_grp.create_dataset('times', data=times_array, **comp_kwargs)
-        event_grp.create_dataset('masks', data=masks_array, **comp_kwargs)
-        del times_array, masks_array
-        
-        # Static data
-        static_array = np.zeros((n_episodes, dims['static_total_dim']), dtype=np.float32)
-        for i, static_data in enumerate(all_static_data):
+                        ind_array[t, f] = event_data['indicators'][t][f][0]
+                h5f['event_data/indicators'][event_start:event_end] = ind_array
+            
+            # Write static data
+            static_array = np.zeros(dims['static_total_dim'], dtype=np.float32)
             offset = 0
             for arr in static_data:
-                static_array[i, offset:offset + len(arr)] = arr
+                static_array[offset:offset + len(arr)] = arr
                 offset += len(arr)
-        h5f.create_dataset('static_data', data=static_array, **comp_kwargs)
-        del static_array
-        
-        # Targets
-        targets_grp = h5f.create_group('targets')
-        mortality_array = np.zeros(n_episodes, dtype=np.float32)
-        los_array = np.zeros(n_episodes, dtype=np.float32)
-        phenotype_array = np.zeros((n_episodes, dims['phenotype_dim']), dtype=np.float32)
-        for i, targets in enumerate(all_target_data):
-            mortality_array[i] = targets['mortality']
-            los_array[i] = targets['length_of_stay']
-            phenotype_array[i, :] = targets['phenotype']
-        targets_grp.create_dataset('mortality', data=mortality_array, **comp_kwargs)
-        targets_grp.create_dataset('length_of_stay', data=los_array, **comp_kwargs)
-        targets_grp.create_dataset('phenotype', data=phenotype_array, **comp_kwargs)
+            h5f['static_data'][i] = static_array
+            
+            # Write targets
+            h5f['targets/mortality'][i] = targets['mortality']
+            h5f['targets/length_of_stay'][i] = targets['length_of_stay']
+            h5f['targets/phenotype'][i] = targets['phenotype']
     
     print(f"HDF5 file written: {h5_path}")
 
@@ -1664,7 +1811,6 @@ def extract_mimic_hdf5(
         compression: HDF5 compression ('gzip', 'lzf', or None)
         compression_opts: Compression level (1-9 for gzip)
     """
-    from TransEHR2.constants import MAX_TOKEN_LENGTH
     
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
