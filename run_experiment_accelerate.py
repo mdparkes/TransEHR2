@@ -152,8 +152,8 @@ if __name__ == "__main__":
         help='If specified, pretraining will be performed even if pretrained weights are found'
     )
     parser.add_argument(
-    '--num_workers', type=int, default=0,
-    help='Number of worker processes for data loading. Default is 0 (main process only).'
+        '--num_workers', type=int, default=0,
+        help='Number of worker processes for data loading. Default is 0 (main process only).'
     )
     parser.add_argument(
         '--mem_test_mode', action='store_true',
