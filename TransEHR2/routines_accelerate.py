@@ -469,7 +469,7 @@ def pretrain_one_epoch(
         else:
             thp_type_preds, thp_time_preds = (None, None)
         
-        gen_loss = gen_loss_fn(generator_preds, batch, value_associated_data_masks)
+        gen_loss = gen_loss_fn(generator_preds, electra_output['masked_targets'], value_associated_data_masks)
         disc_loss = disc_loss_fn(discriminator_preds, value_associated_data_masks)
         
         if thp_encodings is not None and 'thp_intensities' in electra_output:
@@ -615,7 +615,7 @@ def pretrain_validate(
             else:
                 thp_type_preds, thp_time_preds = (None, None)
             
-            gen_loss = gen_loss_fn(generator_preds, batch, value_associated_data_masks)
+            gen_loss = gen_loss_fn(generator_preds, electra_output['masked_targets'], value_associated_data_masks)
             disc_loss = disc_loss_fn(discriminator_preds, value_associated_data_masks)
             
             if thp_encodings is not None and 'thp_intensities' in electra_output:

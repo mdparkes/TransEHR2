@@ -8,12 +8,21 @@ from TransEHR2.data.custom_types import EventAssociatedTensorData, MixedTensorDa
 from TransEHR2.utils import calc_time_diff
 
 
+# Type alias for the sparse masked targets structure returned by ELECTRA._extract_masked_targets()
+MaskedTargets = Dict[str, Dict[str, Union[List[Tensor], Tensor]]]
+
+
 class MaskedGeneratorLoss(torch.nn.Module):
     """
     Loss function for MaskedTokenGenerator that handles multiple output types:
     - Numeric features: Squared L2 norm of the difference between targets and predictions, averaged across samples.
     - Categorical features: Cross entropy loss with ignored padding class
     - Text features: Cosine similarity loss (rescaled from [-1,1] to [0,1])
+    
+    This loss function supports two input formats for targets:
+    1. Full batch format (MixedTensorDataset): The original format with complete batch data
+    2. Sparse masked targets format (MaskedTargets): Memory-efficient format containing only
+       values at masked positions, as returned by ELECTRA._extract_masked_targets()
     """
     
     def __init__(
@@ -52,47 +61,212 @@ class MaskedGeneratorLoss(torch.nn.Module):
         self.ce_loss = torch.nn.CrossEntropyLoss(reduction='none')
         self.bce_loss = torch.nn.BCEWithLogitsLoss(reduction='none')
     
-    def _calculate_indicator_loss(self, pred_indicators, target_indicators, feature_masks):
+    def _calculate_indicator_loss_sparse(
+        self, 
+        pred_indicators: Tensor, 
+        target_indicators: Tensor,
+        indicator_mask: Tensor
+    ) -> Tuple[Tensor, int]:
         """
-        Calculate indicator prediction loss for masked values.
+        Calculate indicator prediction loss using sparse masked targets.
         
         Args:
-            pred_indicators (Tensor): Predicted indicators
-            target_indicators (Tensor): Ground truth indicators
-            feature_masks (Tensor): Mask indicating which features were masked
+            pred_indicators: Predicted indicators, shape (batch_size, max_ts_len, n_features)
+            target_indicators: Ground truth indicators at masked positions only (1D flattened tensor)
+            indicator_mask: Boolean mask indicating which positions were masked
             
         Returns:
             Tuple[Tensor, int]: The loss value and number of masked elements
         """
-        # Calculate BCE loss
-        indicator_loss = self.bce_loss(pred_indicators, target_indicators.float())
+        # Extract predictions at masked positions to match sparse target format
+        pred_at_masked = pred_indicators[indicator_mask]
         
-        # Apply mask and sum
-        masked_indicator_loss = (indicator_loss * feature_masks.bool()).sum()
+        # Calculate BCE loss on the sparse tensors
+        indicator_loss = self.bce_loss(pred_at_masked, target_indicators.float())
         
-        # Count number of masked elements
-        n_masked = feature_masks.bool().sum().item()
+        # Sum the loss
+        masked_indicator_loss = indicator_loss.sum()
+        n_masked = target_indicators.numel()
         
         return masked_indicator_loss, n_masked
         
-    def forward(
-        self, 
-        predictions: ValueAssociatedTensorData, 
-        targets: MixedTensorDataset, 
+    def _forward_sparse(
+        self,
+        predictions: ValueAssociatedTensorData,
+        masked_targets: MaskedTargets,
         record_masks: Dict[str, Dict[str, Union[Tensor, List[Tensor]]]]
     ) -> Tensor:
         """
-        Compute combined loss across all feature types.
+        Compute loss using sparse masked targets format (memory-efficient).
+        
+        This method computes loss using only the pre-extracted masked values, avoiding the need
+        to access the full batch tensors. This is more memory-efficient when the batch has already
+        been modified in-place for the discriminator.
         
         Args:
-            predictions (ValueAssociatedTensorData): Output from MaskedTokenGenerator with predicted values
-            targets (MixedTensorDataset): Original batch data with ground truth values
-            record_masks (Dict): Dictionary of masks indicating which values were masked during generation
+            predictions: Output from MaskedTokenGenerator with predicted values
+            masked_targets: Sparse structure containing only values at masked positions
+            record_masks: Dictionary of masks indicating which values were masked
                 
         Returns:
             Tensor: Scalar loss value combining all feature types
         """
-
+        total_loss = 0.0
+        n_masked = 0
+        
+        # Process numeric features
+        if 'numeric' in predictions and 'numeric' in masked_targets:
+            pred_values = predictions['numeric']['values']
+            target_values = masked_targets['numeric']['values']  # List of 1D tensors (masked values only)
+            feature_masks = record_masks['numeric']['indicators']
+            value_masks = record_masks['numeric']['values']
+            
+            numeric_loss = 0.0
+            
+            for f, (pred, target) in enumerate(zip(pred_values, target_values)):
+                # Skip if no masked values for this feature
+                if target.numel() == 0:
+                    continue
+                
+                # Extract predictions at masked positions to match sparse target format
+                value_mask = value_masks[f].bool()
+                pred_at_masked = pred[value_mask]  # 1D tensor matching target shape
+                
+                # Calculate MSE loss on the sparse tensors
+                feature_loss = self.mse_loss(pred_at_masked, target)
+                numeric_loss += feature_loss.sum()
+                n_masked += target.numel()
+            
+            total_loss += self.numeric_weight * numeric_loss
+            
+            # Process indicator predictions if available
+            if 'indicators' in predictions['numeric'] and predictions['numeric']['indicators'] is not None:
+                if 'indicators' in masked_targets['numeric']:
+                    indicator_loss, indicator_n_masked = self._calculate_indicator_loss_sparse(
+                        predictions['numeric']['indicators'],
+                        masked_targets['numeric']['indicators'],
+                        feature_masks.bool()
+                    )
+                    total_loss += self.indicator_weight * indicator_loss
+                    n_masked += indicator_n_masked
+        
+        # Process categorical features
+        if 'categorical' in predictions and 'categorical' in masked_targets:
+            pred_values = predictions['categorical']['values']
+            target_values = masked_targets['categorical']['values']  # List of (n_masked, n_classes) tensors
+            feature_masks = record_masks['categorical']['indicators']
+            
+            cat_loss = 0.0
+            
+            for f, (pred, target) in enumerate(zip(pred_values, target_values)):
+                # Skip if no masked values for this feature
+                if target.numel() == 0:
+                    continue
+                
+                # Extract feature mask for this feature
+                feat_mask = feature_masks[:, :, f].bool()
+                
+                # Extract predictions at masked positions
+                # pred shape: (batch_size, max_ts_len, n_classes)
+                # pred_at_masked shape: (n_masked_positions, n_classes)
+                pred_at_masked = pred[feat_mask]
+                
+                # Convert one-hot targets to class indices
+                target_classes = torch.argmax(target, dim=-1)  # (n_masked_positions,)
+                
+                # Calculate CE loss on the sparse tensors
+                feature_loss = self.ce_loss(pred_at_masked, target_classes)
+                cat_loss += feature_loss.sum()
+                n_masked += target_classes.numel()
+            
+            total_loss += self.categorical_weight * cat_loss
+            
+            # Process categorical indicators if available
+            if 'indicators' in predictions['categorical'] and predictions['categorical']['indicators'] is not None:
+                if 'indicators' in masked_targets['categorical']:
+                    indicator_loss, indicator_n_masked = self._calculate_indicator_loss_sparse(
+                        predictions['categorical']['indicators'],
+                        masked_targets['categorical']['indicators'],
+                        feature_masks.bool()
+                    )
+                    total_loss += self.indicator_weight * indicator_loss
+                    n_masked += indicator_n_masked
+        
+        # Process text features
+        if 'text' in predictions and 'text' in masked_targets:
+            if 'embedded_values' in masked_targets['text']:
+                pred_values = predictions['text']['values']  # List of predicted embeddings per feature
+                target_values = masked_targets['text']['embedded_values']  # List of (n_masked, embed_dim) tensors
+                feature_masks = record_masks['text']['indicators']
+                
+                text_loss = 0.0
+                
+                for f, (pred, target) in enumerate(zip(pred_values, target_values)):
+                    # Skip if no masked values for this feature
+                    if target.numel() == 0:
+                        continue
+                    
+                    # Extract feature mask for this feature
+                    feat_mask = feature_masks[:, :, f].bool()
+                    
+                    # Extract predictions at masked positions
+                    # pred shape: (batch_size, max_ts_len, TEXT_EMBED_DIM)
+                    # pred_at_masked shape: (n_masked_positions, TEXT_EMBED_DIM)
+                    pred_at_masked = pred[feat_mask]
+                    
+                    # Normalize embeddings for cosine similarity
+                    # Both pred_at_masked and target have full embedding vectors
+                    pred_norm = F.normalize(pred_at_masked, p=2, dim=-1)
+                    target_norm = F.normalize(target, p=2, dim=-1)
+                    
+                    # Calculate cosine similarity (dot product of normalized vectors)
+                    cosine_sim = torch.sum(pred_norm * target_norm, dim=-1)  # (n_masked_positions,)
+                    
+                    # Convert similarity [-1,1] to distance [0,2] and rescale to [0,1]
+                    cosine_distance = (1.0 - cosine_sim) / 2.0
+                    
+                    text_loss += cosine_distance.sum()
+                    n_masked += cosine_distance.numel()
+                
+                total_loss += self.text_weight * text_loss
+                
+                # Process text indicators if available
+                if 'indicators' in predictions['text'] and predictions['text']['indicators'] is not None:
+                    if 'indicators' in masked_targets['text']:
+                        indicator_loss, indicator_n_masked = self._calculate_indicator_loss_sparse(
+                            predictions['text']['indicators'],
+                            masked_targets['text']['indicators'],
+                            feature_masks.bool()
+                        )
+                        total_loss += self.indicator_weight * indicator_loss
+                        n_masked += indicator_n_masked
+        
+        # Normalize the total loss by the number of masked values
+        if n_masked > 0:
+            total_loss = total_loss / n_masked
+        
+        return total_loss
+    
+    def _forward_full_batch(
+        self,
+        predictions: ValueAssociatedTensorData,
+        targets: MixedTensorDataset,
+        record_masks: Dict[str, Dict[str, Union[Tensor, List[Tensor]]]]
+    ) -> Tensor:
+        """
+        Compute loss using full batch format (original implementation).
+        
+        This is the original loss computation that expects the complete batch with
+        targets['val_data'] containing all values.
+        
+        Args:
+            predictions: Output from MaskedTokenGenerator with predicted values
+            targets: Full batch data with ground truth values in targets['val_data']
+            record_masks: Dictionary of masks indicating which values were masked
+                
+        Returns:
+            Tensor: Scalar loss value combining all feature types
+        """
         total_loss = 0.0
         n_masked = 0  # Count of masked values for normalization
         
@@ -130,7 +304,7 @@ class MaskedGeneratorLoss(torch.nn.Module):
                 
                 # Sum across feature dimensions for each (batch, time) position, then mask with batch_time_mask
                 # to get only the loss for positions where feature is masked
-                pos_loss = masked_loss.sum(dim=-1, keepdim=True) # batch_size, max_ts_len, 1]
+                pos_loss = masked_loss.sum(dim=-1, keepdim=True)  # [batch_size, max_ts_len, 1]
                 pos_loss = torch.where(batch_time_mask, pos_loss, torch.zeros_like(pos_loss))
 
                 # Sum total loss and count masked components
@@ -148,13 +322,12 @@ class MaskedGeneratorLoss(torch.nn.Module):
                 pred_indicators = predictions['numeric']['indicators']  # [batch_size, max_ts_len, n_numeric_feats]
                 target_indicators = targets['val_data']['numeric']['indicators']  # [batch_size, max_ts_len, n_numeric_feats]
                 
-
                 # Calculate indicator loss
-                indicator_loss, indicator_n_masked = self._calculate_indicator_loss(
-                    pred_indicators, target_indicators, feature_masks
-                )
+                indicator_loss = self.bce_loss(pred_indicators, target_indicators.float())
+                masked_indicator_loss = (indicator_loss * feature_masks.bool()).sum()
+                indicator_n_masked = feature_masks.bool().sum().item()
                 
-                total_loss += self.indicator_weight * indicator_loss
+                total_loss += self.indicator_weight * masked_indicator_loss
                 n_masked += indicator_n_masked
         
         # Process categorical features
@@ -206,11 +379,11 @@ class MaskedGeneratorLoss(torch.nn.Module):
                 target_indicators = targets['val_data']['categorical']['indicators']
                 
                 # Calculate indicator loss
-                indicator_loss, indicator_n_masked = self._calculate_indicator_loss(
-                    pred_indicators, target_indicators, feature_masks
-                )
+                indicator_loss = self.bce_loss(pred_indicators, target_indicators.float())
+                masked_indicator_loss = (indicator_loss * feature_masks.bool()).sum()
+                indicator_n_masked = feature_masks.bool().sum().item()
                 
-                total_loss += self.indicator_weight * indicator_loss
+                total_loss += self.indicator_weight * masked_indicator_loss
                 n_masked += indicator_n_masked
         
         # Process text features
@@ -227,10 +400,7 @@ class MaskedGeneratorLoss(torch.nn.Module):
                 target_values = None
                 has_target_embeddings = False
             
-            if not has_target_embeddings:
-                # If no pre-computed embeddings, we can't calculate loss for text
-                pass
-            else:
+            if has_target_embeddings:
                 # Get masks for text features
                 feature_masks = record_masks['text']['indicators']  # [batch_size, max_ts_len, n_text_feats]
                 value_masks = record_masks['text']['embedded_values']  # List of [batch_size, max_ts_len, TEXT_EMBED_DIM]
@@ -260,24 +430,9 @@ class MaskedGeneratorLoss(torch.nn.Module):
                     # Apply feature mask
                     masked_distance = cosine_distance * feat_mask
                     
-                    # Calculate masked components (vectorized)
-                    # Create 3D mask combining feature mask and component mask
-                    combined_mask = feat_mask.unsqueeze(-1) & value_mask.bool()  # [batch_size, max_ts_len, TEXT_EMBED_DIM]
-                    
-                    # Count masked components
-                    component_count = combined_mask.sum().item()
-                    
-                    # If using component-level masking
-                    if component_count > 0:
-                        # Adjust the cosine distance to account for partial embedding masking
-                        # For text, we count each masked embedding as one loss unit regardless of components
-                        # because semantic meaning spans the entire embedding
-                        text_loss += masked_distance.sum()
-                        n_masked += feat_mask.sum().item()
-                    else:
-                        # Just use feature-level mask
-                        text_loss += masked_distance.sum()
-                        n_masked += feat_mask.sum().item()
+                    # For text, count each masked embedding as one loss unit
+                    text_loss += masked_distance.sum()
+                    n_masked += feat_mask.sum().item()
                 
                 total_loss += self.text_weight * text_loss
                 
@@ -287,11 +442,11 @@ class MaskedGeneratorLoss(torch.nn.Module):
                     target_indicators = targets['val_data']['text']['indicators']
                     
                     # Calculate indicator loss
-                    indicator_loss, indicator_n_masked = self._calculate_indicator_loss(
-                        pred_indicators, target_indicators, feature_masks
-                    )
+                    indicator_loss = self.bce_loss(pred_indicators, target_indicators.float())
+                    masked_indicator_loss = (indicator_loss * feature_masks.bool()).sum()
+                    indicator_n_masked = feature_masks.bool().sum().item()
                     
-                    total_loss += self.indicator_weight * indicator_loss
+                    total_loss += self.indicator_weight * masked_indicator_loss
                     n_masked += indicator_n_masked
         
         # Normalize the total loss by the number of masked values
@@ -299,6 +454,40 @@ class MaskedGeneratorLoss(torch.nn.Module):
             total_loss = total_loss / n_masked
         
         return total_loss
+    
+
+    def forward(
+        self, 
+        predictions: ValueAssociatedTensorData, 
+        targets: Union[MixedTensorDataset, MaskedTargets],
+        record_masks: Dict[str, Dict[str, Union[Tensor, List[Tensor]]]]
+    ) -> Tensor:
+        """
+        Compute combined loss across all feature types.
+        
+        This method supports two target formats:
+        1. Full batch (MixedTensorDataset): Contains complete batch with targets['val_data']
+        2. Sparse masked targets (MaskedTargets): Contains only values at masked positions,
+           as returned by ELECTRA._extract_masked_targets(). This format is more memory-efficient.
+        
+        The format is auto-detected based on whether 'val_data' key exists in targets.
+        
+        Args:
+            predictions (ValueAssociatedTensorData): Output from MaskedTokenGenerator with predicted values
+            targets: Either full batch data (MixedTensorDataset) or sparse masked targets (MaskedTargets)
+            record_masks (Dict): Dictionary of masks indicating which values were masked during generation
+                
+        Returns:
+            Tensor: Scalar loss value combining all feature types
+        """
+        # Auto-detect target format: sparse if no 'val_data' key, full batch otherwise
+        use_sparse_targets = 'val_data' not in targets
+        
+        if use_sparse_targets:
+            return self._forward_sparse(predictions, targets, record_masks)
+        else:
+            return self._forward_full_batch(predictions, targets, record_masks)
+    
 
 
 class MaskedDiscriminatorLoss(torch.nn.Module):

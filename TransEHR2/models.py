@@ -13,6 +13,7 @@ from TransEHR2.utils import calc_time_diff, sample_non_event_time_diff
 
 
 class ELECTRA(torch.nn.Module):
+
     def __init__(
         self, 
         generator: MaskedTokenGenerator,
@@ -35,6 +36,106 @@ class ELECTRA(torch.nn.Module):
                 self.llm_module = GradientTraceableLLM()
         else:
             self.llm_module = None
+
+    def _extract_masked_targets(
+        self,
+        value_data: ValueAssociatedTensorData,
+        record_masks: Dict[str, Dict[str, Tensor]]
+    ) -> Dict[str, Dict[str, Union[List[Tensor], Tensor]]]:
+        """
+        Extract original values at masked positions before in-place batch modification.
+        
+        This method captures the ground truth values that will be needed for generator loss
+        computation. By extracting only the masked values (rather than deep-copying the entire
+        batch), we significantly reduce VRAM usage during the forward pass.
+        
+        For numeric features, we store the masked value components (sparse extraction).
+        For categorical features, we store the masked one-hot encoded values.
+        For text features, we store complete embedding vectors at masked positions since
+        the cosine similarity loss requires the full embedding for normalization.
+        
+        Args:
+            value_data: Original value-associated data from the batch, containing numeric,
+                categorical, and/or text features with their values and indicators.
+            record_masks: Masks indicating which records and feature values were hidden from
+                the generator. A value of 1 indicates a record was masked, 0 indicates not.
+                
+        Returns:
+            Dictionary with the same structure as value_data, but containing only the values
+            at masked positions. The structure is:
+            {
+                'numeric': {
+                    'values': List[Tensor],  # Flattened masked values per feature
+                    'indicators': Tensor     # Masked indicator values (if predict_indicators)
+                },
+                'categorical': {
+                    'values': List[Tensor],  # Masked one-hot values per feature  
+                    'indicators': Tensor     # Masked indicator values (if predict_indicators)
+                },
+                'text': {
+                    'embedded_values': List[Tensor],  # Full embeddings at masked positions
+                    'indicators': Tensor              # Masked indicator values (if predict_indicators)
+                }
+            }
+        """
+        masked_targets = {}
+        
+        for feat_type in ['numeric', 'categorical', 'text']:
+            if feat_type not in value_data or feat_type not in record_masks:
+                continue
+                
+            masked_targets[feat_type] = {'values': []}
+            
+            if feat_type == 'numeric':
+                # For numeric features, extract only the masked value components.
+                # Each feature may have different dimensionality, so we store per-feature tensors.
+                for i, orig_vals in enumerate(value_data[feat_type]['values']):
+                    # value_mask shape: (batch_size, max_ts_len, feature_dim)
+                    value_mask = record_masks[feat_type]['values'][i].bool()
+                    # Extract masked values as a 1D tensor of all masked components
+                    # This is memory-efficient as we only store ~15-25% of original values
+                    masked_targets[feat_type]['values'].append(orig_vals[value_mask].clone())
+                    
+            elif feat_type == 'categorical':
+                # For categorical features, extract the full one-hot vectors at masked positions.
+                # We need the complete one-hot encoding to compute cross-entropy loss.
+                feature_masks = record_masks[feat_type]['indicators']  # (batch_size, max_ts_len, n_cat_feats)
+                for i, orig_vals in enumerate(value_data[feat_type]['values']):
+                    # feat_mask shape: (batch_size, max_ts_len)
+                    feat_mask = feature_masks[:, :, i].bool()
+                    # Extract complete one-hot vectors at masked (batch, timestep) positions
+                    # Result shape: (n_masked_positions, n_classes)
+                    masked_targets[feat_type]['values'].append(orig_vals[feat_mask].clone())
+                    
+            elif feat_type == 'text':
+                # For text features, we must store the COMPLETE embedding vectors at masked positions.
+                # The cosine similarity loss requires the full embedding for proper L2 normalization;
+                # storing only masked components would corrupt the similarity computation.
+                if 'embedded_values' in value_data[feat_type]:
+                    # embedded_values shape: (batch_size, max_ts_len, n_text_feats, TEXT_EMBED_DIM)
+                    orig_embeddings = value_data[feat_type]['embedded_values']
+                    feature_masks = record_masks[feat_type]['indicators']  # (batch_size, max_ts_len, n_text_feats)
+                    
+                    masked_targets[feat_type]['embedded_values'] = []
+                    n_text_feats = feature_masks.shape[2]
+                    
+                    for i in range(n_text_feats):
+                        # feat_mask shape: (batch_size, max_ts_len)
+                        feat_mask = feature_masks[:, :, i].bool()
+                        # Extract complete embeddings at masked positions
+                        # Result shape: (n_masked_positions, TEXT_EMBED_DIM)
+                        masked_targets[feat_type]['embedded_values'].append(
+                            orig_embeddings[:, :, i, :][feat_mask].clone()
+                        )
+            
+            # Extract masked indicators if the generator predicts them
+            if self.generator.predict_indicators and value_data[feat_type].get('indicators') is not None:
+                indicator_mask = record_masks[feat_type]['indicators'].bool()
+                masked_targets[feat_type]['indicators'] = (
+                    value_data[feat_type]['indicators'][indicator_mask].clone()
+                )
+        
+        return masked_targets
 
     def _gen_text_embeddings(
         self,
@@ -105,83 +206,72 @@ class ELECTRA(torch.nn.Module):
         return final_embeddings
 
 
-    def _create_discriminator_input(
-                self, 
-                batch: ValueAssociatedTensorData, 
-                gen_output: ValueAssociatedTensorData,
-                record_masks: Dict[str, Dict[str, Tensor]]
-            ) -> ValueAssociatedTensorData:
-            """
-            Create input for discriminator by replacing masked values with generated ones.
-            
-            Args:
-                batch: Original value-associated data from the MixedTensorDataset batch input
-                gen_output: Simulated value-associated data output from the MaskedTokenGenerator
-                record_masks: Masks indicating which records and feature values were hidden from the generator. A value of 1
-                    indicates a record was masked, 0 indicates that it was not.
+    def _prepare_discriminator_input_inplace(
+        self, 
+        value_data: ValueAssociatedTensorData, 
+        gen_output: ValueAssociatedTensorData,
+        record_masks: Dict[str, Dict[str, Tensor]]
+    ) -> None:
+        """
+        Modify value_data in-place to prepare input for the discriminator.
+        
+        This replaces masked values with generator predictions directly in the batch tensors, avoiding the memory overhead of deep-copying the entire batch. The original masked values should be extracted using _extract_masked_targets() BEFORE calling this method.
+        
+        IMPORTANT: This method mutates value_data. After calling this method, the batch will contain generated values at masked positions and should not be used for generator loss computation.
+        
+        Args:
+            value_data: Value-associated data from the batch. Will be modified in-place.
+            gen_output: Simulated value-associated data output from the MaskedTokenGenerator.
+            record_masks: Masks indicating which records and feature values were hidden from
+                the generator. A value of 1 indicates masked, 0 indicates not masked.
                 
-            Returns:
-                Updated batch with masked values replaced by generated ones
-            """
-            # Create a copy of feature value dicts to avoid modifying original when masking
-            disc_input = deepcopy(batch)
-            
-            # Process each feature type
-            for feat_type in ['numeric', 'categorical', 'text']:
-                # The generator output only has keys for feature types that were used for prediction.
-                # If the input batch's feature list for a type was empty, the output will not have a key for that type.
-                # The exception is text, which is only processed if the user initialized the MaskedTokenGenerator with 
-                # n_text_features > 0 (even if text features are present in the input batch).
-                if feat_type not in gen_output or feat_type not in batch:
-                    continue
+        Returns:
+            None. The value_data dictionary is modified in-place.
+        """
+        for feat_type in ['numeric', 'categorical', 'text']:
+            # The generator output only has keys for feature types that were used for prediction.
+            # If the input batch's feature list for a type was empty, the output will not have 
+            # a key for that type. Text is only processed if the MaskedTokenGenerator was 
+            # initialized with n_text_features > 0.
+            if feat_type not in gen_output or feat_type not in value_data:
+                continue
+                
+            if feat_type == 'numeric':
+                # Replace masked numeric values with generator predictions in-place
+                for i, pred_vals in enumerate(gen_output[feat_type]['values']):
+                    # value_mask shape: (batch_size, max_ts_len, feature_dim)
+                    value_mask = record_masks[feat_type]['values'][i].bool()
+                    # In-place update: only modify positions where mask is True
+                    value_data[feat_type]['values'][i][value_mask] = pred_vals[value_mask]
                     
-                if feat_type == 'numeric':
-                    # Numeric values can be used as-is from generator
-                    for i, (pred_vals, orig_vals) in enumerate(
-                        zip(gen_output[feat_type]['values'], disc_input[feat_type]['values'])
-                    ):
-                        # Extract the value component mask for the ith feature
-                        #     mask shape: (batch_size, max_ts_length, feature_dim)
-                        value_mask = record_masks[feat_type]['values'][i].bool()
-                        # Replace the values of masked feature value components with the generated values
-                        disc_input[feat_type]['values'][i] = torch.where(value_mask, pred_vals, orig_vals)
-                        
-                elif feat_type == 'categorical':
-                    # Convert generator logits to class indices for discriminator
-                    for i, (pred_logits, orig_vals) in enumerate(
-                        zip(gen_output[feat_type]['values'], disc_input[feat_type]['values'])
-                    ):
-                        # Extract the value component mask for the ith feature
-                        value_mask = record_masks[feat_type]['values'][i].bool()
-                        # Convert logits to class indices to resemble original data: softmax -> argmax
-                        pred_probs = torch.softmax(pred_logits, dim=-1)
-                        pred_classes = torch.argmax(pred_probs, dim=-1, keepdim=True).float()
-                        # Replace the values of masked feature value components with the class indices
-                        disc_input[feat_type]['values'][i] = torch.where(value_mask, pred_classes, orig_vals)
-                        
-                elif feat_type == 'text':
-                    # Text values are embeddings have a consistent shape for all feature, so a single tensor is used.
-                    #   Shape: (batch_size, max_timeseries_length, n_text_features, TEXT_EMBED_DIM).
-                    pred_vals = torch.stack(gen_output[feat_type]['embedded_values'], dim=2)
-                    orig_vals = disc_input[feat_type]['embedded_values']
+            elif feat_type == 'categorical':
+                # Convert generator logits to class indices and replace in-place
+                for i, pred_logits in enumerate(gen_output[feat_type]['values']):
+                    # value_mask shape: (batch_size, max_ts_len, 1) - categorical features are 1D
+                    value_mask = record_masks[feat_type]['values'][i].bool()
+                    # Convert logits to class indices: softmax -> argmax
+                    pred_probs = torch.softmax(pred_logits, dim=-1)
+                    pred_classes = torch.argmax(pred_probs, dim=-1, keepdim=True).float()
+                    # In-place update at masked positions
+                    value_data[feat_type]['values'][i][value_mask] = pred_classes[value_mask]
+                    
+            elif feat_type == 'text':
+                # Replace masked text embeddings with generator predictions in-place
+                # embedded_values shape: (batch_size, max_ts_len, n_text_feats, TEXT_EMBED_DIM)
+                pred_embeddings = torch.stack(gen_output[feat_type]['embedded_values'], dim=2)
+                # value_mask shape: (batch_size, max_ts_len, n_text_feats, TEXT_EMBED_DIM)
+                value_mask = torch.stack(record_masks[feat_type]['embedded_values'], dim=2).bool()
+                # In-place update at masked positions
+                value_data[feat_type]['embedded_values'][value_mask] = pred_embeddings[value_mask]
 
-                    # Extract the text embedding component mask and convert to boolean tensor
-                    value_mask = torch.stack(record_masks[feat_type]['embedded_values'], dim=2).bool()
+            # Replace masked indicators with predicted ones if available
+            if self.generator.predict_indicators:
+                # Binarize generator's indicator predictions: 0 if value <= 0.5, else 1
+                pred_indicators = (gen_output[feat_type]['indicators'] > 0.5).float()
+                indicator_mask = record_masks[feat_type]['indicators'].bool()
+                # In-place update at masked positions
+                value_data[feat_type]['indicators'][indicator_mask] = pred_indicators[indicator_mask]
 
-                    # Replace the values of masked feature value components with the generated values
-                    disc_input[feat_type]['embedded_values'] = torch.where(value_mask, pred_vals, orig_vals)
-
-                # Replace masked indicators with predicted ones if available
-                if self.generator.predict_indicators:
-                    # Ensure that the generator's indicators are strictly binary: 0 if value <= 0.5, else 1
-                    pred_indicators = (gen_output[feat_type]['indicators'] > 0.5).float()
-                    indicator_mask = record_masks[feat_type]['indicators'].bool()
-                    disc_input[feat_type]['indicators'] = torch.where(
-                        indicator_mask, pred_indicators,
-                        disc_input[feat_type]['indicators']
-                    )
-            
-            return disc_input
     
     def compute_conditional_intensity(self, encodings, prev_event_times, time_diff):
         """Wrapper to access hawkes submodule's method from parent model.
@@ -218,7 +308,13 @@ class ELECTRA(torch.nn.Module):
             thp_loss_mc_samples: Number of Monte Carlo samples for THP loss estimation
             
         Returns:
-            Dict containing event encodings, generator output, and discriminator predictions
+            Dict containing:
+                - 'hawkes_encodings': Event sequence encodings (if event_data present)
+                - 'hawkes_predictions': Tuple of (event_type_pred, time_pred) (if event_data present)
+                - 'thp_intensities': Dict of intensity values for THP loss (if compute_intensities)
+                - 'generator': Generator output predictions
+                - 'discriminator': Discriminator output predictions
+                - 'masked_targets': Extracted original values at masked positions for generator loss
         """
         outputs = {}
         
@@ -266,22 +362,27 @@ class ELECTRA(torch.nn.Module):
         value_data = batch['val_data']  # Extract the ValueAssociatedTensorData from the batch
 
         if self.use_text and 'text' in value_data:
-
             # Process text data through LLM
             text_embeddings = self._gen_text_embeddings(value_data, trace_grads)
-
             # Store embeddings in processed batch
             value_data['text']['embedded_values'] = text_embeddings
+
+        # MEMORY OPTIMIZATION: Extract masked target values BEFORE in-place modification.
+        # This stores only the values needed for generator loss (~15-25% of batch) rather than
+        # deep-copying the entire batch, significantly reducing VRAM usage.
+        masked_targets = self._extract_masked_targets(value_data, record_masks)
+        outputs['masked_targets'] = masked_targets
 
         # Generate predictions for masked values
         gen_output = self.generator(value_data, record_masks)
         outputs['generator'] = gen_output
         
-        # Create input for discriminator by replacing masked values with generated ones
-        disc_input = self._create_discriminator_input(value_data, gen_output, record_masks)
+        # Prepare input for discriminator by replacing masked values with generated ones IN-PLACE.
+        # After this call, value_data contains generated values at masked positions.
+        self._prepare_discriminator_input_inplace(value_data, gen_output, record_masks)
         
-        # Get discriminator predictions
-        disc_output = self.discriminator(disc_input, batch.get('static_data', None))
+        # Get discriminator predictions using the modified batch
+        disc_output = self.discriminator(value_data, batch.get('static_data', None))
         outputs['discriminator'] = disc_output
 
         return outputs
