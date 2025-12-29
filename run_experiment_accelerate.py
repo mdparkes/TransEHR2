@@ -20,7 +20,7 @@ from torch.utils.tensorboard import SummaryWriter
 from typing import List, Union
 
 from TransEHR2.constants import TEXT_EMBED_DIM
-from TransEHR2.data.preprocessing import collate_as_tensors, prepare_dataloaders
+from TransEHR2.data.preprocessing import collate_as_tensors, prepare_dataloaders_hdf5
 from TransEHR2.models import ELECTRA, MixedClassifier
 from TransEHR2.modules import MaskedTokenDiscriminator, MaskedTokenGenerator, TransformerHawkesProcess
 from TransEHR2.modules import EventDataEncoder, ValueDataEncoder
@@ -152,12 +152,17 @@ if __name__ == "__main__":
         help='If specified, pretraining will be performed even if pretrained weights are found'
     )
     parser.add_argument(
+    '--num_workers', type=int, default=0,
+    help='Number of worker processes for data loading. Default is 0 (main process only).'
+    )
+    parser.add_argument(
         '--mem_test_mode', action='store_true',
         help='If specified, runs the pretraining forward and backward passes for a single batch to test memory usage. A message with peak memory usage will be printed before forceful termination.'
     )
     args = vars(parser.parse_args())
 
     force_pretrain = args['force_pretrain']
+    num_workers = args['num_workers']
     mem_test_mode = args['mem_test_mode']
 
     # Get parameters from the config file(s)
@@ -273,8 +278,20 @@ if __name__ == "__main__":
         # Create the list of dataloaders for the training, validation (optional), and test sets
         # Dataloaders serve batched MixedDataset objects
         collate_fn = partial(collate_as_tensors, device=None)  # Accelerate will handle device placement
-        dataloader_list = prepare_dataloaders(fold_dir, BATCH_SIZE, collate_fn=collate_fn)
-        train_loader, val_loader, test_loader = dataloader_list
+        dataloader_list = prepare_dataloaders_hdf5(
+            fold_dir, 
+            BATCH_SIZE, 
+            preload=True,
+            collate_fn=collate_fn,
+            num_workers=num_workers,
+            pin_memory=torch.cuda.is_available()
+        )
+        if len(dataloader_list) == 3:
+            train_loader, val_loader, test_loader = dataloader_list
+        else:
+            # No validation set
+            train_loader, test_loader = dataloader_list[0], dataloader_list[-1]
+            val_loader = None
 
 
         # Initialize models
