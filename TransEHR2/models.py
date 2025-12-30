@@ -205,7 +205,6 @@ class ELECTRA(torch.nn.Module):
 
         return final_embeddings
 
-
     def _prepare_discriminator_input_inplace(
         self, 
         value_data: ValueAssociatedTensorData, 
@@ -215,9 +214,13 @@ class ELECTRA(torch.nn.Module):
         """
         Modify value_data in-place to prepare input for the discriminator.
         
-        This replaces masked values with generator predictions directly in the batch tensors, avoiding the memory overhead of deep-copying the entire batch. The original masked values should be extracted using _extract_masked_targets() BEFORE calling this method.
+        This replaces masked values with generator predictions directly in the batch tensors,
+        avoiding the memory overhead of deep-copying the entire batch. The original masked
+        values should be extracted using _extract_masked_targets() BEFORE calling this method.
         
-        IMPORTANT: This method mutates value_data. After calling this method, the batch will contain generated values at masked positions and should not be used for generator loss computation.
+        IMPORTANT: This method mutates value_data. After calling this method, the batch will
+        contain generated values at masked positions and should not be used for generator
+        loss computation.
         
         Args:
             value_data: Value-associated data from the batch. Will be modified in-place.
@@ -241,8 +244,10 @@ class ELECTRA(torch.nn.Module):
                 for i, pred_vals in enumerate(gen_output[feat_type]['values']):
                     # value_mask shape: (batch_size, max_ts_len, feature_dim)
                     value_mask = record_masks[feat_type]['values'][i].bool()
-                    # In-place update: only modify positions where mask is True
-                    value_data[feat_type]['values'][i][value_mask] = pred_vals[value_mask]
+                    # Get destination tensor and its dtype for casting
+                    dest_tensor = value_data[feat_type]['values'][i]
+                    # In-place update: cast predictions to destination dtype before assignment
+                    dest_tensor[value_mask] = pred_vals[value_mask].to(dest_tensor.dtype)
                     
             elif feat_type == 'categorical':
                 # Convert generator logits to class indices and replace in-place
@@ -252,8 +257,10 @@ class ELECTRA(torch.nn.Module):
                     # Convert logits to class indices: softmax -> argmax
                     pred_probs = torch.softmax(pred_logits, dim=-1)
                     pred_classes = torch.argmax(pred_probs, dim=-1, keepdim=True).float()
-                    # In-place update at masked positions
-                    value_data[feat_type]['values'][i][value_mask] = pred_classes[value_mask]
+                    # Get destination tensor and its dtype for casting
+                    dest_tensor = value_data[feat_type]['values'][i]
+                    # In-place update at masked positions, casting to destination dtype
+                    dest_tensor[value_mask] = pred_classes[value_mask].to(dest_tensor.dtype)
                     
             elif feat_type == 'text':
                 # Replace masked text embeddings with generator predictions in-place
@@ -261,17 +268,20 @@ class ELECTRA(torch.nn.Module):
                 pred_embeddings = torch.stack(gen_output[feat_type]['embedded_values'], dim=2)
                 # value_mask shape: (batch_size, max_ts_len, n_text_feats, TEXT_EMBED_DIM)
                 value_mask = torch.stack(record_masks[feat_type]['embedded_values'], dim=2).bool()
-                # In-place update at masked positions
-                value_data[feat_type]['embedded_values'][value_mask] = pred_embeddings[value_mask]
+                # Get destination tensor and its dtype for casting
+                dest_tensor = value_data[feat_type]['embedded_values']
+                # In-place update at masked positions, casting to destination dtype
+                dest_tensor[value_mask] = pred_embeddings[value_mask].to(dest_tensor.dtype)
 
             # Replace masked indicators with predicted ones if available
             if self.generator.predict_indicators:
                 # Binarize generator's indicator predictions: 0 if value <= 0.5, else 1
                 pred_indicators = (gen_output[feat_type]['indicators'] > 0.5).float()
                 indicator_mask = record_masks[feat_type]['indicators'].bool()
-                # In-place update at masked positions
-                value_data[feat_type]['indicators'][indicator_mask] = pred_indicators[indicator_mask]
-
+                # Get destination tensor and its dtype for casting
+                dest_tensor = value_data[feat_type]['indicators']
+                # In-place update at masked positions, casting to destination dtype
+                dest_tensor[indicator_mask] = pred_indicators[indicator_mask].to(dest_tensor.dtype)
     
     def compute_conditional_intensity(self, encodings, prev_event_times, time_diff):
         """Wrapper to access hawkes submodule's method from parent model.

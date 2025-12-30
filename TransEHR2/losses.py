@@ -81,8 +81,11 @@ class MaskedGeneratorLoss(torch.nn.Module):
         # Extract predictions at masked positions to match sparse target format
         pred_at_masked = pred_indicators[indicator_mask]
         
+        # Cast target to match prediction dtype for mixed precision compatibility
+        target_casted = target_indicators.to(pred_at_masked.dtype)
+        
         # Calculate BCE loss on the sparse tensors
-        indicator_loss = self.bce_loss(pred_at_masked, target_indicators.float())
+        indicator_loss = self.bce_loss(pred_at_masked, target_casted)
         
         # Sum the loss
         masked_indicator_loss = indicator_loss.sum()
@@ -132,8 +135,11 @@ class MaskedGeneratorLoss(torch.nn.Module):
                 value_mask = value_masks[f].bool()
                 pred_at_masked = pred[value_mask]  # 1D tensor matching target shape
                 
+                # Cast target to match prediction dtype for mixed precision compatibility
+                target_casted = target.to(pred_at_masked.dtype)
+                
                 # Calculate MSE loss on the sparse tensors
-                feature_loss = self.mse_loss(pred_at_masked, target)
+                feature_loss = self.mse_loss(pred_at_masked, target_casted)
                 numeric_loss += feature_loss.sum()
                 n_masked += target.numel()
             
@@ -172,6 +178,7 @@ class MaskedGeneratorLoss(torch.nn.Module):
                 pred_at_masked = pred[feat_mask]
                 
                 # Convert one-hot targets to class indices
+                # Note: argmax returns int64 which is expected by CrossEntropyLoss, no dtype cast needed
                 target_classes = torch.argmax(target, dim=-1)  # (n_masked_positions,)
                 
                 # Calculate CE loss on the sparse tensors
@@ -214,10 +221,13 @@ class MaskedGeneratorLoss(torch.nn.Module):
                     # pred_at_masked shape: (n_masked_positions, TEXT_EMBED_DIM)
                     pred_at_masked = pred[feat_mask]
                     
+                    # Cast target to match prediction dtype for mixed precision compatibility
+                    target_casted = target.to(pred_at_masked.dtype)
+                    
                     # Normalize embeddings for cosine similarity
-                    # Both pred_at_masked and target have full embedding vectors
+                    # Both pred_at_masked and target_casted have full embedding vectors
                     pred_norm = F.normalize(pred_at_masked, p=2, dim=-1)
-                    target_norm = F.normalize(target, p=2, dim=-1)
+                    target_norm = F.normalize(target_casted, p=2, dim=-1)
                     
                     # Calculate cosine similarity (dot product of normalized vectors)
                     cosine_sim = torch.sum(pred_norm * target_norm, dim=-1)  # (n_masked_positions,)
