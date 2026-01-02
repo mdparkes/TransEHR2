@@ -91,6 +91,9 @@ TransEHR2/configs/**/test*.yaml
 # Test script
 test_run_experiment_accelerate.py
 
+# Development notes
+notes.md
+
 # PyTorch / Training artifacts
 *.pt
 *.pth

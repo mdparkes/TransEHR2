@@ -580,7 +580,8 @@ if __name__ == "__main__":
                     learning_rate_decay=FINETUNE_LEARNING_RATE_DECAY,
                     total_epoch=FINETUNE_TOTAL_EPOCH,
                     checkpoint_dir=checkpoint_dir,
-                    accelerator=accelerator
+                    accelerator=accelerator,
+                    mem_test_mode=mem_test_mode
                 )
             except Exception as e:
                 if accelerator.is_main_process:
@@ -668,7 +669,8 @@ if __name__ == "__main__":
                 model=downstream_predictor,
                 loader=wrapped_test_loader,
                 task=task,
-                accelerator=accelerator
+                accelerator=accelerator,
+                mem_test_mode=mem_test_mode
             )
 
 

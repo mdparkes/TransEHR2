@@ -505,8 +505,9 @@ def pretrain_one_epoch(
         optimizer.step()
 
         if mem_test_mode:
+            print("Memory usage during pretraining training:", flush=True)
             print_peak_memory(accelerator)
-            raise Exception("Memory test mode enabled, terminating after one batch.")
+            break  # Exit after one batch for memory testing
 
     # Gather and average losses across all ranks
     train_losses = accelerator.gather(torch.tensor(train_losses, device=accelerator.device))
@@ -567,7 +568,8 @@ def pretrain_validate(
     obs_unobs_sample_ratio: float,
     cmpnt_mask_ratio: float,
     accelerator: Accelerator,
-    desc: str = "Validation"
+    desc: str = "Validation",
+    mem_test_mode: bool = False
 ) -> Dict[str, float]:
     """Execute one epoch of pretraining validation.
     
@@ -645,6 +647,11 @@ def pretrain_validate(
             val_losses.append(loss.item())
             val_gen_losses.append(gen_loss.item())
             val_disc_losses.append(disc_loss.item())
+
+            if mem_test_mode:
+                print("Memory usage during pretraining validation:", flush=True)
+                print_peak_memory(accelerator)
+                break  # Exit after one batch for memory testing
 
     # Gather and average losses across all ranks
     val_losses = accelerator.gather(torch.tensor(val_losses, device=accelerator.device))
@@ -781,7 +788,8 @@ def evaluate_finetuned_model(
     accelerator: Accelerator,
     prefix: str = '',
     global_step: int = 0,
-    writer: Optional[torch.utils.tensorboard.SummaryWriter] = None
+    writer: Optional[torch.utils.tensorboard.SummaryWriter] = None,
+    mem_test_mode: bool = False
 ) -> Dict[str, Any]:
     """Evaluates model performance for different tasks with Accelerate support.
 
@@ -793,6 +801,7 @@ def evaluate_finetuned_model(
         prefix: Prefix for TensorBoard logging
         global_step: Current training step
         writer: TensorBoard SummaryWriter object for logging
+        mem_test_mode: If True, runs only one batch for memory testing
 
     Returns:
         Task-specific losses and performance metrics
@@ -815,7 +824,7 @@ def evaluate_finetuned_model(
         desc = f'Evaluating {task} model performance'
         disable = not accelerator.is_local_main_process
 
-        for batch_idx, batch in enumerate(tqdm(loader, desc=desc, leave=False, disable=disable)):
+        for batch in tqdm(loader, desc=desc, leave=False, disable=disable):
             
             # Prepare input tensors
             # batch = prepare_input_tensors(batch, device=accelerator.device)
@@ -835,9 +844,16 @@ def evaluate_finetuned_model(
             val_preds.append(preds)
             val_targs.append(targets.detach())
 
+            if mem_test_mode:
+                print("Memory usage during finetuned model evaluation:", flush=True)
+                print_peak_memory(accelerator)  # Exit after one batch for memory testing
+
             # Explicitly delete large tensors and free cache
             del logits, batch
             torch.cuda.empty_cache()
+
+            if mem_test_mode:
+                break  # Exit after one batch for memory testing
 
         # Concatenate all local results
         if len(val_preds) > 0:
@@ -1077,7 +1093,8 @@ def pretrain_model(
             obs_unobs_sample_ratio=obs_unobs_sample_ratio,
             cmpnt_mask_ratio=cmpnt_mask_ratio,
             accelerator=accelerator,
-            desc=f"Epoch {epoch + 1} Validation"
+            desc=f"Epoch {epoch + 1} Validation",
+            mem_test_mode=mem_test_mode
         )
 
         # Logging
@@ -1196,7 +1213,8 @@ def finetune_model(
     checkpoint_dir: str = None,
     resume_from_checkpoint: bool = True,
     timer: Optional[DistributedTimer] = None,
-    accelerator: Accelerator = None
+    accelerator: Accelerator = None,
+    mem_test_mode: bool = False
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Fine-tune a pretrained model with Accelerate support (FSDP or DDP).
     
@@ -1213,6 +1231,8 @@ def finetune_model(
         resume_from_checkpoint: Whether to resume from checkpoint
         timer: Timer for tracking training time
         accelerator: Accelerator instance for distributed training
+        mem_test_mode: If True, runs the forward and backward passes on a single batch and reports memory usage. Useful
+            for figuring out batch size limits.
     
     Returns:
         Tuple of (best_train_scores, best_val_scores) dictionaries
@@ -1329,6 +1349,11 @@ def finetune_model(
             accelerator.backward(loss)
             optimizer.step()
 
+            if mem_test_mode:
+                print("Memory usage during finetuning training:", flush=True)
+                print_peak_memory(accelerator)
+                break  # Exit after one batch for memory testing
+
         # Concatenate all local results
         if len(train_preds) > 0:
             train_losses = torch.stack(train_losses, dim=0)
@@ -1379,7 +1404,8 @@ def finetune_model(
             accelerator=accelerator,
             global_step=(epoch + 1),
             prefix='val',
-            writer=writer
+            writer=writer,
+            mem_test_mode=mem_test_mode
         )
 
         # Check for improvement
