@@ -441,7 +441,7 @@ def pretrain_one_epoch(
 
     disable_tqdm = not accelerator.is_local_main_process
 
-    for batch in tqdm(loader, desc=desc, leave=False, disable=disable_tqdm):
+    for i, batch in enumerate(tqdm(loader, desc=desc, leave=False, disable=disable_tqdm)):
         
         value_associated_data_masks, _ = generate_record_masks(
             batch,
@@ -505,9 +505,11 @@ def pretrain_one_epoch(
         optimizer.step()
 
         if mem_test_mode:
-            print("Memory usage during pretraining training:", flush=True)
+            if accelerator.is_main_process:
+                print("Memory usage during pretraining training:", flush=True)
             print_peak_memory(accelerator)
-            break  # Exit after one batch for memory testing
+            if i == 0:
+                break  # Exit after one batch for memory testing
 
     # Gather and average losses across all ranks
     train_losses = accelerator.gather(torch.tensor(train_losses, device=accelerator.device))
@@ -589,7 +591,7 @@ def pretrain_validate(
     disable_tqdm = not accelerator.is_local_main_process
 
     with torch.no_grad():
-        for batch in tqdm(loader, desc=desc, leave=False, disable=disable_tqdm):
+        for i, batch in enumerate(tqdm(loader, desc=desc, leave=False, disable=disable_tqdm)):
 
             value_associated_data_masks, _ = generate_record_masks(
                 batch,
@@ -649,9 +651,11 @@ def pretrain_validate(
             val_disc_losses.append(disc_loss.item())
 
             if mem_test_mode:
-                print("Memory usage during pretraining validation:", flush=True)
+                if accelerator.is_main_process:
+                    print("Memory usage during pretraining validation:", flush=True)
                 print_peak_memory(accelerator)
-                break  # Exit after one batch for memory testing
+                if i == 0:    
+                    break  # Exit after one batch for memory testing
 
     # Gather and average losses across all ranks
     val_losses = accelerator.gather(torch.tensor(val_losses, device=accelerator.device))
