@@ -91,7 +91,7 @@ def reshape_flattened_state_dict(
                     # Keep original shape if reshape would fail
                     reshaped_state_dict[clean_key] = tensor.clone()
                 else:
-                    print(f"Reshaping {clean_key}: {tensor.shape} -> {expected_shape}")
+                    # print(f"Reshaping {clean_key}: {tensor.shape} -> {expected_shape}")
                     reshaped_state_dict[clean_key] = tensor.reshape(expected_shape).clone()
             else:
                 reshaped_state_dict[clean_key] = tensor.clone()
@@ -440,16 +440,18 @@ def pretrain_one_epoch(
     train_thp_time_losses = []
 
     disable_tqdm = not accelerator.is_local_main_process
+    
+    for i, batch in tqdm(enumerate(loader), desc=desc, leave=False, disable=disable_tqdm):
 
-    for i, batch in enumerate(tqdm(loader, desc=desc, leave=False, disable=disable_tqdm)):
-        
         value_associated_data_masks, _ = generate_record_masks(
             batch,
             feature_sample_rate=record_mask_ratio,
             obs_unobs_ratio=obs_unobs_sample_ratio,
             subsample_rate=cmpnt_mask_ratio
         )
-        
+
+        accelerator.wait_for_everyone()
+
         electra_output = model(
             batch,
             value_associated_data_masks,
@@ -468,7 +470,7 @@ def pretrain_one_epoch(
             thp_type_preds, thp_time_preds = thp_preds
         else:
             thp_type_preds, thp_time_preds = (None, None)
-        
+
         gen_loss = gen_loss_fn(generator_preds, electra_output['masked_targets'], value_associated_data_masks)
         disc_loss = disc_loss_fn(discriminator_preds, value_associated_data_masks)
         
@@ -503,13 +505,13 @@ def pretrain_one_epoch(
         optimizer.zero_grad()
         accelerator.backward(loss)
         optimizer.step()
+        accelerator.wait_for_everyone()
 
-        if mem_test_mode:
+        if mem_test_mode and i == 1:
             if accelerator.is_main_process:
                 print("Memory usage during pretraining training:", flush=True)
             print_peak_memory(accelerator)
-            if i == 0:
-                break  # Exit after one batch for memory testing
+            break  # Exit after two batches for memory testing
 
     # Gather and average losses across all ranks
     train_losses = accelerator.gather(torch.tensor(train_losses, device=accelerator.device))
@@ -591,7 +593,7 @@ def pretrain_validate(
     disable_tqdm = not accelerator.is_local_main_process
 
     with torch.no_grad():
-        for i, batch in enumerate(tqdm(loader, desc=desc, leave=False, disable=disable_tqdm)):
+        for i, batch in tqdm(enumerate(loader), desc=desc, leave=False, disable=disable_tqdm):
 
             value_associated_data_masks, _ = generate_record_masks(
                 batch,
@@ -650,12 +652,22 @@ def pretrain_validate(
             val_gen_losses.append(gen_loss.item())
             val_disc_losses.append(disc_loss.item())
 
-            if mem_test_mode:
+            del electra_output, generator_preds, discriminator_preds
+            del thp_encodings, thp_preds, thp_type_preds, thp_time_preds
+            del gen_loss, disc_loss, loss
+            del batch, value_associated_data_masks
+            if 'intensities' in dir():
+                del intensities
+            if 'event_data' in dir():
+                del event_data
+            torch.cuda.empty_cache()
+            accelerator.wait_for_everyone()
+
+            if mem_test_mode and i == 1:
                 if accelerator.is_main_process:
                     print("Memory usage during pretraining validation:", flush=True)
-                print_peak_memory(accelerator)
-                if i == 0:    
-                    break  # Exit after one batch for memory testing
+                print_peak_memory(accelerator)   
+                break  # Exit after two batches for memory testing
 
     # Gather and average losses across all ranks
     val_losses = accelerator.gather(torch.tensor(val_losses, device=accelerator.device))
@@ -828,7 +840,7 @@ def evaluate_finetuned_model(
         desc = f'Evaluating {task} model performance'
         disable = not accelerator.is_local_main_process
 
-        for batch in tqdm(loader, desc=desc, leave=False, disable=disable):
+        for i, batch in tqdm(enumerate(loader), desc=desc, leave=False, disable=disable):
             
             # Prepare input tensors
             # batch = prepare_input_tensors(batch, device=accelerator.device)
@@ -848,16 +860,16 @@ def evaluate_finetuned_model(
             val_preds.append(preds)
             val_targs.append(targets.detach())
 
-            if mem_test_mode:
-                print("Memory usage during finetuned model evaluation:", flush=True)
-                print_peak_memory(accelerator)  # Exit after one batch for memory testing
+            if mem_test_mode and i == 1:
+                if accelerator.is_main_process:
+                    print("Memory usage during finetuned model evaluation:", flush=True)
+                print_peak_memory(accelerator)
+                break  # Exit after two batches for memory testing
 
             # Explicitly delete large tensors and free cache
             del logits, batch
             torch.cuda.empty_cache()
 
-            if mem_test_mode:
-                break  # Exit after one batch for memory testing
 
         # Concatenate all local results
         if len(val_preds) > 0:
@@ -963,8 +975,8 @@ def pretrain_model(
         Tuple of (best_train_losses, best_val_losses) dictionaries
     """
 
-    report_freq = 5
-    chkpt_freq = 5
+    report_freq = 10
+    chkpt_freq = 10
 
     if accelerator is None:
         raise ValueError("accelerator must be provided for distributed training")
@@ -1242,7 +1254,7 @@ def finetune_model(
         Tuple of (best_train_scores, best_val_scores) dictionaries
     """
 
-    chkpt_freq = 5
+    chkpt_freq = 10
 
     if accelerator is None:
         raise ValueError("accelerator must be provided for distributed training")
@@ -1331,7 +1343,7 @@ def finetune_model(
 
         desc = f"Epoch {epoch + 1}, Training"
         disable = not accelerator.is_local_main_process
-        for batch in tqdm(train_loader, desc=desc, leave=False, disable=disable):
+        for i, batch in tqdm(enumerate(train_loader), desc=desc, leave=False, disable=disable):
 
             # batch = prepare_input_tensors(batch, device=accelerator.device)
             logits = model(batch)
@@ -1354,9 +1366,11 @@ def finetune_model(
             optimizer.step()
 
             if mem_test_mode:
-                print("Memory usage during finetuning training:", flush=True)
+                if accelerator.is_main_process:
+                    print("Memory usage during finetuning training:", flush=True)
                 print_peak_memory(accelerator)
-                break  # Exit after one batch for memory testing
+                if i == 1:
+                    break  # Exit after two batches for memory testing
 
         # Concatenate all local results
         if len(train_preds) > 0:
@@ -1538,8 +1552,8 @@ def pretrain_with_hyperparameter(
         Tuple of (best_train_losses, best_val_losses) dictionaries
     """
 
-    report_freq = 5
-    chkpt_freq = 5
+    report_freq = 10
+    chkpt_freq = 10
 
 
     if accelerator is None:

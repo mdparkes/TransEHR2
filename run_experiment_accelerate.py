@@ -15,12 +15,11 @@ import yaml
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import broadcast, broadcast_object_list
 from accelerate.utils import DistributedType
-from functools import partial
 from torch.utils.tensorboard import SummaryWriter
 from typing import List, Union
 
 from TransEHR2.constants import TEXT_EMBED_DIM
-from TransEHR2.data.preprocessing import collate_as_tensors, prepare_dataloaders_hdf5
+from TransEHR2.data.preprocessing import prepare_dataloaders_tensorized
 from TransEHR2.models import ELECTRA, MixedClassifier
 from TransEHR2.modules import MaskedTokenDiscriminator, MaskedTokenGenerator, TransformerHawkesProcess
 from TransEHR2.modules import EventDataEncoder, ValueDataEncoder
@@ -45,21 +44,16 @@ def initialize_accelerator(use_text: bool) -> Accelerator:
         ValueError: If the accelerator's distributed type does not match the expected type based on use_text.
     """
 
-    if use_text:
-        accelerator = Accelerator()
-    else:
-        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-        accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
     
-    if use_text and accelerator.distributed_type != DistributedType.FSDP:
+    if use_text and accelerator.distributed_type not in (DistributedType.FSDP, DistributedType.MULTI_GPU):
         raise ValueError(
-            f"USE_TEXT=True requires FSDP but accelerator is configured for {accelerator.distributed_type}. "
-            f"Please update your accelerate config to use FSDP."
+            f"USE_TEXT=True requires FSDP or MULTI_GPU but accelerator is configured for {accelerator.distributed_type}."
         )
     elif not use_text and accelerator.distributed_type != DistributedType.MULTI_GPU:
         raise ValueError(
-            f"USE_TEXT=False expects MULTI_GPU (DDP) but accelerator is configured for {accelerator.distributed_type}. "
-            f"Please update your accelerate config to use MULTI_GPU."
+            f"USE_TEXT=False expects MULTI_GPU (DDP) but accelerator is configured for {accelerator.distributed_type}."
         )
     
     return accelerator
@@ -276,15 +270,12 @@ if __name__ == "__main__":
 
         fold_dir = os.path.join(DATA_DIR, fold_name)
         # Create the list of dataloaders for the training, validation (optional), and test sets
-        # Dataloaders serve batched MixedDataset objects
-        collate_fn = partial(collate_as_tensors, device=None)  # Accelerate will handle device placement
-        dataloader_list = prepare_dataloaders_hdf5(
+        dataloader_list = prepare_dataloaders_tensorized(
             fold_dir, 
             BATCH_SIZE, 
-            preload=True,
-            collate_fn=collate_fn,
             num_workers=num_workers,
-            pin_memory=torch.cuda.is_available()
+            pin_memory=torch.cuda.is_available(),
+            prefetch_factor=2
         )
         if len(dataloader_list) == 3:
             train_loader, val_loader, test_loader = dataloader_list

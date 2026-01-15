@@ -425,7 +425,7 @@ def _gen_val_assoc_feat_mask(
     data: Dict, feature_type: str, val_masks: Dict, 
     feature_sample_rate: float, obs_unobs_ratio: float, subsample_rate: float
 ):
-    """Generate value-associated feature masks for batch data.
+    """Generate value-associated feature masks using vectorized operations.
     
     Feature masking is done over all batch instances combined.
     """
@@ -435,10 +435,13 @@ def _gen_val_assoc_feat_mask(
         values_key = 'values'
         values_data = data['val_data'][feature_type][values_key]
     else:
-        values_key = 'embedded_values'  # Key used in val_masks for text features
-    padding_mask = data['val_data']['masks'].unsqueeze(-1)  # Shape: (batch_size, max_ts_len, 1)
+        values_key = 'embedded_values'
+    padding_mask = data['val_data']['masks'].unsqueeze(-1)  # (batch_size, max_ts_len, 1)
 
-    # Count the total number of observed and unobserved features in the whole batch
+    batch_size, max_ts_len, n_features = indicators_data.shape
+    device = indicators_data.device
+
+    # Identify observed and unobserved positions
     obs_feats = (indicators_data == 1) & padding_mask.bool()
     unobs_feats = (indicators_data == 0) & padding_mask.bool()
 
@@ -451,20 +454,60 @@ def _gen_val_assoc_feat_mask(
     n_obs_masked = int(feature_sample_rate * obs_count)
     n_unobs_masked = min(unobs_count, max(1, int(n_obs_masked / obs_unobs_ratio))) if unobs_count > 0 else 0
 
-    for positions, n_masked in [(obs_positions, n_obs_masked), (unobs_positions, n_unobs_masked)]:
-        if n_masked > 0:
-            perm = torch.randperm(positions.size(0))[:n_masked]
-            selected = positions[perm]
-            val_masks[feature_type]['indicators'][selected[:,0], selected[:,1], selected[:,2]] = 1.0
-            # Iterate over selected positions to mask corresponding value components
-            for idx in range(selected.size(0)):
-                b, t, f = selected[idx]  # batch index, timestep, feature
-                feat_dim = TEXT_EMBED_DIM if feature_type == 'text' else values_data[f].shape[-1]
-                n_components_to_mask = max(1, int(subsample_rate * feat_dim))
-                component_indices = torch.randperm(feat_dim)[:n_components_to_mask]
-                val_masks[feature_type][values_key][f][b, t, component_indices] = 1.0
+    # Sample positions globally first
+    selected_obs = None
+    selected_unobs = None
+    
+    if n_obs_masked > 0:
+        perm = torch.randperm(obs_count, device=device)[:n_obs_masked]
+        selected_obs = obs_positions[perm]
+        # Set indicator masks for observed positions
+        val_masks[feature_type]['indicators'][selected_obs[:, 0], selected_obs[:, 1], selected_obs[:, 2]] = 1.0
+    
+    if n_unobs_masked > 0:
+        perm = torch.randperm(unobs_count, device=device)[:n_unobs_masked]
+        selected_unobs = unobs_positions[perm]
+        # Set indicator masks for unobserved positions
+        val_masks[feature_type]['indicators'][selected_unobs[:, 0], selected_unobs[:, 1], selected_unobs[:, 2]] = 1.0
 
-    return val_masks
+    # Combine all selected positions
+    if selected_obs is not None and selected_unobs is not None:
+        all_selected = torch.cat([selected_obs, selected_unobs], dim=0)
+    elif selected_obs is not None:
+        all_selected = selected_obs
+    elif selected_unobs is not None:
+        all_selected = selected_unobs
+    else:
+        return  # Nothing to mask
+
+    # Process value masks per feature (vectorized within each feature)
+    for f in range(n_features):
+        feat_dim = TEXT_EMBED_DIM if feature_type == 'text' else values_data[f].shape[-1]
+        n_components_to_mask = max(1, int(subsample_rate * feat_dim))
+
+        # Filter to positions for this feature
+        feat_mask = all_selected[:, 2] == f
+        feat_positions = all_selected[feat_mask]
+        
+        n_pos = feat_positions.size(0)
+        if n_pos == 0:
+            continue
+
+        # Generate component masks for all positions at once using random sorting
+        rand_vals = torch.rand(n_pos, feat_dim, device=device)
+        _, component_order = rand_vals.sort(dim=1)
+        selected_components = component_order[:, :n_components_to_mask]  # (n_pos, n_components)
+
+        # Build expanded index tensors
+        batch_idx = feat_positions[:, 0].unsqueeze(1).expand(-1, n_components_to_mask)
+        time_idx = feat_positions[:, 1].unsqueeze(1).expand(-1, n_components_to_mask)
+
+        # Flatten and assign
+        val_masks[feature_type][values_key][f][
+            batch_idx.reshape(-1),
+            time_idx.reshape(-1),
+            selected_components.reshape(-1)
+        ] = 1.0
 
 
 def _gen_event_assoc_feat_mask(
@@ -807,3 +850,26 @@ def print_peak_memory(accelerator: Accelerator):
         print("="*60 + "\n")
     
     accelerator.wait_for_everyone()
+    torch.cuda.reset_peak_memory_stats(accelerator.device)
+
+
+def convert_model_to_dtype(model: torch.nn.Module, dtype: torch.dtype = torch.bfloat16) -> torch.nn.Module:
+    """Convert all parameters and buffers in a model to the specified dtype.
+    
+    This should be called BEFORE accelerator.prepare() to ensure FSDP sees uniform dtypes.
+    
+    Args:
+        model: The model to convert
+        dtype: Target dtype (default: torch.bfloat16)
+    
+    Returns:
+        The model with converted parameters/buffers
+    """
+    for param in model.parameters():
+        param.data = param.data.to(dtype)
+    for buffer_name, buffer in model.named_buffers():
+        # Skip buffers that should remain as integers (like position indices)
+        if buffer.dtype in (torch.int64, torch.int32, torch.long, torch.bool):
+            continue
+        buffer.data = buffer.data.to(dtype)
+    return model

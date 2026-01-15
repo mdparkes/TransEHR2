@@ -13,9 +13,15 @@ from TransEHR2.utils import combine_value_and_text_data
 class GradientTraceableLLM(torch.nn.Module):
     """A wrapper for a language model that allows gradients to be traced through it."""
 
-    def __init__(self, model_name: str = LLM_NAME, max_length: int = MAX_TOKEN_LENGTH):
+    def __init__(
+        self, 
+        model_name: str = LLM_NAME,
+        max_length: int = MAX_TOKEN_LENGTH,
+        use_gradient_checkpointing: bool = True
+    ):
 
         super().__init__()
+        self.use_gradient_checkpointing = use_gradient_checkpointing
         # Initialize the model on CPU to avoid GPU memory issues during FSDP wrapping
         # Try to load from local files to avoid hitting rate limits on Hugging Face
         try:
@@ -36,7 +42,8 @@ class GradientTraceableLLM(torch.nn.Module):
         self.model = AutoModel.from_pretrained(
             model_name,
             token=HF_API_TOKEN,
-            device_map='cpu'
+            device_map='cpu',
+            attn_implementation='flash_attention_2' if torch.cuda.is_available() else 'default',
         )
         # Resize to account for padding token
         self.model.resize_token_embeddings(len(self.tokenizer))
@@ -45,6 +52,9 @@ class GradientTraceableLLM(torch.nn.Module):
         # Freeze the LLM parameters to prevent them from being updated during training
         for param in self.model.parameters():
             param.requires_grad = False
+        
+        if self.use_gradient_checkpointing:
+            self.model.gradient_checkpointing_enable()
 
     def forward(
         self, 
