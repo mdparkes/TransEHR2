@@ -41,7 +41,7 @@ PRETRAIN_LEARNING_RATE_DECAY:
   - 0.80
   - 0.50
 
-BATCH_SIZE: 200
+BATCH_SIZE: 60
 
 # Whether to use text data as features
 USE_TEXT: True

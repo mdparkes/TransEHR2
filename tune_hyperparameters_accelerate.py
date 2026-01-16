@@ -1,8 +1,8 @@
 """
-Accelerate-compatible version of test_tune_hyperparameters.py for multi-GPU FSDP training.
+Accelerate-compatible version of hyperparameter tuning for multi-GPU DDP/FSDP training.
 
 Usage:
-    accelerate launch tune_hyperparameters_accelerate.py <dataset_config> <experiment_config>
+    accelerate launch --config_file <accelerate_config> tune_hyperparameters_accelerate.py <dataset_config> <experiment_config> [--num_workers N]
 """
 
 import argparse
@@ -11,19 +11,43 @@ import os
 import torch
 import yaml
 
-from accelerate import Accelerator
-from functools import partial
+from accelerate import Accelerator, DistributedDataParallelKwargs
+from accelerate.utils import DistributedType
 from torch.utils.tensorboard import SummaryWriter
 from typing import Any, Dict, Tuple
 
 from TransEHR2.constants import TEXT_EMBED_DIM
-from TransEHR2.data.preprocessing import collate_as_tensors, prepare_dataloaders
+from TransEHR2.data.preprocessing import prepare_dataloaders
 from TransEHR2.models import ELECTRA
 from TransEHR2.modules import MaskedTokenDiscriminator, MaskedTokenGenerator, TransformerHawkesProcess
 from TransEHR2.modules import EventDataEncoder, ValueDataEncoder
 from TransEHR2.modules import GradientTraceableLLM
 from TransEHR2.routines_accelerate import pretrain_with_hyperparameter
 from TransEHR2.utils import create_timer, convert_to_python_types
+
+
+def initialize_accelerator(use_text: bool) -> Accelerator:
+    """Initialize an Accelerate Accelerator instance with appropriate settings.
+    
+    Args:
+        use_text: Whether the experiment uses text features (requires FSDP or MULTI_GPU).
+        
+    Returns:
+        Configured Accelerator instance.
+    """
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
+    
+    if use_text and accelerator.distributed_type not in (DistributedType.FSDP, DistributedType.MULTI_GPU):
+        raise ValueError(
+            f"USE_TEXT=True requires FSDP or MULTI_GPU but accelerator is configured for {accelerator.distributed_type}."
+        )
+    elif not use_text and accelerator.distributed_type != DistributedType.MULTI_GPU:
+        raise ValueError(
+            f"USE_TEXT=False expects MULTI_GPU (DDP) but accelerator is configured for {accelerator.distributed_type}."
+        )
+    
+    return accelerator
 
 
 class HyperparameterContext:
@@ -105,7 +129,10 @@ def update_evaluation_results(
         fold_name (str): Name of the data fold.
         hp_context (HyperparameterContext): Context manager for hyperparameter settings.
         update_defaults (bool): Flag indicating whether to update results for default hyperparameter values. Typically 
-            this would be done only once after the very first hyperparameter value is tested together with the default values of the rest of the hyperparameters slated for tuning. This ensures that evaluations are not repeated unnecessarily for the default value of each hyperparameter. If True, the function will set this flag to False before returning its value.
+            this would be done only once after the very first hyperparameter value is tested together with the default 
+            values of the rest of the hyperparameters slated for tuning. This ensures that evaluations are not repeated 
+            unnecessarily for the default value of each hyperparameter. If True, the function will set this flag to 
+            False before returning its value.
         accelerator (Accelerator): Accelerator instance for distributed training.
     
     Returns:
@@ -164,12 +191,15 @@ def update_evaluation_results(
 
 if __name__ == "__main__":
 
-
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Tunes hyperparameters with Accelerate')
     parser.add_argument('dataset_config', type=str, help='YAML file for dataset parameters')
     parser.add_argument('experiment_config', type=str, help='YAML file for experiment parameters')
+    parser.add_argument('--num_workers', type=int, default=0,
+                        help='Number of worker processes for data loading. Default is 0.')
     args = vars(parser.parse_args())
+    
+    num_workers = args['num_workers']
 
     # Get dataset config parameters
     with open(args['dataset_config'], 'r') as f_in:
@@ -274,10 +304,19 @@ if __name__ == "__main__":
     os.makedirs(evaluation_dir, exist_ok=True)
 
 
-    # Create dataloaders
-    collate_fn = partial(collate_as_tensors, device=None)  # Let Accelerator handle device placement 
-    dataloader_list = prepare_dataloaders(fold_dir, BATCH_SIZE, collate_fn=collate_fn)
-    train_loader, _, test_loader = dataloader_list
+    # Create dataloaders using the optimized tensorized format
+    dataloader_list = prepare_dataloaders(
+        fold_dir, 
+        BATCH_SIZE, 
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+        prefetch_factor=2 if num_workers > 0 else None
+    )
+    # For HP tuning, we use train and test loaders only (test is used for model selection)
+    if len(dataloader_list) == 3:
+        train_loader, _, test_loader = dataloader_list
+    else:
+        train_loader, test_loader = dataloader_list
 
 
     with HyperparameterContext(HYPERPARAMETERS_TO_TUNE, experiment_config) as hp_context:
@@ -303,17 +342,17 @@ if __name__ == "__main__":
             # Iterate over hyperparameter values
             for value in hp_values:
 
-
-                # Remove the accelerator to avoid issues on next iteration (will be recreated)
+                # Clean up previous accelerator to avoid issues on next iteration
                 # It is removed here instead of at the end of the loop to ensure that there is still an accelerator
-                # instance available for writing the evalution results after the loop finishes.
+                # instance available for writing the evaluation results after the loop finishes.
                 if 'accelerator' in locals():
+                    accelerator.free_memory()
                     del accelerator
-                    torch.cuda.empty_cache()
                     gc.collect()
+                    torch.cuda.empty_cache()
 
-                # Create a fresh Accelerator instance because it solves problems.
-                accelerator = Accelerator()
+                # Create a fresh Accelerator instance with proper DDP settings
+                accelerator = initialize_accelerator(USE_TEXT)
 
 
                 locals()[hp_name] = value
@@ -440,7 +479,7 @@ if __name__ == "__main__":
                 accelerator.wait_for_everyone()
 
 
-                # Clean up model
+                # Clean up model and free memory
                 del electra
                 del generator
                 del discriminator
@@ -449,6 +488,8 @@ if __name__ == "__main__":
                 del discriminator_encoder
                 del thp_encoder
                 del pretrain_llm_module
+                gc.collect()
+                torch.cuda.empty_cache()
                 accelerator.wait_for_everyone()
 
 
