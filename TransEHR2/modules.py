@@ -42,8 +42,7 @@ class GradientTraceableLLM(torch.nn.Module):
         self.model = AutoModel.from_pretrained(
             model_name,
             token=HF_API_TOKEN,
-            device_map='cpu',
-            attn_implementation='flash_attention_2' if torch.cuda.is_available() else 'default',
+            device_map='cpu'
         )
         # Resize to account for padding token
         self.model.resize_token_embeddings(len(self.tokenizer))
