@@ -262,7 +262,7 @@ class MaskedGeneratorLoss(torch.nn.Module):
         # Process text features
         if 'text' in predictions and 'text' in masked_targets:
             if 'embedded_values' in masked_targets['text']:
-                pred_values = predictions['text']['values']
+                pred_values = predictions['text']['embedded_values']
                 target_values = masked_targets['text']['embedded_values']
                 feature_masks = record_masks['text']['indicators']
                 
