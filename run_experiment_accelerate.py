@@ -658,10 +658,9 @@ if __name__ == "__main__":
             # Prepare the model and dataloader with Accelerator and evaluate on test set
             downstream_predictor = accelerator.prepare(downstream_predictor)
             accelerator.wait_for_everyone()
-            wrapped_test_loader = accelerator.prepare(test_loader)  # Original test_loader stays unwrapped
             best_test_scores = evaluate_finetuned_model(
                 model=downstream_predictor,
-                loader=wrapped_test_loader,
+                loader=test_loader,
                 task=task,
                 accelerator=accelerator,
                 mem_test_mode=mem_test_mode
