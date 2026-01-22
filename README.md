@@ -19,17 +19,7 @@ git clone https://github.com/mdparkes/TransEHR2.git && cd TransEHR2
 python -m venv venv/TransEHR2
 ```
 
-Install the required libraries. Note for high performance compute cluster users: you may have to build `transformer-engine` before installing other libraries from `requirements.txt` to use fp8 precision. Try something like
-
-```shell
-source venv/TransEHR2/bin/activate
-pip install wheel
-module load cuda/12.6
-mkdir -p ~/tmp
-TMPDIR=~/tmp pip install --extra-index-url https://pypi.nvidia.com transformer-engine[pytorch,core_cu12]
-pip install -r requirements.txt
-deactivate
-```
+Install the required libraries. Note for high performance compute cluster users: you may have to build `transformer-engine` before installing other libraries from `requirements.txt` to use fp8 precision.
 
 Otherwise, if you don't need fp8 precision, just do
 
