@@ -23,7 +23,7 @@ from TransEHR2.losses import MaskedDiscriminatorLoss, MaskedGeneratorLoss, Trans
 from TransEHR2.models import MixedClassifier
 from TransEHR2.utils import DistributedTimer
 from TransEHR2.utils import format_pretraining_performance_table, generate_record_masks, get_param_shapes
-from TransEHR2.utils import print_peak_memory
+from TransEHR2.utils import print_peak_memory, move_batch_to_device
 
 
 MetadataDict: TypeAlias = Dict[str, Any]
@@ -443,6 +443,8 @@ def pretrain_one_epoch(
     
     for i, batch in tqdm(enumerate(loader), desc=desc, leave=False, disable=disable_tqdm):
 
+        batch = move_batch_to_device(batch, device=accelerator.device)
+
         value_associated_data_masks, _ = generate_record_masks(
             batch,
             feature_sample_rate=record_mask_ratio,
@@ -594,6 +596,8 @@ def pretrain_validate(
 
     with torch.no_grad():
         for i, batch in tqdm(enumerate(loader), desc=desc, leave=False, disable=disable_tqdm):
+
+            batch = move_batch_to_device(batch, device=accelerator.device)
 
             value_associated_data_masks, _ = generate_record_masks(
                 batch,
@@ -841,6 +845,8 @@ def evaluate_finetuned_model(
         disable = not accelerator.is_local_main_process
 
         for i, batch in tqdm(enumerate(loader), desc=desc, leave=False, disable=disable):
+
+            batch = move_batch_to_device(batch, device=accelerator.device)
             
             # Prepare input tensors
             # batch = prepare_input_tensors(batch, device=accelerator.device)
@@ -1355,6 +1361,8 @@ def finetune_model(
         desc = f"Epoch {epoch + 1}, Training"
         disable = not accelerator.is_local_main_process
         for i, batch in tqdm(enumerate(train_loader), desc=desc, leave=False, disable=disable):
+
+            batch = move_batch_to_device(batch, device=accelerator.device)
 
             # batch = prepare_input_tensors(batch, device=accelerator.device)
             logits = model(batch)

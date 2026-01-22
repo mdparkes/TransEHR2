@@ -239,6 +239,34 @@ def create_timer(results_dir: str = None, experiment_name: str = "experiment") -
     return DistributedTimer(results_path=results_path)
 
 
+def move_batch_to_device(batch: MixedTensorDataset, device: torch.device) -> MixedTensorDataset:
+    """Recursively move all tensors in a batch to the specified device.
+    
+    This is needed when using custom samplers that bypass accelerator.prepare_data_loader(),
+    which would otherwise handle automatic device transfer.
+    
+    Args:
+        batch: The batch dictionary from the dataloader
+        device: Target device (e.g., accelerator.device)
+        
+    Returns:
+        The batch with all tensors moved to the specified device
+    """
+    def _move_to_device(obj):
+        if isinstance(obj, torch.Tensor):
+            return obj.to(device, non_blocking=True)
+        elif isinstance(obj, dict):
+            return {k: _move_to_device(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [_move_to_device(item) for item in obj]
+        elif isinstance(obj, tuple):
+            return tuple(_move_to_device(item) for item in obj)
+        else:
+            return obj
+    
+    return _move_to_device(batch)
+
+
 def ensure_float32(data: MixedDataset) -> MixedDataset:
     """Converts float64-valued tensors in `data` to float32.
 
