@@ -452,7 +452,7 @@ class TextBalancedDistributedSampler(Sampler):
             # Pad to make evenly divisible
             self.num_meta_batches = (self.total_size + self.meta_batch_size - 1) // self.meta_batch_size
             self.num_samples = (self.num_meta_batches * self.meta_batch_size) // self.num_replicas
-    
+
     def __iter__(self) -> Iterator[int]:
         # Create generator with seed + epoch for reproducibility
         g = torch.Generator()
@@ -487,19 +487,41 @@ class TextBalancedDistributedSampler(Sampler):
                 if self.drop_last:
                     continue
             
-            # Sort meta-batch by text density (ascending)
-            # After sorting: [light, light, ..., heavy, heavy]
+            # Sort meta-batch by text density (ascending: lightest first)
             meta_batch_sorted = sorted(meta_batch, key=lambda i: self.text_counts[i])
             
-            # Round-robin assignment to ranks
-            # Rank 0 gets indices 0, num_replicas, 2*num_replicas, ...
-            # Rank 1 gets indices 1, num_replicas+1, 2*num_replicas+1, ...
-            # This interleaves light and heavy across all ranks
-            rank_indices = meta_batch_sorted[self.rank::self.num_replicas]
-            balanced_indices.extend(rank_indices)
+            # Pair lightest with heaviest to balance each rank's total text load
+            # E.g., for 16 items [0..15] sorted by density, create pairs:
+            #   (0, 15), (1, 14), (2, 13), ..., (7, 8)
+            # Then assign pairs round-robin to ranks so each rank gets balanced load
+            n_items = len(meta_batch_sorted)
+            n_pairs = n_items // 2
+            
+            # Build pairs: (lightest, heaviest), (2nd lightest, 2nd heaviest), ...
+            pairs = []
+            for i in range(n_pairs):
+                light_idx = meta_batch_sorted[i]
+                heavy_idx = meta_batch_sorted[n_items - 1 - i]
+                pairs.append((light_idx, heavy_idx))
+            
+            # Handle odd item (middle element) if present
+            middle_item = None
+            if n_items % 2 == 1:
+                middle_item = meta_batch_sorted[n_pairs]
+            
+            # Assign pairs to ranks round-robin
+            # Each rank gets every num_replicas-th pair
+            for pair_idx in range(self.rank, n_pairs, self.num_replicas):
+                light_idx, heavy_idx = pairs[pair_idx]
+                balanced_indices.append(light_idx)
+                balanced_indices.append(heavy_idx)
+            
+            # Assign middle item (if any) to rank 0
+            if middle_item is not None and self.rank == 0:
+                balanced_indices.append(middle_item)
         
-        return iter(balanced_indices)
-    
+        return iter(balanced_indices)    
+
     def __len__(self) -> int:
         return self.num_samples
     
@@ -1631,3 +1653,4 @@ def prepare_dataloaders(
         dataloaders.append(loader)
     
     return dataloaders
+    
