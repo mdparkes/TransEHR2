@@ -19,7 +19,7 @@ from torch.utils.tensorboard import SummaryWriter
 from typing import List, Union
 
 from TransEHR2.constants import TEXT_EMBED_DIM
-from TransEHR2.data.preprocessing import prepare_dataloaders_tensorized
+from TransEHR2.data.preprocessing import prepare_dataloaders
 from TransEHR2.models import ELECTRA, MixedClassifier
 from TransEHR2.modules import MaskedTokenDiscriminator, MaskedTokenGenerator, TransformerHawkesProcess
 from TransEHR2.modules import EventDataEncoder, ValueDataEncoder
@@ -270,12 +270,15 @@ if __name__ == "__main__":
 
         fold_dir = os.path.join(DATA_DIR, fold_name)
         # Create the list of dataloaders for the training, validation (optional), and test sets
-        dataloader_list = prepare_dataloaders_tensorized(
+        dataloader_list = prepare_dataloaders(
             fold_dir, 
             BATCH_SIZE, 
             num_workers=num_workers,
             pin_memory=torch.cuda.is_available(),
-            prefetch_factor=2
+            prefetch_factor=2 if num_workers > 0 else 1,
+            balance_text=USE_TEXT,
+            world_size=accelerator.num_processes,
+            rank=accelerator.process_index
         )
         if len(dataloader_list) == 3:
             train_loader, val_loader, test_loader = dataloader_list

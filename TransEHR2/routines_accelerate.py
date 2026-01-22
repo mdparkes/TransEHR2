@@ -1025,9 +1025,10 @@ def pretrain_model(
     model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
     accelerator.wait_for_everyone()  # Ensure model is fully prepared before dataloaders - reduces peak memory usage
 
-    # Prepare parallel dataloaders with Accelerate
-    train_loader = accelerator.prepare_data_loader(train_loader)
-    val_loader = accelerator.prepare_data_loader(val_loader)
+    # Prepare dataloaders - only use accelerator.prepare if not using balanced sampler
+    if not hasattr(train_loader.sampler, 'set_epoch'):
+        train_loader = accelerator.prepare_data_loader(train_loader)
+        val_loader = accelerator.prepare_data_loader(val_loader)
     
     # Set up checkpoint file paths
     if checkpoint_dir is not None:
@@ -1079,6 +1080,10 @@ def pretrain_model(
     early_stopping_counter = training_metadata.get('early_stopping_counter', 0) 
 
     for epoch in tqdm(range(start_epoch, total_epoch), disable=not accelerator.is_local_main_process):
+
+        # Set epoch for balanced sampler shuffling
+        if hasattr(train_loader.sampler, 'set_epoch'):
+            train_loader.sampler.set_epoch(epoch)
 
         # Training phase
         curr_epoch_train_losses = pretrain_one_epoch(
@@ -1296,9 +1301,11 @@ def finetune_model(
     model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
     accelerator.wait_for_everyone()
 
-    # Ensure model is fully prepared before dataloaders - reduces peak memory usage
-    train_loader = accelerator.prepare_data_loader(train_loader)
-    val_loader = accelerator.prepare_data_loader(val_loader)
+    # Prepare dataloaders - only use accelerator.prepare if not using balanced sampler
+    # Preparing the dataloaders after the model reduces peak memory usage
+    if not hasattr(train_loader.sampler, 'set_epoch'):
+        train_loader = accelerator.prepare_data_loader(train_loader)
+        val_loader = accelerator.prepare_data_loader(val_loader)
 
     # Set up checkpoint file paths
     if checkpoint_dir is not None:
@@ -1333,6 +1340,10 @@ def finetune_model(
     early_stopping_counter = training_metadata.get('early_stopping_counter', 0)
 
     for epoch in tqdm(range(start_epoch, total_epoch), disable=not accelerator.is_local_main_process):
+
+        # Set epoch for balanced sampler shuffling
+        if hasattr(train_loader.sampler, 'set_epoch'):
+            train_loader.sampler.set_epoch(epoch)
 
         # Training phase
         model.train()
@@ -1610,9 +1621,10 @@ def pretrain_with_hyperparameter(
     accelerator.wait_for_everyone()  # Ensure model is fully prepared before dataloaders - reduces peak memory usage
 
 
-    # Prepare parallel dataloaders with Accelerate
-    train_loader = accelerator.prepare_data_loader(train_loader)
-    test_loader = accelerator.prepare_data_loader(test_loader)
+    # Prepare dataloaders - only use accelerator.prepare if not using balanced sampler
+    if not hasattr(train_loader.sampler, 'set_epoch'):
+        train_loader = accelerator.prepare_data_loader(train_loader)
+        test_loader = accelerator.prepare_data_loader(test_loader)
 
 
     # Set up checkpoint file paths
@@ -1668,6 +1680,10 @@ def pretrain_with_hyperparameter(
 
 
     for epoch in tqdm(range(start_epoch, total_epoch), disable=not accelerator.is_local_main_process):
+
+        # Set epoch for balanced sampler shuffling
+        if hasattr(train_loader.sampler, 'set_epoch'):
+            train_loader.sampler.set_epoch(epoch)
 
         # Training phase
         curr_epoch_train_losses = pretrain_one_epoch(

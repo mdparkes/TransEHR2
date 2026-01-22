@@ -11,10 +11,10 @@ import yaml
 
 from collections import namedtuple
 from functools import partial
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 from tqdm import tqdm
 from transformers import AutoTokenizer
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, Iterator, List, Optional, Tuple, Union
 
 from TransEHR2.constants import HF_API_TOKEN, LLM_NAME, MAX_TOKEN_LENGTH, TOKENIZER_PAD_TOKEN
 from TransEHR2.data.custom_types import EpisodeData, MixedTensorDataset, TensorDimensions
@@ -370,6 +370,165 @@ class DataProcessor:
         """Find columns matching a feature name in a namedtuple."""
         fields = record._fields if hasattr(record, '_fields') else []
         return [f for f in fields if re.match(f'^{re.escape(base_name)}(_\\d+)?$', f)]
+
+
+class TextBalancedDistributedSampler(Sampler):
+    """
+    Distributed sampler that balances text density across ranks.
+    
+    Within each meta-batch (batch_size * world_size samples), episodes are
+    sorted by text density and assigned to ranks via round-robin, ensuring
+    each rank gets a mix of text-heavy and text-light episodes.
+    
+    This prevents memory imbalance where one GPU gets all text-heavy episodes
+    and OOMs while others sit idle with light batches.
+    
+    Randomness is preserved through:
+    - Global shuffle at start of each epoch
+    - Different episodes grouped into meta-batches each epoch
+    - Only the within-meta-batch distribution is deterministic
+    """
+    
+    def __init__(
+        self,
+        dataset,
+        text_counts: np.ndarray,
+        batch_size: int,
+        num_replicas: Optional[int] = None,
+        rank: Optional[int] = None,
+        shuffle: bool = True,
+        seed: int = 0,
+        drop_last: bool = False
+    ):
+        """
+        Args:
+            dataset: The dataset to sample from
+            text_counts: Array of shape (n_episodes,) with text entry count per episode
+            batch_size: Per-GPU batch size
+            num_replicas: Number of distributed processes (defaults to world size)
+            rank: Rank of current process (defaults to current rank)
+            shuffle: Whether to shuffle indices each epoch
+            seed: Random seed for shuffling
+            drop_last: Whether to drop incomplete final meta-batch
+        """
+        if num_replicas is None:
+            if not torch.distributed.is_available():
+                raise RuntimeError("Requires distributed package")
+            if torch.distributed.is_initialized():
+                num_replicas = torch.distributed.get_world_size()
+            else:
+                num_replicas = 1
+        
+        if rank is None:
+            if not torch.distributed.is_available():
+                raise RuntimeError("Requires distributed package")
+            if torch.distributed.is_initialized():
+                rank = torch.distributed.get_rank()
+            else:
+                rank = 0
+        
+        if rank >= num_replicas or rank < 0:
+            raise ValueError(f"Invalid rank {rank}, must be in [0, {num_replicas})")
+        
+        self.dataset = dataset
+        self.text_counts = np.asarray(text_counts)
+        self.batch_size = batch_size
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.shuffle = shuffle
+        self.seed = seed
+        self.drop_last = drop_last
+        self.epoch = 0
+        
+        # Calculate number of samples per replica
+        self.meta_batch_size = batch_size * num_replicas
+        self.total_size = len(dataset)
+        
+        if self.drop_last and self.total_size % self.meta_batch_size != 0:
+            # Number of complete meta-batches
+            self.num_meta_batches = self.total_size // self.meta_batch_size
+            self.num_samples = (self.num_meta_batches * self.meta_batch_size) // self.num_replicas
+        else:
+            # Pad to make evenly divisible
+            self.num_meta_batches = (self.total_size + self.meta_batch_size - 1) // self.meta_batch_size
+            self.num_samples = (self.num_meta_batches * self.meta_batch_size) // self.num_replicas
+    
+    def __iter__(self) -> Iterator[int]:
+        # Create generator with seed + epoch for reproducibility
+        g = torch.Generator()
+        g.manual_seed(self.seed + self.epoch)
+        
+        # Get all indices
+        n = len(self.dataset)
+        
+        if self.shuffle:
+            indices = torch.randperm(n, generator=g).tolist()
+        else:
+            indices = list(range(n))
+        
+        # Pad if necessary to make evenly divisible by meta_batch_size
+        if not self.drop_last:
+            padding_size = self.num_meta_batches * self.meta_batch_size - n
+            if padding_size > 0:
+                # Pad with repeated indices from the beginning
+                indices += indices[:padding_size]
+        else:
+            # Truncate to complete meta-batches only
+            indices = indices[:self.num_meta_batches * self.meta_batch_size]
+        
+        # Balance within each meta-batch and extract this rank's indices
+        balanced_indices = []
+        
+        for start in range(0, len(indices), self.meta_batch_size):
+            meta_batch = indices[start:start + self.meta_batch_size]
+            
+            if len(meta_batch) < self.meta_batch_size:
+                # Incomplete meta-batch at end (shouldn't happen with padding, but safety check)
+                if self.drop_last:
+                    continue
+            
+            # Sort meta-batch by text density (ascending)
+            # After sorting: [light, light, ..., heavy, heavy]
+            meta_batch_sorted = sorted(meta_batch, key=lambda i: self.text_counts[i])
+            
+            # Round-robin assignment to ranks
+            # Rank 0 gets indices 0, num_replicas, 2*num_replicas, ...
+            # Rank 1 gets indices 1, num_replicas+1, 2*num_replicas+1, ...
+            # This interleaves light and heavy across all ranks
+            rank_indices = meta_batch_sorted[self.rank::self.num_replicas]
+            balanced_indices.extend(rank_indices)
+        
+        return iter(balanced_indices)
+    
+    def __len__(self) -> int:
+        return self.num_samples
+    
+    def set_epoch(self, epoch: int) -> None:
+        """Set epoch for deterministic shuffling across epochs."""
+        self.epoch = epoch
+
+
+def get_text_counts_from_dataset(dataset) -> np.ndarray:
+    """
+    Compute total text entry count per episode from MixedDataset sparse storage.
+    
+    Args:
+        dataset: MixedDataset instance with sparse text storage
+        
+    Returns:
+        Array of shape (n_episodes,) with total text entries per episode
+    """
+    n_episodes = dataset.n_episodes
+    text_counts = np.zeros(n_episodes, dtype=np.int32)
+    
+    # Sum across all text features
+    for f in range(dataset.n_text_feats):
+        offsets = dataset.val_text_offsets[f]
+        # offsets[i+1] - offsets[i] gives count for episode i
+        for i in range(n_episodes):
+            text_counts[i] += int(offsets[i + 1]) - int(offsets[i])
+    
+    return text_counts
 
 
 def _init_tensorized_worker(
@@ -991,6 +1150,26 @@ def standardize_feats(
             arrays['val_numeric_values'][f] /= (p95[f] - p5[f])
 
 
+def get_text_counts_from_dataset_vectorized(dataset) -> np.ndarray:
+    """
+    Compute total text entry count per episode (vectorized version).
+    
+    Args:
+        dataset: MixedDataset instance with sparse text storage
+        
+    Returns:
+        Array of shape (n_episodes,) with total text entries per episode
+    """
+    n_episodes = dataset.n_episodes
+    text_counts = np.zeros(n_episodes, dtype=np.int32)
+    
+    for f in range(dataset.n_text_feats):
+        offsets = np.asarray(dataset.val_text_offsets[f])
+        text_counts += (offsets[1:] - offsets[:-1]).astype(np.int32)
+    
+    return text_counts
+
+
 def extract_mimic(
     reader: MIMICDataReader,
     suffix: str,
@@ -1323,39 +1502,88 @@ def prepare_dataloaders(
     batch_size: int,
     num_workers: int = 4,
     pin_memory: bool = True,
-    prefetch_factor: int = 2
+    prefetch_factor: int = 2,
+    balance_text: bool = False,
+    world_size: Optional[int] = None,
+    rank: Optional[int] = None
 ) -> List[DataLoader]:
     """Prepare training, (validation), and test DataLoaders for MixedDataset.
 
-    This function creates PyTorch DataLoader instances for `MixedDataset` objects prepared by `extract_mimic()`. The dataset uses memory-mapped numpy arrays for efficient multi-worker access with minimal memory overhead. Workers share read-only memory-mapped arrays rather than duplicating data in each worker process' memory space.
+    This function creates PyTorch DataLoader instances for `MixedDataset` objects prepared by 
+    `extract_mimic()`. The dataset uses memory-mapped numpy arrays for efficient multi-worker 
+    access with minimal memory overhead. Workers share read-only memory-mapped arrays rather 
+    than duplicating data in each worker process' memory space.
 
-    The function loads pre-extracted datasets from `{data_dir}/{partition}/` directories, where each directory contains:
+    The function loads pre-extracted datasets from `{data_dir}/{partition}/` directories, where 
+    each directory contains:
         - Dense arrays for feature indicators, times, and masks
-        - Per-feature .npy arrays for numeric and ceategorical feature values
-        - Spare arrays in CSR-style format for text features
+        - Per-feature .npy arrays for numeric and categorical feature values
+        - Sparse arrays in CSR-style format for text features
         - metadata.pkl with dimension information
     
-    Dataloaders are configured for efficient GPU training with configurable worker processes, memory pinning, and batch prefetching. The training loader shuffles data while validation and test loaders maintain sequential order.
+    Dataloaders are configured for efficient GPU training with configurable worker processes, 
+    memory pinning, and batch prefetching. The training loader shuffles data while validation 
+    and test loaders maintain sequential order.
 
-    In multi-GPU setups, a good rule of thumb is to have at least num_workers * num_gpus CPUs, and double that if possible.
+    For distributed training with text features, the optional `balance_text` parameter enables
+    text-balanced sampling across ranks for all partitions (train, val, test). This prevents 
+    memory imbalance where one GPU receives all text-heavy episodes and OOMs while others have 
+    light batches. Within each meta-batch (batch_size * world_size samples), episodes are sorted 
+    by text density and distributed via round-robin to ensure each rank gets a mix of text-heavy 
+    and text-light episodes. For training data, global shuffling is preserved - only 
+    within-meta-batch distribution is deterministic. For validation and test data, ordering is 
+    deterministic but balanced across ranks.
+
+    The function supports three modes:
+        1. Single-GPU: No sampler, standard shuffling for train
+        2. Multi-GPU without balancing: Use accelerator.prepare_data_loader() after calling this
+        3. Multi-GPU with balancing: Pass balance_text=True with world_size and rank
+
+    In multi-GPU setups, a good rule of thumb is to have at least num_workers * num_gpus CPUs, 
+    and double that if possible.
 
     Args:
-        data_dir (str): Directory containing 'train/', 'val/', and 'test/' subdirectories. Each subdirectory should be 
-            the output of `extract_mimic()`.
-        batch_size (int): Number of samples per batch.
+        data_dir (str): Directory containing 'train/', 'val/', and 'test/' subdirectories. Each 
+            subdirectory should be the output of `extract_mimic()`.
+        batch_size (int): Number of samples per batch (per GPU in distributed settings).
         num_workers (int, optional): Number of worker processes for data loading. Defaults to 4.
-        pin_memory (bool, optional): Whether to pin memory in DataLoader for faster GPU transfers. Defaults to True. 
-            Only effective if num_workers > 0.
-        prefetch_factor (int, optional): Number of batches to prefetch per worker. Defaults to 2. Higher values 
-            increase memory usage but can improve throughput if batch processing by the model is slower than data loading. Only effective if num_workers > 0.
+        pin_memory (bool, optional): Whether to pin memory in DataLoader for faster GPU transfers. 
+            Defaults to True. Only effective if num_workers > 0.
+        prefetch_factor (int, optional): Number of batches to prefetch per worker. Defaults to 2. 
+            Higher values increase memory usage but can improve throughput if batch processing by 
+            the model is slower than data loading. Only effective if num_workers > 0.
+        balance_text (bool, optional): If True and running distributed (world_size > 1), use 
+            TextBalancedDistributedSampler to balance text density across ranks for all partitions.
+            This prevents memory imbalance in distributed training with sparse text data. 
+            Defaults to False. When False, no distributed sampler is added - use 
+            accelerator.prepare_data_loader() to add standard distributed sampling.
+        world_size (int, optional): Number of distributed processes. Required if balance_text=True.
+            Can be obtained from accelerator.num_processes.
+        rank (int, optional): Current process rank. Required if balance_text=True. Can be obtained 
+            from accelerator.process_index.
         
     Returns:
-        List[DataLoader]: List of DataLoaders in order: [train_loader, val_loader (if available), test_loader]. If 
-            validation data are not found, only [train_loader, test_loader] is returned.
+        List[DataLoader]: List of DataLoaders in order: [train_loader, val_loader (if available), 
+            test_loader]. If validation data are not found, only [train_loader, test_loader] is 
+            returned.
     
     Raises:
         FileNotFoundError: If 'train/' or 'test/' directories are not found in `data_dir`.
+        ValueError: If balance_text=True but world_size or rank is not provided.
+    
+    Note:
+        When using balance_text=True:
+        - Do NOT wrap the returned dataloaders with accelerator.prepare_data_loader() as the 
+          custom sampler already handles distributed sampling.
+        - Call train_loader.sampler.set_epoch(epoch) at the start of each training epoch to 
+          ensure proper shuffling.
+        
+        When using balance_text=False for distributed training:
+        - Wrap dataloaders with accelerator.prepare_data_loader() to add distributed sampling.
     """
+    if balance_text and (world_size is None or rank is None):
+        raise ValueError("world_size and rank are required when balance_text=True")
+    
     dataloaders = []
     
     for partition in ['train', 'val', 'test']:
@@ -1369,10 +1597,29 @@ def prepare_dataloaders(
         
         dataset = load_dataset(dataset_path)
         
+        # Determine sampler and shuffle behavior
+        sampler = None
+        shuffle = (partition == 'train')
+        
+        # Only add balanced sampler if explicitly requested AND distributed
+        if balance_text and world_size is not None and world_size > 1:
+            text_counts = get_text_counts_from_dataset_vectorized(dataset)
+            sampler = TextBalancedDistributedSampler(
+                dataset=dataset,
+                text_counts=text_counts,
+                batch_size=batch_size,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=shuffle,  # True for train, False for val/test
+                drop_last=False
+            )
+            shuffle = False  # Sampler handles shuffling
+        
         loader = DataLoader(
             dataset,
             batch_size=batch_size,
-            shuffle=(partition == 'train'),
+            shuffle=shuffle if sampler is None else False,
+            sampler=sampler,
             collate_fn=collate_tensorized,
             num_workers=num_workers,
             pin_memory=pin_memory if num_workers > 0 else False,

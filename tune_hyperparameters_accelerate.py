@@ -303,15 +303,28 @@ if __name__ == "__main__":
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(evaluation_dir, exist_ok=True)
 
+    # Get distributed info for dataloader creation
+    # We need world_size and rank before creating dataloaders for text-balanced sampling
+    _temp_accelerator = initialize_accelerator(USE_TEXT)
+    _world_size = _temp_accelerator.num_processes
+    _rank = _temp_accelerator.process_index
+    _temp_accelerator.free_memory()
+    del _temp_accelerator
+    gc.collect()
+    torch.cuda.empty_cache()
 
-    # Create dataloaders using the optimized tensorized format
+    # Create dataloaders using the optimized tensorized format with text-balanced sampling
     dataloader_list = prepare_dataloaders(
         fold_dir, 
         BATCH_SIZE, 
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
-        prefetch_factor=2 if num_workers > 0 else None
+        prefetch_factor=2 if num_workers > 0 else 1,
+        balance_text=USE_TEXT,
+        world_size=_world_size,
+        rank=_rank
     )
+    
     # For HP tuning, we use train and test loaders only (test is used for model selection)
     if len(dataloader_list) == 3:
         train_loader, _, test_loader = dataloader_list
