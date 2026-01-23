@@ -509,18 +509,36 @@ class TextBalancedDistributedSampler(Sampler):
             if n_items % 2 == 1:
                 middle_item = meta_batch_sorted[n_pairs]
             
-            # Assign pairs to ranks round-robin
-            # Each rank gets every num_replicas-th pair
-            for pair_idx in range(self.rank, n_pairs, self.num_replicas):
-                light_idx, heavy_idx = pairs[pair_idx]
-                balanced_indices.append(light_idx)
-                balanced_indices.append(heavy_idx)
+            # Assign pairs to ranks using snake/boustrophedon pattern
+            # This reverses direction each pass through ranks to balance any
+            # systematic bias from pair ordering
+            # E.g., with 4 ranks and 8 pairs:
+            #   Pass 0: pair 0->rank 0, pair 1->rank 1, pair 2->rank 2, pair 3->rank 3
+            #   Pass 1: pair 4->rank 3, pair 5->rank 2, pair 6->rank 1, pair 7->rank 0
+            for pair_idx, (light_idx, heavy_idx) in enumerate(pairs):
+                pass_num = pair_idx // self.num_replicas
+                pos_in_pass = pair_idx % self.num_replicas
+                
+                if pass_num % 2 == 0:
+                    # Forward pass: rank 0, 1, 2, ...
+                    assigned_rank = pos_in_pass
+                else:
+                    # Reverse pass: rank n-1, n-2, ..., 0
+                    assigned_rank = self.num_replicas - 1 - pos_in_pass
+                
+                if assigned_rank == self.rank:
+                    balanced_indices.append(light_idx)
+                    balanced_indices.append(heavy_idx)
             
-            # Assign middle item (if any) to rank 0
-            if middle_item is not None and self.rank == 0:
-                balanced_indices.append(middle_item)
+            # Assign middle item (if any) to rank based on number of passes
+            # Alternate which rank gets the middle item for additional balancing
+            if middle_item is not None:
+                n_passes = (n_pairs + self.num_replicas - 1) // self.num_replicas
+                middle_rank = n_passes % self.num_replicas
+                if self.rank == middle_rank:
+                    balanced_indices.append(middle_item)
         
-        return iter(balanced_indices)    
+        return iter(balanced_indices)
 
     def __len__(self) -> int:
         return self.num_samples
