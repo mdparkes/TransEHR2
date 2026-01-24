@@ -521,11 +521,9 @@ def pretrain_one_epoch(
         accelerator.wait_for_everyone()
 
         # TODO REMOVE DEBUG
-        if accelerator.is_main_process:
+        if accelerator.is_main_process and i < 5:
             print(f"Batch {i}: transfer={t1-t0:.3f}s, masks={t2-t1:.3f}s, "
                 f"forward={t3-t2:.3f}s, loss={t4-t3:.3f}s, backward={t5-t4:.3f}s")
-        if i == 1:
-            break 
         # END DEBUG
 
         if mem_test_mode and i == 1:
