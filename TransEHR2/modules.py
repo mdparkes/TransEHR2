@@ -24,20 +24,20 @@ class GradientTraceableLLM(torch.nn.Module):
         self.use_gradient_checkpointing = use_gradient_checkpointing
         # Initialize the model on CPU to avoid GPU memory issues during FSDP wrapping
         # Try to load from local files to avoid hitting rate limits on Hugging Face
+        # Explicitly use the 3.1-8B tokenizer because the 3.2-1B tokenizer is giving errors
+        tokenizer_name = 'meta-llama/Llama-3.1-8B'
         try:
             self.tokenizer = AutoTokenizer.from_pretrained(
-                model_name, 
+                tokenizer_name, 
                 token=HF_API_TOKEN, 
                 device_map='cpu',
                 local_files_only=True,
-                use_fast=False
             )
         except OSError:
             self.tokenizer = AutoTokenizer.from_pretrained(
-                model_name,
+                tokenizer_name,
                 token=HF_API_TOKEN,
                 device_map='cpu',
-                use_fast=False
             )
         # Using add_special_tokens so that pad_token_id is set automatically
         self.tokenizer.add_special_tokens({'pad_token': TOKENIZER_PAD_TOKEN})
