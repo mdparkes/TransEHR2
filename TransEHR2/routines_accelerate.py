@@ -444,10 +444,7 @@ def pretrain_one_epoch(
     
     for i, batch in tqdm(enumerate(loader), desc=desc, leave=False, disable=disable_tqdm):
 
-        t0 = time.time()  # TODO REMOVE DEBUG
         batch = move_batch_to_device(batch, device=accelerator.device)
-        torch.cuda.synchronize()  # TODO REMOVE DEBUG
-        t1 = time.time()  # TODO REMOVE DEBUG
 
         value_associated_data_masks, _ = generate_record_masks(
             batch,
@@ -455,7 +452,6 @@ def pretrain_one_epoch(
             obs_unobs_ratio=obs_unobs_sample_ratio,
             subsample_rate=cmpnt_mask_ratio
         )
-        t2 = time.time()  # TODO REMOVE DEBUG
 
         accelerator.wait_for_everyone()
 
@@ -467,8 +463,6 @@ def pretrain_one_epoch(
             compute_intensities=True,
             thp_loss_mc_samples=thp_loss_mc_samples
         )
-        torch.cuda.synchronize()  # TODO REMOVE DEBUG
-        t3 = time.time()  # TODO REMOVE DEBUG
 
         generator_preds = electra_output['generator']
         discriminator_preds = electra_output['discriminator']
@@ -511,20 +505,10 @@ def pretrain_one_epoch(
         train_gen_losses.append(gen_loss.item())
         train_disc_losses.append(disc_loss.item())
 
-        t4 = time.time()  # TODO REMOVE DEBUG
-
         optimizer.zero_grad()
         accelerator.backward(loss)
         optimizer.step()
-        torch.cuda.synchronize()  # TODO REMOVE DEBUG
-        t5 = time.time()  # TODO REMOVE DEBUG
         accelerator.wait_for_everyone()
-
-        # TODO REMOVE DEBUG
-        if accelerator.is_main_process and i < 5:
-            print(f"Batch {i}: transfer={t1-t0:.3f}s, masks={t2-t1:.3f}s, "
-                f"forward={t3-t2:.3f}s, loss={t4-t3:.3f}s, backward={t5-t4:.3f}s")
-        # END DEBUG
 
         if mem_test_mode and i == 1:
             if accelerator.is_main_process:
