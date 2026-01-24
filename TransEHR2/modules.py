@@ -30,14 +30,14 @@ class GradientTraceableLLM(torch.nn.Module):
                 token=HF_API_TOKEN, 
                 device_map='cpu',
                 local_files_only=True,
-                use_fast=False if model_name == 'meta-llama/Llama-3.2-1B' else True
+                use_fast=False
             )
         except OSError:
             self.tokenizer = AutoTokenizer.from_pretrained(
                 model_name,
                 token=HF_API_TOKEN,
                 device_map='cpu',
-                use_fast=False if model_name == 'meta-llama/Llama-3.2-1B' else True
+                use_fast=False
             )
         # Using add_special_tokens so that pad_token_id is set automatically
         self.tokenizer.add_special_tokens({'pad_token': TOKENIZER_PAD_TOKEN})
