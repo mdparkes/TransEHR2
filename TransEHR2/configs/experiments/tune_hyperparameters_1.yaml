@@ -14,13 +14,13 @@ DISC_LOSS_WEIGHT:
   - 10.0
   - 100.0
 THP_LOSS_NLL_WEIGHT:
-  - 1.0
+  - 0.01
   - 0.001
   - 0.0001
 THP_PRED_LOSS_TIME_WT:
-  - 1.0
-  - 0.001
   - 0.0001
+  - 0.00001
+  - 0.000001
 RECORD_MASK_RATIO:
   - 0.15
   - 0.25
