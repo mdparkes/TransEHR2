@@ -891,9 +891,11 @@ class TransformerHawkesProcess(torch.nn.Module):
             base_intensity = self.intensity_base[None, ...]  # (1, 1, n_event_types)
             
             prev_times = prev_event_times[..., None]  # (batch_size, seq_len - 1, 1)
+            # elapsed_history shape: (batch_size, seq_len - 1, 1)
+            elapsed_history = prev_event_times - prev_times.min(dim=1, keepdim=True).values
             time_diff_expanded = time_diff[..., None]  # (batch_size, seq_len - 1, 1)
 
-            current = decay * (time_diff_expanded / (prev_times + eps))
+            current = decay * (time_diff_expanded / (elapsed_history + eps))
             history = self.intensity_linear(encodings)
             
             conditional_intensity_state = current + history + base_intensity
@@ -903,9 +905,11 @@ class TransformerHawkesProcess(torch.nn.Module):
             base_intensity = self.intensity_base[None, None, ...]  # (1, 1, 1, n_event_types)
             
             prev_times = prev_event_times[..., None, None]  # (batch_size, seq_len - 1, 1, 1)
+            # elapsed_history shape: (batch_size, seq_len - 1, n_samples, 1)
+            elapsed_history = prev_event_times - prev_times.min(dim=1, keepdim=True).values
             time_diff_expanded = time_diff[..., None]  # (batch_size, seq_len - 1, n_samples, 1)
             
-            current = decay * (time_diff_expanded / (prev_times + eps))
+            current = decay * (time_diff_expanded / (elapsed_history + eps))
             history = self.intensity_linear(encodings)[:, :, None, :]
             
             conditional_intensity_state = current + history + base_intensity
