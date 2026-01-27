@@ -361,7 +361,7 @@ def generate_record_masks(
         data: Batched MixedTensorDataset from DataLoader containing value-associated and event-associated data.
         feature_sample_rate (float): The rate at which features are sampled for masking.
         obs_unobs_ratio (float): The ratio of observed to unobserved records that sampling will try to achieve. If
-            None, only observed records will be masked.
+            None, only observed records will be masked. This does not apply to text features, which only mask observed records because embeddings of unobserved text are zero vectors and the cosine similarity loss is not defined when one of the target or prediction vectors is zero.
         subsample_rate (float): The rate at which components of vector-valued features are subsampled for masking.
 
     Returns:
@@ -481,7 +481,7 @@ def _gen_val_assoc_feat_mask(
     unobs_count = unobs_positions.size(0)
 
     n_obs_masked = int(feature_sample_rate * obs_count)
-    if obs_unobs_ratio is None:
+    if obs_unobs_ratio is None or feature_type == 'text':
         n_unobs_masked = 0
     else:
         # Attempt to maintain the specified observed-to-unobserved ratio. If there are not enough unobserved positions to satisfy the ratio, mask all the unobserved positions. If the number of unobserved positions to sample is calculated to be less than 1, mask one unobserved position (if any exist).
