@@ -507,6 +507,24 @@ def pretrain_one_epoch(
 
         optimizer.zero_grad()
         accelerator.backward(loss)
+
+        # TODO REMOVE DEBUG: Monitor gradient norms before clipping
+        if accelerator.is_main_process and i % 50 == 0:
+            total_norm = 0.0
+            for p in model.parameters():
+                if p.grad is not None:
+                    param_norm = p.grad.data.norm(2)
+                    total_norm += param_norm.item() ** 2
+            total_norm = total_norm ** 0.5
+            print(f"Batch {i}: grad_norm={total_norm:.4f}, loss={loss.item():.4f}")
+            if torch.isnan(loss) or torch.isinf(loss):
+                print("  WARNING: Loss is NaN/Inf!")
+            if total_norm > 100:
+                print(f"  WARNING: Large gradient norm!")
+        # END DEBUG
+
+
+        accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         accelerator.wait_for_everyone()
 
@@ -1383,6 +1401,7 @@ def finetune_model(
 
             optimizer.zero_grad()
             accelerator.backward(loss)
+            accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
             if mem_test_mode:
@@ -1572,7 +1591,7 @@ def pretrain_with_hyperparameter(
         Tuple of (best_train_losses, best_val_losses) dictionaries
     """
 
-    report_freq = 10
+    report_freq = 1
     chkpt_freq = 10
 
 
