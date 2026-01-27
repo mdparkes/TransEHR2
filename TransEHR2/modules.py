@@ -884,7 +884,7 @@ class TransformerHawkesProcess(torch.nn.Module):
             Tensor: A `Tensor` of shape [batch size, seq_len - 1, n_event_types] or 
                 [batch size, seq_len - 1, n_samples, n_event_types] containing the pre-softplus intensity states for each event type at each time step.
         """
-        eps = torch.finfo(torch.float32).eps
+        eps = 1e-6  # Small constant to prevent division by zero
         
         if time_diff.dim() == 2:  # Observed event times
             decay = self.intensity_decay[None, ...]  # (1, 1, n_event_types)

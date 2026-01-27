@@ -759,7 +759,7 @@ class TransformerHawkesLoss(torch.nn.Module):
                 - event_ll (Tensor): Log-likelihood of observed events of shape (batch_size, max_ts_len)
                 - non_event_ll (Tensor): Log-likelihood of non-events of shape (batch_size, max_ts_len)
         """
-        eps = torch.finfo(torch.float32).eps  # Small constant to avoid log(0)
+        eps = 1e-6 # Small constant to avoid log(0)
 
         event_indicators = event_data['indicators']  # (batch_size, max_ts_len, n_event_types)
         event_times = event_data['times']  # (batch_size, max_ts_len)
