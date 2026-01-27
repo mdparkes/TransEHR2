@@ -515,6 +515,27 @@ def pretrain_one_epoch(
             print(f"  thp_nll_loss: {thp_nll_loss.item():.4f}")
             print(f"  thp_type_loss: {thp_type_loss.item():.4f}")
             print(f"  thp_time_loss: {thp_time_loss.item():.4f}")
+        
+        # DEBUG: Check for large activations in model outputs
+        if accelerator.is_main_process:
+            with torch.no_grad():
+                # Check generator output stats
+                for feat_type in ['numeric', 'categorical', 'text']:
+                    if feat_type in electra_output['generator']:
+                        if 'values' in electra_output['generator'][feat_type]:
+                            for i, v in enumerate(electra_output['generator'][feat_type]['values']):
+                                print(f"Gen {feat_type}[{i}]: min={v.min():.4f}, max={v.max():.4f}, "
+                                    f"mean={v.mean():.4f}, has_nan={torch.isnan(v).any()}")
+                        if 'embedded_values' in electra_output['generator'][feat_type]:
+                            for i, v in enumerate(electra_output['generator'][feat_type]['embedded_values']):
+                                print(f"Gen {feat_type}_emb[{i}]: min={v.min():.4f}, max={v.max():.4f}, "
+                                    f"mean={v.mean():.4f}, has_nan={torch.isnan(v).any()}")
+                # Check discriminator output stats
+                for feat_type in ['numeric', 'categorical', 'text']:
+                    if feat_type in electra_output['discriminator']:
+                        v = electra_output['discriminator'][feat_type]
+                        print(f"Disc {feat_type}: min={v.min():.4f}, max={v.max():.4f}, "
+                            f"mean={v.mean():.4f}, has_nan={torch.isnan(v).any()}")
         # END DEBUG
 
         accelerator.backward(loss)
