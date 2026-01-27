@@ -348,10 +348,13 @@ class TemporalPositionEncoding(torch.nn.Module):
             times = times.unsqueeze(-1)
         if non_padding_mask.dim() == 2:
             non_padding_mask = non_padding_mask.unsqueeze(-1)
-        x[:, :, 0::2] = x[:, :, 0::2] + torch.sin(torch.div(times, self.position_encoding))
-        x[:, :, 1::2] = x[:, :, 1::2] + torch.cos(torch.div(times, self.position_encoding))
-        x = self.dropout(x) * non_padding_mask if self.dropout is not None else x * non_padding_mask
-        return x
+        pos_enc = torch.zeros_like(x)
+        scaled_times = torch.div(times, self.position_encoding)
+        pos_enc[:, :, 0::2] = torch.sin(scaled_times)
+        pos_enc[:, :, 1::2] = torch.cos(scaled_times)
+        output = x + pos_enc
+        output = self.dropout(output) * non_padding_mask if self.dropout is not None else output * non_padding_mask
+        return output
 
 
 class TransformerBatchNormEncoderLayer(torch.nn.Module):
