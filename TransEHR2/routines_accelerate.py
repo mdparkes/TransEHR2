@@ -506,6 +506,17 @@ def pretrain_one_epoch(
         train_disc_losses.append(disc_loss.item())
 
         optimizer.zero_grad()
+
+        # TODO REMOVE DEBUG
+        if accelerator.is_main_process:
+            print(f"  gen_loss: {gen_loss.item():.4f}, has_nan: {torch.isnan(gen_loss).item()}")
+            print(f"  disc_loss: {disc_loss.item():.4f}, has_nan: {torch.isnan(disc_loss).item()}")
+            print(f"  thp_loss: {thp_loss.item():.4f}, has_nan: {torch.isnan(thp_loss).item()}")
+            print(f"  thp_nll: {thp_nll_loss.item():.4f}")
+            print(f"  thp_type: {thp_type_loss.item():.4f}")
+            print(f"  thp_time: {thp_time_loss.item():.4f}")
+        # END DEBUG
+        
         accelerator.backward(loss)
 
         # TODO REMOVE DEBUG: Monitor gradient norms before clipping
