@@ -309,8 +309,7 @@ class EventDataEncoder(torch.nn.Module):
         # Apply the indicator input projection layer to the indicators to get the initial embedding
         enc_output = self.indicator_input_projection_layer(indicators.float())
         for enc_layer in self.layer_stack:
-            position_encoding = self.position_encoding_layer(enc_output, timestamps, non_padding_mask)
-            enc_output += position_encoding
+            enc_output = self.position_encoding_layer(enc_output, timestamps, non_padding_mask)
             enc_output, _ = enc_layer(enc_output, non_padding_mask=non_padding_mask, self_attention_mask=self_attn_mask)
 
         return enc_output
