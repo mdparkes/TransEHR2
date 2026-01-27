@@ -360,7 +360,8 @@ def generate_record_masks(
     Args:
         data: Batched MixedTensorDataset from DataLoader containing value-associated and event-associated data.
         feature_sample_rate (float): The rate at which features are sampled for masking.
-        obs_unobs_ratio (float): The ratio of observed to unobserved records that sampling will try to achieve.
+        obs_unobs_ratio (float): The ratio of observed to unobserved records that sampling will try to achieve. If
+            None, only observed records will be masked.
         subsample_rate (float): The rate at which components of vector-valued features are subsampled for masking.
 
     Returns:
@@ -480,7 +481,11 @@ def _gen_val_assoc_feat_mask(
     unobs_count = unobs_positions.size(0)
 
     n_obs_masked = int(feature_sample_rate * obs_count)
-    n_unobs_masked = min(unobs_count, max(1, int(n_obs_masked / obs_unobs_ratio))) if unobs_count > 0 else 0
+    if obs_unobs_ratio is None:
+        n_unobs_masked = 0
+    else:
+        # Attempt to maintain the specified observed-to-unobserved ratio. If there are not enough unobserved positions to satisfy the ratio, mask all the unobserved positions. If the number of unobserved positions to sample is calculated to be less than 1, mask one unobserved position (if any exist).
+        n_unobs_masked = min(unobs_count, max(1, int(n_obs_masked / obs_unobs_ratio))) if unobs_count > 0 else 0
 
     # Sample positions globally first
     selected_obs = None
@@ -557,9 +562,13 @@ def _gen_event_assoc_feat_mask(
 
     # Calculate the number of observed and unobserved features to mask
     n_obs_masked = int(feature_sample_rate * obs_positions.size(0))
-    n_unobs_masked = min(
-        unobs_positions.size(0), max(1, int(n_obs_masked / obs_unobs_ratio))
-    ) if unobs_positions.size(0) > 0 else 0
+    if obs_unobs_ratio is None:
+        n_unobs_masked = 0
+    else:
+        # Attempt to maintain the specified observed-to-unobserved ratio. If there are not enough unobserved positions to satisfy the ratio, mask all the unobserved positions. If the number of unobserved positions to sample is calculated to be less than 1, mask one unobserved position (if any exist).
+        n_unobs_masked = min(
+            unobs_positions.size(0), max(1, int(n_obs_masked / obs_unobs_ratio))
+        ) if unobs_positions.size(0) > 0 else 0
 
     # Process both observed and unobserved positions efficiently
     for positions, n_masked in [(obs_positions, n_obs_masked), (unobs_positions, n_unobs_masked)]:
