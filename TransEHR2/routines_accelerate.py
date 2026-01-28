@@ -557,11 +557,12 @@ def pretrain_one_epoch(
 
         accelerator.backward(loss)
         # TODO REMOVE DEBUG
-        # Remove hooks
-        for h in handles:
-            h.remove()
-        if nan_detected:
-            print(f"  NaN detected in: {list(nan_detected.keys())}")
+        if accelerator.is_main_process:
+            # Remove hooks
+            for h in handles:
+                h.remove()
+            if nan_detected:
+                print(f"  NaN detected in: {list(nan_detected.keys())}")
         # END DEBUG
 
         # TODO REMOVE DEBUG: Monitor gradient norms before clipping
