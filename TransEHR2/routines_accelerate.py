@@ -479,8 +479,10 @@ def pretrain_one_epoch(
         
         # TODO REMOVE DEBUG
         if accelerator.is_main_process:
-            trainable_params = [p for p in model.parameters() if p.requires_grad]
+            unwrapped_model = accelerator.unwrap_model(model)
+            trainable_params = [p for p in unwrapped_model.parameters() if p.requires_grad]
             print(f"  Number of trainable params: {len(trainable_params)}")
+            
             # Test gradient from generator loss alone
             try:
                 test_grad = torch.autograd.grad(gen_loss, trainable_params, retain_graph=True, allow_unused=True)
