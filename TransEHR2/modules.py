@@ -889,10 +889,12 @@ class TransformerHawkesProcess(torch.nn.Module):
         if time_diff.dim() == 2:  # Observed event times
             decay = self.intensity_decay[None, ...]  # (1, 1, n_event_types)
             base_intensity = self.intensity_base[None, ...]  # (1, 1, n_event_types)
+
+            # Compute time elapsed since the first timestamp in the history
+            min_times = prev_event_times.min(dim=1, keepdim=True).values  # (batch_size, 1)
+            elapsed_history = prev_event_times - min_times  # (batch_size, seq_len - 1)
+            elapsed_history = elapsed_history[..., None]  # (batch_size, seq_len - 1, 1)
             
-            prev_times = prev_event_times[..., None]  # (batch_size, seq_len - 1, 1)
-            # elapsed_history shape: (batch_size, seq_len - 1, 1)
-            elapsed_history = prev_event_times - prev_times.min(dim=1, keepdim=True).values
             time_diff_expanded = time_diff[..., None]  # (batch_size, seq_len - 1, 1)
 
             current = decay * (time_diff_expanded / (elapsed_history + eps))
@@ -904,9 +906,11 @@ class TransformerHawkesProcess(torch.nn.Module):
             decay = self.intensity_decay[None, None, ...]  # (1, 1, 1, n_event_types)
             base_intensity = self.intensity_base[None, None, ...]  # (1, 1, 1, n_event_types)
             
-            prev_times = prev_event_times[..., None, None]  # (batch_size, seq_len - 1, 1, 1)
-            # elapsed_history shape: (batch_size, seq_len - 1, n_samples, 1)
-            elapsed_history = prev_event_times - prev_times.min(dim=1, keepdim=True).values
+            # Compute time elapsed since the first timestamp in the history
+            min_times = prev_event_times.min(dim=1, keepdim=True).values  # (batch_size, 1)
+            elapsed_history = prev_event_times - min_times  # (batch_size, seq_len - 1)
+            elapsed_history = elapsed_history[..., None, None]  # (batch_size, seq_len - 1, 1, 1)
+            
             time_diff_expanded = time_diff[..., None]  # (batch_size, seq_len - 1, n_samples, 1)
             
             current = decay * (time_diff_expanded / (elapsed_history + eps))
