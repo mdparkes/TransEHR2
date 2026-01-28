@@ -522,12 +522,12 @@ def pretrain_one_epoch(
             # TODO REMOVE DEBUG
             if accelerator.is_main_process:
                 # THP outputs
-                if electra_output['thp']['type_pred'].requires_grad:
-                    handles.append(electra_output['thp']['type_pred'].register_hook(make_tensor_hook('thp_type_pred')))
-                if electra_output['thp']['time_pred'].requires_grad:
-                    handles.append(electra_output['thp']['time_pred'].register_hook(make_tensor_hook('thp_time_pred')))
-                if electra_output['thp']['encodings'].requires_grad:
-                    handles.append(electra_output['thp']['encodings'].register_hook(make_tensor_hook('thp_encodings')))
+                if electra_output['hawkes_encodings'].requires_grad:
+                    handles.append(electra_output['hawkes_encodings'].register_hook(make_tensor_hook('thp_encodings')))
+                if electra_output['hawkes_predictions'][0].requires_grad:
+                    handles.append(electra_output['hawkes_predictions'][0].register_hook(make_tensor_hook('thp_type_pred')))
+                if electra_output['hawkes_predictions'][1].requires_grad:
+                    handles.append(electra_output['hawkes_predictions'][1].register_hook(make_tensor_hook('thp_time_pred')))
             # END DEBUG
 
             loss = gen_loss + disc_loss + thp_loss
