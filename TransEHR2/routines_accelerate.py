@@ -479,21 +479,32 @@ def pretrain_one_epoch(
 
         # TODO REMOVE DEBUG
         if accelerator.is_main_process:
-            nan_detected = {}
-            def make_hook(name):
+            nan_sources = []
+            def make_tensor_hook(name):
                 def hook(grad):
-                    grad_norm = grad.norm().item() if grad.numel() == 1 else "N/A"
-                    has_nan = torch.isnan(grad).any().item()
-                    has_inf = torch.isinf(grad).any().item()
-                    print(f"  {name} backward: grad_norm={grad_norm}, has_nan={has_nan}, has_inf={has_inf}")
-                    if has_nan:
-                        nan_detected[name] = True
+                    if grad is not None:
+                        has_nan = torch.isnan(grad).any().item()
+                        has_inf = torch.isinf(grad).any().item()
+                        grad_norm = grad.norm().item()
+                        if has_nan or has_inf or grad_norm > 1e6:
+                            print(f"  ISSUE in {name}: grad_norm={grad_norm:.4e}, has_nan={has_nan}, has_inf={has_inf}")
+                            nan_sources.append(name)
                     return grad
                 return hook
-            # Register hooks on the loss tensors
+            # Hook on key intermediate tensors from the forward pass
             handles = []
-            handles.append(gen_loss.register_hook(make_hook('gen_loss')))
-            handles.append(disc_loss.register_hook(make_hook('disc_loss')))
+            # Generator outputs
+            if 'numeric' in electra_output['generator']:
+                for i, v in enumerate(electra_output['generator']['numeric']['values']):
+                    if v.requires_grad:
+                        handles.append(v.register_hook(make_tensor_hook(f'gen_numeric_{i}')))
+            # Discriminator outputs  
+            if 'numeric' in electra_output['discriminator']:
+                if electra_output['discriminator']['numeric'].requires_grad:
+                    handles.append(electra_output['discriminator']['numeric'].register_hook(make_tensor_hook('disc_numeric')))
+            if 'text' in electra_output['discriminator']:
+                if electra_output['discriminator']['text'].requires_grad:
+                    handles.append(electra_output['discriminator']['text'].register_hook(make_tensor_hook('disc_text')))
         # END DEBUG
 
         if thp_encodings is not None and 'thp_intensities' in electra_output:
@@ -510,11 +521,15 @@ def pretrain_one_epoch(
             )
             # TODO REMOVE DEBUG
             if accelerator.is_main_process:
-                handles.append(thp_loss.register_hook(make_hook('thp_loss')))
-                handles.append(thp_nll_loss.register_hook(make_hook('thp_nll_loss')))
-                handles.append(thp_type_loss.register_hook(make_hook('thp_type_loss')))
-                handles.append(thp_time_loss.register_hook(make_hook('thp_time_loss')))
+                # THP outputs
+                if electra_output['thp']['type_pred'].requires_grad:
+                    handles.append(electra_output['thp']['type_pred'].register_hook(make_tensor_hook('thp_type_pred')))
+                if electra_output['thp']['time_pred'].requires_grad:
+                    handles.append(electra_output['thp']['time_pred'].register_hook(make_tensor_hook('thp_time_pred')))
+                if electra_output['thp']['encodings'].requires_grad:
+                    handles.append(electra_output['thp']['encodings'].register_hook(make_tensor_hook('thp_encodings')))
             # END DEBUG
+
             loss = gen_loss + disc_loss + thp_loss
             train_thp_losses.append(thp_loss.item())
             train_thp_nll_losses.append(thp_nll_loss.item())
@@ -555,14 +570,14 @@ def pretrain_one_epoch(
                             f"mean={v.mean():.4f}, has_nan={torch.isnan(v).any()}")
         # END DEBUG
 
-        accelerator.backward(loss)
         # TODO REMOVE DEBUG
+        accelerator.backward(loss)
         if accelerator.is_main_process:
-            # Remove hooks
+            # Cleanup
             for h in handles:
                 h.remove()
-            if nan_detected:
-                print(f"  NaN detected in: {list(nan_detected.keys())}")
+            if nan_sources:
+                print(f"  NaN/Inf sources: {nan_sources}")
         # END DEBUG
 
         # TODO REMOVE DEBUG: Monitor gradient norms before clipping
