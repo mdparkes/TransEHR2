@@ -476,35 +476,24 @@ def pretrain_one_epoch(
 
         gen_loss = gen_loss_fn(generator_preds, electra_output['masked_targets'], value_associated_data_masks)
         disc_loss = disc_loss_fn(discriminator_preds, value_associated_data_masks)
-        
+
         # TODO REMOVE DEBUG
         if accelerator.is_main_process:
-            unwrapped_model = accelerator.unwrap_model(model)
-            trainable_params = [p for p in unwrapped_model.parameters() if p.requires_grad]
-            print(f"  Number of trainable params: {len(trainable_params)}")
-            
-            # Test gradient from generator loss alone
-            try:
-                test_grad = torch.autograd.grad(gen_loss, trainable_params, retain_graph=True, allow_unused=True)
-                non_none_grads = [g for g in test_grad if g is not None]
-                print(f"  gen_loss: {len(non_none_grads)}/{len(trainable_params)} params have grads")
-                if non_none_grads:
-                    gen_grad_norm = sum(g.norm().item() ** 2 for g in non_none_grads) ** 0.5
-                    gen_grad_has_nan = any(torch.isnan(g).any().item() for g in non_none_grads)
-                    print(f"  gen_loss grad_norm: {gen_grad_norm:.4f}, has_nan: {gen_grad_has_nan}")
-            except Exception as e:
-                print(f"  gen_loss grad failed: {e}")
-            # Test gradient from discriminator loss alone
-            try:
-                test_grad = torch.autograd.grad(disc_loss, trainable_params, retain_graph=True, allow_unused=True)
-                non_none_grads = [g for g in test_grad if g is not None]
-                print(f"  disc_loss: {len(non_none_grads)}/{len(trainable_params)} params have grads")
-                if non_none_grads:
-                    disc_grad_norm = sum(g.norm().item() ** 2 for g in non_none_grads) ** 0.5
-                    disc_grad_has_nan = any(torch.isnan(g).any().item() for g in non_none_grads)
-                    print(f"  disc_loss grad_norm: {disc_grad_norm:.4f}, has_nan: {disc_grad_has_nan}")
-            except Exception as e:
-                print(f"  disc_loss grad failed: {e}")
+            nan_detected = {}
+            def make_hook(name):
+                def hook(grad):
+                    grad_norm = grad.norm().item() if grad.numel() == 1 else "N/A"
+                    has_nan = torch.isnan(grad).any().item()
+                    has_inf = torch.isinf(grad).any().item()
+                    print(f"  {name} backward: grad_norm={grad_norm}, has_nan={has_nan}, has_inf={has_inf}")
+                    if has_nan:
+                        nan_detected[name] = True
+                    return grad
+                return hook
+            # Register hooks on the loss tensors
+            handles = []
+            handles.append(gen_loss.register_hook(make_hook('gen_loss')))
+            handles.append(disc_loss.register_hook(make_hook('disc_loss')))
         # END DEBUG
 
         if thp_encodings is not None and 'thp_intensities' in electra_output:
@@ -519,47 +508,13 @@ def pretrain_one_epoch(
                 thp_type_preds,
                 thp_time_preds
             )
-
             # TODO REMOVE DEBUG
             if accelerator.is_main_process:
-                if thp_nll_loss.requires_grad:
-                    try:
-                        test_grad = torch.autograd.grad(thp_nll_loss, trainable_params, retain_graph=True, allow_unused=True)
-                        non_none_grads = [g for g in test_grad if g is not None]
-                        print(f"  thp_nll_loss: {len(non_none_grads)}/{len(trainable_params)} params have grads")
-                        if non_none_grads:
-                            nll_grad_norm = sum(g.norm().item() ** 2 for g in non_none_grads) ** 0.5
-                            nll_grad_has_nan = any(torch.isnan(g).any().item() for g in non_none_grads)
-                            print(f"  thp_nll_loss grad_norm: {nll_grad_norm:.4f}, has_nan: {nll_grad_has_nan}")
-                    except Exception as e:
-                        print(f"  thp_nll_loss grad failed: {e}")
-                
-                if thp_type_loss.requires_grad:
-                    try:
-                        test_grad = torch.autograd.grad(thp_type_loss, trainable_params, retain_graph=True, allow_unused=True)
-                        non_none_grads = [g for g in test_grad if g is not None]
-                        print(f"  thp_type_loss: {len(non_none_grads)}/{len(trainable_params)} params have grads")
-                        if non_none_grads:
-                            type_grad_norm = sum(g.norm().item() ** 2 for g in non_none_grads) ** 0.5
-                            type_grad_has_nan = any(torch.isnan(g).any().item() for g in non_none_grads)
-                            print(f"  thp_type_loss grad_norm: {type_grad_norm:.4f}, has_nan: {type_grad_has_nan}")
-                    except Exception as e:
-                        print(f"  thp_type_loss grad failed: {e}")
-                
-                if thp_time_loss.requires_grad:
-                    try:
-                        test_grad = torch.autograd.grad(thp_time_loss, trainable_params, retain_graph=True, allow_unused=True)
-                        non_none_grads = [g for g in test_grad if g is not None]
-                        print(f"  thp_time_loss: {len(non_none_grads)}/{len(trainable_params)} params have grads")
-                        if non_none_grads:
-                            time_grad_norm = sum(g.norm().item() ** 2 for g in non_none_grads) ** 0.5
-                            print(f"  thp_time_loss grad_norm: {time_grad_norm:.4f}")
-                        time_grad_has_nan = any(torch.isnan(g).any().item() for g in test_grad if g is not None)
-                        print(f"  thp_time_loss grad has_nan: {time_grad_has_nan}")
-                    except Exception as e:
-                        print(f"  thp_time_loss grad failed: {e}")
+                handles.append(thp_loss.register_hook(make_hook('thp_loss')))
+                handles.append(thp_nll_loss.register_hook(make_hook('thp_nll_loss')))
+                handles.append(thp_type_loss.register_hook(make_hook('thp_type_loss')))
+                handles.append(thp_time_loss.register_hook(make_hook('thp_time_loss')))
             # END DEBUG
-
             loss = gen_loss + disc_loss + thp_loss
             train_thp_losses.append(thp_loss.item())
             train_thp_nll_losses.append(thp_nll_loss.item())
@@ -601,6 +556,13 @@ def pretrain_one_epoch(
         # END DEBUG
 
         accelerator.backward(loss)
+        # TODO REMOVE DEBUG
+        # Remove hooks
+        for h in handles:
+            h.remove()
+        if nan_detected:
+            print(f"  NaN detected in: {list(nan_detected.keys())}")
+        # END DEBUG
 
         # TODO REMOVE DEBUG: Monitor gradient norms before clipping
         if accelerator.is_main_process and i % 50 == 0:
