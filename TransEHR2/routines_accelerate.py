@@ -479,18 +479,23 @@ def pretrain_one_epoch(
         
         # TODO REMOVE DEBUG
         if accelerator.is_main_process:
+            trainable_params = [p for p in model.parameters() if p.requires_grad]
             # Test gradient from generator loss alone
-            if gen_loss.requires_grad:
-                test_grad = torch.autograd.grad(gen_loss, model.parameters(), retain_graph=True, allow_unused=True)
+            try:
+                test_grad = torch.autograd.grad(gen_loss, trainable_params, retain_graph=True, allow_unused=True)
                 gen_grad_norm = sum(g.norm().item() ** 2 for g in test_grad if g is not None) ** 0.5
                 gen_grad_has_nan = any(torch.isnan(g).any().item() for g in test_grad if g is not None)
                 print(f"  gen_loss grad_norm: {gen_grad_norm:.4f}, has_nan: {gen_grad_has_nan}")
+            except Exception as e:
+                print(f"  gen_loss grad failed: {e}")
             # Test gradient from discriminator loss alone
-            if disc_loss.requires_grad:
-                test_grad = torch.autograd.grad(disc_loss, model.parameters(), retain_graph=True, allow_unused=True)
+            try:
+                test_grad = torch.autograd.grad(disc_loss, trainable_params, retain_graph=True, allow_unused=True)
                 disc_grad_norm = sum(g.norm().item() ** 2 for g in test_grad if g is not None) ** 0.5
                 disc_grad_has_nan = any(torch.isnan(g).any().item() for g in test_grad if g is not None)
                 print(f"  disc_loss grad_norm: {disc_grad_norm:.4f}, has_nan: {disc_grad_has_nan}")
+            except Exception as e:
+                print(f"  disc_loss grad failed: {e}")
         # END DEBUG
 
         if thp_encodings is not None and 'thp_intensities' in electra_output:
@@ -509,19 +514,29 @@ def pretrain_one_epoch(
             # TODO REMOVE DEBUG
             if accelerator.is_main_process:
                 if thp_nll_loss.requires_grad:
-                    test_grad = torch.autograd.grad(thp_nll_loss, model.parameters(), retain_graph=True, allow_unused=True)
-                    nll_grad_has_nan = any(torch.isnan(g).any().item() for g in test_grad if g is not None)
-                    print(f"  thp_nll_loss grad has_nan: {nll_grad_has_nan}")
+                    try:
+                        test_grad = torch.autograd.grad(thp_nll_loss, trainable_params, retain_graph=True, allow_unused=True)
+                        nll_grad_norm = sum(g.norm().item() ** 2 for g in test_grad if g is not None) ** 0.5
+                        nll_grad_has_nan = any(torch.isnan(g).any().item() for g in test_grad if g is not None)
+                        print(f"  thp_nll_loss grad_norm: {nll_grad_norm:.4f}, has_nan: {nll_grad_has_nan}")
+                    except Exception as e:
+                        print(f"  thp_nll_loss grad failed: {e}")
                 
                 if thp_type_loss.requires_grad:
-                    test_grad = torch.autograd.grad(thp_type_loss, model.parameters(), retain_graph=True, allow_unused=True)
-                    type_grad_has_nan = any(torch.isnan(g).any().item() for g in test_grad if g is not None)
-                    print(f"  thp_type_loss grad has_nan: {type_grad_has_nan}")
+                    try:
+                        test_grad = torch.autograd.grad(thp_type_loss, trainable_params, retain_graph=True, allow_unused=True)
+                        type_grad_has_nan = any(torch.isnan(g).any().item() for g in test_grad if g is not None)
+                        print(f"  thp_type_loss grad has_nan: {type_grad_has_nan}")
+                    except Exception as e:
+                        print(f"  thp_type_loss grad failed: {e}")
                 
                 if thp_time_loss.requires_grad:
-                    test_grad = torch.autograd.grad(thp_time_loss, model.parameters(), retain_graph=True, allow_unused=True)
-                    time_grad_has_nan = any(torch.isnan(g).any().item() for g in test_grad if g is not None)
-                    print(f"  thp_time_loss grad has_nan: {time_grad_has_nan}")
+                    try:
+                        test_grad = torch.autograd.grad(thp_time_loss, trainable_params, retain_graph=True, allow_unused=True)
+                        time_grad_has_nan = any(torch.isnan(g).any().item() for g in test_grad if g is not None)
+                        print(f"  thp_time_loss grad has_nan: {time_grad_has_nan}")
+                    except Exception as e:
+                        print(f"  thp_time_loss grad failed: {e}")
             # END DEBUG
 
             loss = gen_loss + disc_loss + thp_loss
