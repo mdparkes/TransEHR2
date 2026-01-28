@@ -884,39 +884,21 @@ class TransformerHawkesProcess(torch.nn.Module):
             Tensor: A `Tensor` of shape [batch size, seq_len - 1, n_event_types] or 
                 [batch size, seq_len - 1, n_samples, n_event_types] containing the pre-softplus intensity states for each event type at each time step.
         """
-        eps = 1e-6  # Small constant to prevent division by zero
         
         if time_diff.dim() == 2:  # Observed event times
+            time_diff_expanded = time_diff[..., None]  # (batch_size, seq_len - 1, 1)
             decay = self.intensity_decay[None, ...]  # (1, 1, n_event_types)
             base_intensity = self.intensity_base[None, ...]  # (1, 1, n_event_types)
-
-            # Compute time elapsed since the first timestamp in the history
-            min_times = prev_event_times.min(dim=1, keepdim=True).values  # (batch_size, 1)
-            elapsed_history = prev_event_times - min_times  # (batch_size, seq_len - 1)
-            elapsed_history = elapsed_history[..., None]  # (batch_size, seq_len - 1, 1)
-            
-            time_diff_expanded = time_diff[..., None]  # (batch_size, seq_len - 1, 1)
-
-            current = decay * (time_diff_expanded / (elapsed_history + eps))
+            current = decay * time_diff_expanded  # (batch_size, seq_len - 1, n_event_types)
             history = self.intensity_linear(encodings)
             
-            conditional_intensity_state = current + history + base_intensity
-            
         elif time_diff.dim() == 3:  # Sampled inter-event times for Monte Carlo integration
+            time_diff_expanded = time_diff[..., None]  # (batch_size, seq_len - 1, n_samples, 1)
             decay = self.intensity_decay[None, None, ...]  # (1, 1, 1, n_event_types)
             base_intensity = self.intensity_base[None, None, ...]  # (1, 1, 1, n_event_types)
-            
-            # Compute time elapsed since the first timestamp in the history
-            min_times = prev_event_times.min(dim=1, keepdim=True).values  # (batch_size, 1)
-            elapsed_history = prev_event_times - min_times  # (batch_size, seq_len - 1)
-            elapsed_history = elapsed_history[..., None, None]  # (batch_size, seq_len - 1, 1, 1)
-            
-            time_diff_expanded = time_diff[..., None]  # (batch_size, seq_len - 1, n_samples, 1)
-            
-            current = decay * (time_diff_expanded / (elapsed_history + eps))
+            current = decay * time_diff_expanded  # (batch_size, seq_len - 1, n_samples, n_event_types)
             history = self.intensity_linear(encodings)[:, :, None, :]
             
-            conditional_intensity_state = current + history + base_intensity
 
         else:
 
@@ -925,6 +907,8 @@ class TransformerHawkesProcess(torch.nn.Module):
                 f"Expected shape (batch_size, seq_len) or (batch_size, seq_len, n_samples)."
             )
         
+        conditional_intensity_state = current + history + base_intensity
+
         return self.softplus(conditional_intensity_state)
 
     def forward(self, batch: EventAssociatedTensorData) -> Tuple[Tensor, Tuple[Tensor, Tensor]]:
