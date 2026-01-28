@@ -477,6 +477,22 @@ def pretrain_one_epoch(
         gen_loss = gen_loss_fn(generator_preds, electra_output['masked_targets'], value_associated_data_masks)
         disc_loss = disc_loss_fn(discriminator_preds, value_associated_data_masks)
         
+        # TODO REMOVE DEBUG
+        if accelerator.is_main_process:
+            # Test gradient from generator loss alone
+            if gen_loss.requires_grad:
+                test_grad = torch.autograd.grad(gen_loss, model.parameters(), retain_graph=True, allow_unused=True)
+                gen_grad_norm = sum(g.norm().item() ** 2 for g in test_grad if g is not None) ** 0.5
+                gen_grad_has_nan = any(torch.isnan(g).any().item() for g in test_grad if g is not None)
+                print(f"  gen_loss grad_norm: {gen_grad_norm:.4f}, has_nan: {gen_grad_has_nan}")
+            # Test gradient from discriminator loss alone
+            if disc_loss.requires_grad:
+                test_grad = torch.autograd.grad(disc_loss, model.parameters(), retain_graph=True, allow_unused=True)
+                disc_grad_norm = sum(g.norm().item() ** 2 for g in test_grad if g is not None) ** 0.5
+                disc_grad_has_nan = any(torch.isnan(g).any().item() for g in test_grad if g is not None)
+                print(f"  disc_loss grad_norm: {disc_grad_norm:.4f}, has_nan: {disc_grad_has_nan}")
+        # END DEBUG
+
         if thp_encodings is not None and 'thp_intensities' in electra_output:
             intensities = electra_output['thp_intensities']
             event_data = batch['event_data']
@@ -489,6 +505,25 @@ def pretrain_one_epoch(
                 thp_type_preds,
                 thp_time_preds
             )
+
+            # TODO REMOVE DEBUG
+            if accelerator.is_main_process:
+                if thp_nll_loss.requires_grad:
+                    test_grad = torch.autograd.grad(thp_nll_loss, model.parameters(), retain_graph=True, allow_unused=True)
+                    nll_grad_has_nan = any(torch.isnan(g).any().item() for g in test_grad if g is not None)
+                    print(f"  thp_nll_loss grad has_nan: {nll_grad_has_nan}")
+                
+                if thp_type_loss.requires_grad:
+                    test_grad = torch.autograd.grad(thp_type_loss, model.parameters(), retain_graph=True, allow_unused=True)
+                    type_grad_has_nan = any(torch.isnan(g).any().item() for g in test_grad if g is not None)
+                    print(f"  thp_type_loss grad has_nan: {type_grad_has_nan}")
+                
+                if thp_time_loss.requires_grad:
+                    test_grad = torch.autograd.grad(thp_time_loss, model.parameters(), retain_graph=True, allow_unused=True)
+                    time_grad_has_nan = any(torch.isnan(g).any().item() for g in test_grad if g is not None)
+                    print(f"  thp_time_loss grad has_nan: {time_grad_has_nan}")
+            # END DEBUG
+
             loss = gen_loss + disc_loss + thp_loss
             train_thp_losses.append(thp_loss.item())
             train_thp_nll_losses.append(thp_nll_loss.item())
@@ -508,15 +543,6 @@ def pretrain_one_epoch(
         optimizer.zero_grad()
 
         # TODO REMOVE DEBUG
-        if accelerator.is_main_process:
-            print(f"  gen_loss: {gen_loss.item():.4f}, has_nan: {torch.isnan(gen_loss).item()}")
-            print(f"  disc_loss: {disc_loss.item():.4f}, has_nan: {torch.isnan(disc_loss).item()}")
-            print(f"  thp_loss: {thp_loss.item():.4f}, has_nan: {torch.isnan(thp_loss).item()}")
-            print(f"  thp_nll_loss: {thp_nll_loss.item():.4f}")
-            print(f"  thp_type_loss: {thp_type_loss.item():.4f}")
-            print(f"  thp_time_loss: {thp_time_loss.item():.4f}")
-        
-        # DEBUG: Check for large activations in model outputs
         if accelerator.is_main_process:
             with torch.no_grad():
                 # Check generator output stats
