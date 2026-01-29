@@ -1707,7 +1707,7 @@ def pretrain_with_hyperparameter(
     # Register hook on all attention modules
     for name, module in model.named_modules():
         if 'attention' in name.lower() or isinstance(module, torch.nn.MultiheadAttention):
-            module.register_forward_pre_hook(check_attention_inputs)
+            module.register_forward_pre_hook(check_attention_inputs(name))
     # END DEBUG
 
 
