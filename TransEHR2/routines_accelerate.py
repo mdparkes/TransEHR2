@@ -32,16 +32,44 @@ StateDict: TypeAlias = OrderedDict[str, Tensor]
 
 
 # TODO REMOVE DEBUG
+# Global state for attention hooks
+_debug_state = {'epoch': 0, 'enabled': False}
 # Add hooks to attention layers
+def check_attention_inputs(name):
+    def hook(module, args):
+        if not _debug_state['enabled'] or _debug_state['epoch'] < 20:
+            return
+        # MultiheadAttention forward signature: (query, key, value, ...)
+        if len(args) >= 3:
+            query, key, value = args[0], args[1], args[2]
+            q_max = query.abs().max().item()
+            k_max = key.abs().max().item()
+            v_max = value.abs().max().item()
+            if q_max > 100 or k_max > 100 or v_max > 100:
+                print(f"WARNING [{name}]: Large attention inputs - Q_max={q_max:.1f}, K_max={k_max:.1f}, V_max={v_max:.1f}")
+            # Check for NaN in inputs
+            if torch.isnan(query).any() or torch.isnan(key).any() or torch.isnan(value).any():
+                print(f"WARNING [{name}]: NaN in attention inputs!")
+        # Check attn_mask if present (usually args[3] or args[4])
+        for i, arg in enumerate(args[3:], start=3):
+            if isinstance(arg, torch.Tensor) and arg.dtype in [torch.bool, torch.float32, torch.float16]:
+                if arg.dtype == torch.bool:
+                    all_masked = arg.all(dim=-1).any().item()
+                else:
+                    all_masked = (arg == float('-inf')).all(dim=-1).any().item()
+                if all_masked:
+                    print(f"WARNING [{name}]: Some queries have all keys masked!")
+                break
+    return hook
 def check_attention_outputs(name):
     def hook(module, args, output):
+        if not _debug_state['enabled'] or _debug_state['epoch'] < 20:
+            return
         # output is (attn_output, attn_weights) or just attn_output
         attn_out = output[0] if isinstance(output, tuple) else output
-        
         out_max = attn_out.abs().max().item()
         has_nan = torch.isnan(attn_out).any().item()
         has_inf = torch.isinf(attn_out).any().item()
-        
         if has_nan or has_inf or out_max > 1000:
             print(f"ATTENTION [{name}]: out_max={out_max:.1f}, has_nan={has_nan}, has_inf={has_inf}")
     return hook
@@ -449,6 +477,11 @@ def pretrain_one_epoch(
     Returns dictionary of average losses for the epoch.
     """
     model.train()
+
+    # TODO REMOVE DEBUG
+    _debug_state['epoch'] = epoch
+    _debug_state['enabled'] = accelerator.is_main_process
+    # END DEBUG
     
     train_losses = []
     train_gen_losses = []
@@ -1696,6 +1729,9 @@ def pretrain_with_hyperparameter(
 
     # TODO REMOVE DEBUG
     # Register hook on all attention modules
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.MultiheadAttention):
+            module.register_forward_pre_hook(check_attention_inputs(name))
     for name, module in model.named_modules():
         if isinstance(module, torch.nn.MultiheadAttention):
             module.register_forward_hook(check_attention_outputs(name))
