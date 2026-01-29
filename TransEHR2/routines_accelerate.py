@@ -1756,16 +1756,17 @@ def pretrain_with_hyperparameter(
 
     # TODO REMOVE DEBUG
     # Register hook on all attention modules
-    if isinstance(module, torch.nn.MultiheadAttention):
-        module.register_forward_pre_hook(check_attention_inputs(name))
-        module.register_forward_hook(check_attention_outputs(name))
-    # Hook on the TransformerEncoder or TransformerEncoderLayer
-    if 'transformer_encoder' in name and not 'layers' in name:
-        module.register_forward_pre_hook(check_encoder_input(name))
-        module.register_forward_hook(check_encoder_output(name))
-    # Hook on position encoding
-    if 'position_encoding' in name:
-        module.register_forward_hook(check_encoder_output(name + '_pos_enc'))
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.MultiheadAttention):
+            module.register_forward_pre_hook(check_attention_inputs(name))
+            module.register_forward_hook(check_attention_outputs(name))
+        # Hook on the TransformerEncoder or TransformerEncoderLayer
+        if 'transformer_encoder' in name and not 'layers' in name:
+            module.register_forward_pre_hook(check_encoder_input(name))
+            module.register_forward_hook(check_encoder_output(name))
+        # Hook on position encoding
+        if 'position_encoding' in name:
+            module.register_forward_hook(check_encoder_output(name + '_pos_enc'))
     # END DEBUG
 
 
