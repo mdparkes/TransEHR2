@@ -477,36 +477,6 @@ def pretrain_one_epoch(
         gen_loss = gen_loss_fn(generator_preds, electra_output['masked_targets'], value_associated_data_masks)
         disc_loss = disc_loss_fn(discriminator_preds, value_associated_data_masks)
 
-        # TODO REMOVE DEBUG
-        if accelerator.is_main_process:
-            nan_sources = []
-            def make_tensor_hook(name):
-                def hook(grad):
-                    if grad is not None:
-                        has_nan = torch.isnan(grad).any().item()
-                        has_inf = torch.isinf(grad).any().item()
-                        grad_norm = grad.norm().item()
-                        if has_nan or has_inf or grad_norm > 1e6:
-                            print(f"  ISSUE in {name}: grad_norm={grad_norm:.4e}, has_nan={has_nan}, has_inf={has_inf}")
-                            nan_sources.append(name)
-                    return grad
-                return hook
-            # Hook on key intermediate tensors from the forward pass
-            handles = []
-            # Generator outputs
-            if 'numeric' in electra_output['generator']:
-                for i, v in enumerate(electra_output['generator']['numeric']['values']):
-                    if v.requires_grad:
-                        handles.append(v.register_hook(make_tensor_hook(f'gen_numeric_{i}')))
-            # Discriminator outputs  
-            if 'numeric' in electra_output['discriminator']:
-                if electra_output['discriminator']['numeric'].requires_grad:
-                    handles.append(electra_output['discriminator']['numeric'].register_hook(make_tensor_hook('disc_numeric')))
-            if 'text' in electra_output['discriminator']:
-                if electra_output['discriminator']['text'].requires_grad:
-                    handles.append(electra_output['discriminator']['text'].register_hook(make_tensor_hook('disc_text')))
-        # END DEBUG
-
         if thp_encodings is not None and 'thp_intensities' in electra_output:
             intensities = electra_output['thp_intensities']
             event_data = batch['event_data']
@@ -519,16 +489,6 @@ def pretrain_one_epoch(
                 thp_type_preds,
                 thp_time_preds
             )
-            # TODO REMOVE DEBUG
-            if accelerator.is_main_process:
-                # THP outputs
-                if electra_output['hawkes_encodings'].requires_grad:
-                    handles.append(electra_output['hawkes_encodings'].register_hook(make_tensor_hook('thp_encodings')))
-                if electra_output['hawkes_predictions'][0].requires_grad:
-                    handles.append(electra_output['hawkes_predictions'][0].register_hook(make_tensor_hook('thp_type_pred')))
-                if electra_output['hawkes_predictions'][1].requires_grad:
-                    handles.append(electra_output['hawkes_predictions'][1].register_hook(make_tensor_hook('thp_time_pred')))
-            # END DEBUG
 
             loss = gen_loss + disc_loss + thp_loss
             train_thp_losses.append(thp_loss.item())
@@ -570,15 +530,9 @@ def pretrain_one_epoch(
                             f"mean={v.mean():.4f}, has_nan={torch.isnan(v).any()}")
         # END DEBUG
 
-        # TODO REMOVE DEBUG
+        torch.set_anomaly_enabled(True)  # TODO remove after debugging
         accelerator.backward(loss)
-        if accelerator.is_main_process:
-            # Cleanup
-            for h in handles:
-                h.remove()
-            if nan_sources:
-                print(f"  NaN/Inf sources: {nan_sources}")
-        # END DEBUG
+        torch.set_anomaly_enabled(False) # TODO remove after debugging
 
         # TODO REMOVE DEBUG: Monitor gradient norms before clipping
         if accelerator.is_main_process and i % 50 == 0:
@@ -594,7 +548,6 @@ def pretrain_one_epoch(
             if total_norm > 100:
                 print(f"  WARNING: Large gradient norm!")
         # END DEBUG
-
 
         accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
