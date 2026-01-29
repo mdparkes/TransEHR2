@@ -31,6 +31,32 @@ MetadataDict: TypeAlias = Dict[str, Any]
 StateDict: TypeAlias = OrderedDict[str, Tensor]
 
 
+# TODO REMOVE DEBUG
+import torch.backends.cuda
+torch.backends.cuda.enable_flash_sdp(False)
+torch.backends.cuda.enable_mem_efficient_sdp(False)
+torch.backends.cuda.enable_math_sdp(True)
+# Add hooks to attention layers
+def check_attention_inputs(module, args, kwargs):
+    query, key, value = args[0], args[1], args[2]
+    attn_mask = kwargs.get('attn_mask', None)
+    print(f"Attention input - Q: min={query.min():.2f}, max={query.max():.2f}")
+    print(f"Attention input - K: min={key.min():.2f}, max={key.max():.2f}")
+    print(f"Attention input - V: min={value.min():.2f}, max={value.max():.2f}")
+    if attn_mask is not None:
+        # Check if all positions are masked for any query
+        if attn_mask.dtype == torch.bool:
+            all_masked = attn_mask.all(dim=-1).any()
+        else:
+            all_masked = (attn_mask == float('-inf')).all(dim=-1).any()
+        if all_masked:
+            print("WARNING: Some queries have all keys masked!")
+    # Check for extreme values
+    if query.abs().max() > 100 or key.abs().max() > 100:
+        print("WARNING: Large attention input values!")
+# END DEBUG
+
+
 def is_fsdp_enabled(accelerator: Accelerator) -> bool:
     """Check if the accelerator is using FSDP.
     
@@ -423,8 +449,9 @@ def pretrain_one_epoch(
     obs_unobs_sample_ratio: float,
     cmpnt_mask_ratio: float,
     accelerator: Accelerator,
+    epoch: int,  # TODO REMOVE DEBUG
     desc: str = "Training",
-    mem_test_mode: bool = False
+    mem_test_mode: bool = False,
 ) -> Dict[str, float]:
     """Execute one epoch of pretraining.
     
@@ -529,10 +556,12 @@ def pretrain_one_epoch(
                         print(f"Disc {feat_type}: min={v.min():.4f}, max={v.max():.4f}, "
                             f"mean={v.mean():.4f}, has_nan={torch.isnan(v).any()}")
         # END DEBUG
-
-        torch.autograd.set_detect_anomaly(True)  # TODO remove after debugging
+        
+        if epoch >= 20: # TODO REMOVE DEBUG
+            torch.autograd.set_detect_anomaly(True)  # TODO REMOVE DEBUG
         accelerator.backward(loss)
-        torch.autograd.set_detect_anomaly(False) # TODO remove after debugging
+        if epoch >= 20: # TODO REMOVE DEBUG
+            torch.autograd.set_detect_anomaly(False) # TODO REMOVE DEBUG
 
         # TODO REMOVE DEBUG: Monitor gradient norms before clipping
         if accelerator.is_main_process and i % 50 == 0:
@@ -1674,6 +1703,14 @@ def pretrain_with_hyperparameter(
     accelerator.wait_for_everyone()  # Ensure model is fully prepared before dataloaders - reduces peak memory usage
 
 
+    # TODO REMOVE DEBUG
+    # Register hook on all attention modules
+    for name, module in model.named_modules():
+        if 'attention' in name.lower() or isinstance(module, torch.nn.MultiheadAttention):
+            module.register_forward_pre_hook(check_attention_inputs)
+    # END DEBUG
+
+
     # Prepare dataloaders - only use accelerator.prepare if not using balanced sampler
     if not hasattr(train_loader.sampler, 'set_epoch'):
         train_loader = accelerator.prepare_data_loader(train_loader)
@@ -1751,7 +1788,8 @@ def pretrain_with_hyperparameter(
             obs_unobs_sample_ratio=obs_unobs_sample_ratio,
             cmpnt_mask_ratio=cmpnt_mask_ratio,
             accelerator=accelerator,
-            desc=f"Epoch {epoch + 1} Training"            
+            desc=f"Epoch {epoch + 1} Training",
+            epoch=epoch + 1  # TODO REMOVE DEBUG        
         )
 
         # Validation phase
