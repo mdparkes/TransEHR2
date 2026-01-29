@@ -33,7 +33,7 @@ StateDict: TypeAlias = OrderedDict[str, Tensor]
 
 # TODO REMOVE DEBUG
 # Global state for attention hooks
-_debug_state = {'epoch': 0, 'enabled': False}
+_debug_state = {'epoch': 0, 'enabled': False, 'batch_idx': 0}
 # Add hooks to attention layers
 def check_attention_inputs(name):
     def hook(module, args):
@@ -72,6 +72,31 @@ def check_attention_outputs(name):
         has_inf = torch.isinf(attn_out).any().item()
         if has_nan or has_inf or out_max > 1000:
             print(f"ATTENTION [{name}]: out_max={out_max:.1f}, has_nan={has_nan}, has_inf={has_inf}")
+    return hook
+def check_encoder_input(name):
+    def hook(module, args):
+        if not _debug_state['enabled'] or _debug_state['epoch'] < 20:
+            return
+        # Only log first batch of each epoch to reduce noise
+        if _debug_state['batch_idx'] > 0:
+            return
+        x = args[0]
+        x_max = x.abs().max().item()
+        x_mean = x.abs().mean().item()
+        has_nan = torch.isnan(x).any().item()
+        print(f"ENCODER INPUT [{name}]: max={x_max:.1f}, mean={x_mean:.4f}, has_nan={has_nan}")
+    return hook
+def check_encoder_output(name):
+    def hook(module, args, output):
+        if not _debug_state['enabled'] or _debug_state['epoch'] < 20:
+            return
+        if _debug_state['batch_idx'] > 0:
+            return
+        out = output[0] if isinstance(output, tuple) else output
+        out_max = out.abs().max().item()
+        out_mean = out.abs().mean().item()
+        has_nan = torch.isnan(out).any().item()
+        print(f"ENCODER OUTPUT [{name}]: max={out_max:.1f}, mean={out_mean:.4f}, has_nan={has_nan}")
     return hook
 # END DEBUG
 
@@ -494,6 +519,8 @@ def pretrain_one_epoch(
     disable_tqdm = not accelerator.is_local_main_process
     
     for i, batch in tqdm(enumerate(loader), desc=desc, leave=False, disable=disable_tqdm):
+
+        _debug_state['batch_idx'] = i  # TODO REMOVE DEBUG
 
         batch = move_batch_to_device(batch, device=accelerator.device)
 
@@ -1729,12 +1756,16 @@ def pretrain_with_hyperparameter(
 
     # TODO REMOVE DEBUG
     # Register hook on all attention modules
-    for name, module in model.named_modules():
-        if isinstance(module, torch.nn.MultiheadAttention):
-            module.register_forward_pre_hook(check_attention_inputs(name))
-    for name, module in model.named_modules():
-        if isinstance(module, torch.nn.MultiheadAttention):
-            module.register_forward_hook(check_attention_outputs(name))
+    if isinstance(module, torch.nn.MultiheadAttention):
+        module.register_forward_pre_hook(check_attention_inputs(name))
+        module.register_forward_hook(check_attention_outputs(name))
+    # Hook on the TransformerEncoder or TransformerEncoderLayer
+    if 'transformer_encoder' in name and not 'layers' in name:
+        module.register_forward_pre_hook(check_encoder_input(name))
+        module.register_forward_hook(check_encoder_output(name))
+    # Hook on position encoding
+    if 'position_encoding' in name:
+        module.register_forward_hook(check_encoder_output(name + '_pos_enc'))
     # END DEBUG
 
 
