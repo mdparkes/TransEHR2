@@ -530,9 +530,9 @@ def pretrain_one_epoch(
                             f"mean={v.mean():.4f}, has_nan={torch.isnan(v).any()}")
         # END DEBUG
 
-        torch.set_anomaly_enabled(True)  # TODO remove after debugging
+        torch.autograd.set_detect_anomaly(True)  # TODO remove after debugging
         accelerator.backward(loss)
-        torch.set_anomaly_enabled(False) # TODO remove after debugging
+        torch.autograd.set_detect_anomaly(False) # TODO remove after debugging
 
         # TODO REMOVE DEBUG: Monitor gradient norms before clipping
         if accelerator.is_main_process and i % 50 == 0:
