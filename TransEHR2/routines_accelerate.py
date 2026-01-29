@@ -37,7 +37,7 @@ _debug_state = {'epoch': 0, 'enabled': False, 'batch_idx': 0}
 # Add hooks to attention layers
 def check_attention_inputs(name):
     def hook(module, args):
-        if not _debug_state['enabled'] or _debug_state['epoch'] < 20:
+        if not _debug_state['enabled'] or _debug_state['epoch'] < 10:
             return
         # MultiheadAttention forward signature: (query, key, value, ...)
         if len(args) >= 3:
