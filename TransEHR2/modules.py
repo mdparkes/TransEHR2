@@ -183,7 +183,8 @@ class EventDataEncoder(torch.nn.Module):
             n_head: int, 
             d_k: int, 
             d_v: int,
-            dropout: float
+            dropout: float,
+            normalize_before: bool = False
     ):
         """Initialize an instance.
 
@@ -196,6 +197,9 @@ class EventDataEncoder(torch.nn.Module):
             d_k (int): The dimensionality of the key vectors.
             d_v (int): The dimensionality of the value vectors.
             dropout (float): The dropout rate applied throughout the encoder.
+            normalize_before (bool, optional): Whether to apply layer normalization before the attention and
+                feed-forward layers in each encoder layer. If False, layer normalization is applied after.
+                Defaults to False.
         """
 
         super().__init__()
@@ -207,6 +211,7 @@ class EventDataEncoder(torch.nn.Module):
         self.d_k = d_k
         self.d_v = d_v
         self.dropout = dropout
+        self.normalize_before = normalize_before
         
         # NOTE Xu et al. used a torch.nn.Embedding layer to project event types to the model dimension. That worked
         # because the original implementation of the forward pass expected one event ID per timestep (i.e. [batch_size, 
@@ -223,7 +228,7 @@ class EventDataEncoder(torch.nn.Module):
         self.position_encoding_layer = TemporalPositionEncoding(d_model=self.d_model, dropout=0.1)
         enc_args, enc_kwargs = (
             [self.d_model, self.d_inner, self.n_head, self.d_k, self.d_v],
-            {'dropout': self.dropout, 'normalize_before': False}
+            {'dropout': self.dropout, 'normalize_before': self.normalize_before}
         )
         self.layer_stack = torch.nn.ModuleList([EncoderLayer(*enc_args, **enc_kwargs) for _ in range(self.n_layers)])
 
@@ -344,6 +349,7 @@ class ValueDataEncoder(torch.nn.Module):
         dropout: float = 0.1,
         activation: str = 'gelu',
         norm: str = 'BatchNorm',
+        normalize_before: bool = False,
     ):
         r"""Initialize an instance.
 
@@ -360,7 +366,12 @@ class ValueDataEncoder(torch.nn.Module):
             pos_encoding (str, optional): The strategy to use for generating a positional encoding of a timestamp.
                 If 'learnable', use `LearnablePositionalEncoding`. If 'fixed', use `FixedPositionalEncoding`. Defaults to 'fixed'.
             activation (str, optional): The activation function applied throughout the network. Defaults to 'gelu'.
-                norm (str, optional): The type of normalization to use in the `TransformerEncoder`. If 'LayerNorm', `self.transformer_encoder` will be initialized with an instance of `TransformerEncoder` that uses `TransformerEncoderLayer'. Otherwise, `self.transformer_encoder` will be initialized with an instance of `TransformerEncoder` that uses `TransformerBatchNormEncoderLayer`.
+            norm (str, optional): The type of normalization to use in the `TransformerEncoder`. If 'LayerNorm', 
+                `self.transformer_encoder` will be initialized with an instance of `TransformerEncoder` that uses 
+                `TransformerEncoderLayer'. Otherwise, `self.transformer_encoder` will be initialized with an instance 
+                of `TransformerEncoder` that uses `TransformerBatchNormEncoderLayer`.
+            normalize_before (bool, optional): Whether to apply normalization before attention and feedforward 
+                operations (Pre-LN). If False, normalization is applied after (Post-LN). Defaults to False.
         """
 
         super().__init__()
@@ -371,6 +382,7 @@ class ValueDataEncoder(torch.nn.Module):
         self.n_encoder_blocks = n_encoder_blocks
         self.dim_feedforward = dim_feedforward
         self.norm = norm
+        self.normalize_before = normalize_before
         # NOTE Xu et al. only used the value_input_projection_layer in their code, but in the paper they described
         # using two separate projection layers for the indicator and value-associated data. We follow the paper.
         # The value input projection uses bias, but the indicator input projection does not.
@@ -392,7 +404,7 @@ class ValueDataEncoder(torch.nn.Module):
 
         enc_args, enc_kwargs = (
             [self.d_model, self.n_heads, self.dim_feedforward, dropout],
-            {'activation': activation, 'batch_first': True}
+            {'activation': activation, 'batch_first': True, 'norm_first': self.normalize_before}
         )
         if norm == 'LayerNorm':
             return torch.nn.TransformerEncoderLayer(*enc_args, **enc_kwargs)

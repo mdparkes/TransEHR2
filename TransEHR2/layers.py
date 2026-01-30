@@ -25,7 +25,7 @@ class EncoderLayer(torch.nn.Module):
         d_k: int, 
         d_v: int, 
         dropout: float = 0.1, 
-        normalize_before: bool = True
+        normalize_before: bool = False
     ):
         r"""Initialize an instance
         
@@ -37,7 +37,7 @@ class EncoderLayer(torch.nn.Module):
             d_v (int): The dimension of the value vectors.
             dropout (float, optional): The dropout rate. Defaults to 0.1.
             normalize_before (bool, optional): Whether to apply layer normalization before the attention and
-                feed-forward layers. If False, layer normalization is applied *after* each. Defaults to True.
+                feed-forward layers. If False, layer normalization is applied *after* each. Defaults to False.
         """
         super().__init__()
         self.self_attention = MultiHeadAttention(
@@ -383,7 +383,8 @@ class TransformerBatchNormEncoderLayer(torch.nn.Module):
         n_heads: int, 
         dim_feedforward: int = 2048, 
         dropout: float = 0.1, 
-        activation: str = "relu"
+        activation: str = "relu",
+        norm_first: bool = False
     ):
         r"""Initialize an instance
         Args:
@@ -394,9 +395,12 @@ class TransformerBatchNormEncoderLayer(torch.nn.Module):
                 Defaults to 0.1.
             activation (str, optional): The activation applied after the first layer in the feedforward network. Accepts
                 either "relu" or "gelu".
+            norm_first (bool, optional): Whether to apply normalization before attention and feedforward operations
+                (Pre-LN). If False, normalization is applied after (Post-LN). Defaults to False.
         """
 
         super(TransformerBatchNormEncoderLayer, self).__init__()
+        self.norm_first = norm_first
         self.self_attn = torch.nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
         # Feedforward layers
         self.linear1 = torch.nn.Linear(d_model, dim_feedforward)
@@ -456,16 +460,33 @@ class TransformerBatchNormEncoderLayer(torch.nn.Module):
                 output is `[seq_len, batch_size, d_model]`, where `seq_len` is the length of the input token sequence
                 and `d_model` is the model's embedding dimensionality.
         """
-        # Self-attention
-        src2 = self.self_attn(src, src, src, attn_mask=src_mask, key_padding_mask=src_key_padding_mask)[0]
-        src = src + self.dropout1(src2)  # Residual connection, (seq_len, batch_size, d_model)
-        src = src.permute(1, 2, 0)  # Reshape for BatchNorm, (batch_size, d_model, seq_len)
-        src = self.norm1(src)  # Perform batch normalization
-        src = src.permute(2, 0, 1)  # Restore original shape, (seq_len, batch_size, d_model)
-        # Feedforward network
-        src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
-        src = src + self.dropout2(src2)  # (seq_len, batch_size, d_model)
-        src = src.permute(1, 2, 0)  # Reshape for BatchNorm, (batch_size, d_model, seq_len)
-        src = self.norm2(src)  # Perform batch normalization
-        src = src.permute(2, 0, 1)  # Restore original shape, (seq_len, batch_size, d_model)
+        if self.norm_first:
+            # Pre-LN: normalize before attention and feedforward
+            # Self-attention with pre-normalization
+            src_normalized = src.permute(1, 2, 0)  # (batch_size, d_model, seq_len)
+            src_normalized = self.norm1(src_normalized)
+            src_normalized = src_normalized.permute(2, 0, 1)  # (seq_len, batch_size, d_model)
+            src2 = self.self_attn(src_normalized, src_normalized, src_normalized, 
+                                  attn_mask=src_mask, key_padding_mask=src_key_padding_mask)[0]
+            src = src + self.dropout1(src2)  # Residual connection
+            # Feedforward with pre-normalization
+            src_normalized = src.permute(1, 2, 0)  # (batch_size, d_model, seq_len)
+            src_normalized = self.norm2(src_normalized)
+            src_normalized = src_normalized.permute(2, 0, 1)  # (seq_len, batch_size, d_model)
+            src2 = self.linear2(self.dropout(self.activation(self.linear1(src_normalized))))
+            src = src + self.dropout2(src2)  # Residual connection
+        else:
+            # Post-LN: normalize after attention and feedforward (original behaviour)
+            # Self-attention
+            src2 = self.self_attn(src, src, src, attn_mask=src_mask, key_padding_mask=src_key_padding_mask)[0]
+            src = src + self.dropout1(src2)  # Residual connection, (seq_len, batch_size, d_model)
+            src = src.permute(1, 2, 0)  # Reshape for BatchNorm, (batch_size, d_model, seq_len)
+            src = self.norm1(src)  # Perform batch normalization
+            src = src.permute(2, 0, 1)  # Restore original shape, (seq_len, batch_size, d_model)
+            # Feedforward network
+            src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
+            src = src + self.dropout2(src2)  # (seq_len, batch_size, d_model)
+            src = src.permute(1, 2, 0)  # Reshape for BatchNorm, (batch_size, d_model, seq_len)
+            src = self.norm2(src)  # Perform batch normalization
+            src = src.permute(2, 0, 1)  # Restore original shape, (seq_len, batch_size, d_model)
         return src

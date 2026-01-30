@@ -182,6 +182,7 @@ if __name__ == "__main__":
     GENERATOR_ENCODER_DROPOUT = experiment_config['GENERATOR_ENCODER_DROPOUT']
     GENERATOR_ENCODER_ACTIVATION = experiment_config['GENERATOR_ENCODER_ACTIVATION']
     GENERATOR_ENCODER_NORM = experiment_config['GENERATOR_ENCODER_NORM']
+    GENERATOR_ENCODER_NORM_FIRST = experiment_config.get('GENERATOR_ENCODER_NORM_FIRST', False)
     DISCRIMINATOR_ENCODER_D_MODEL = experiment_config['DISCRIMINATOR_ENCODER_D_MODEL']
     DISCRIMINATOR_ENCODER_N_HEADS = experiment_config['DISCRIMINATOR_ENCODER_N_HEADS']
     DISCRIMINATOR_ENCODER_N_ENCODER_BLOCKS = experiment_config['DISCRIMINATOR_ENCODER_N_ENCODER_BLOCKS']
@@ -189,6 +190,7 @@ if __name__ == "__main__":
     DISCRIMINATOR_ENCODER_DROPOUT = experiment_config['DISCRIMINATOR_ENCODER_DROPOUT']
     DISCRIMINATOR_ENCODER_ACTIVATION = experiment_config['DISCRIMINATOR_ENCODER_ACTIVATION']
     DISCRIMINATOR_ENCODER_NORM = experiment_config['DISCRIMINATOR_ENCODER_NORM']
+    DISCRIMINATOR_ENCODER_NORM_FIRST = experiment_config.get('DISCRIMINATOR_ENCODER_NORM_FIRST', False)
     THP_ENCODER_D_MODEL = experiment_config['THP_ENCODER_D_MODEL']
     THP_ENCODER_D_INNER = experiment_config['THP_ENCODER_D_INNER']
     THP_ENCODER_N_LAYERS = experiment_config['THP_ENCODER_N_LAYERS']
@@ -196,6 +198,7 @@ if __name__ == "__main__":
     THP_ENCODER_D_K = experiment_config['THP_ENCODER_D_K']
     THP_ENCODER_D_V = experiment_config['THP_ENCODER_D_V']
     THP_ENCODER_DROPOUT = experiment_config['THP_ENCODER_DROPOUT']
+    THP_ENCODER_NORM_FIRST = experiment_config.get('THP_ENCODER_NORM_FIRST', False)
     GENERATOR_D_MODEL = experiment_config['GENERATOR_D_MODEL']
     GENERATOR_DIM_FEEDFORWARD = experiment_config['GENERATOR_DIM_FEEDFORWARD']
     DISCRIMINATOR_DIM_FEEDFORWARD = experiment_config['DISCRIMINATOR_DIM_FEEDFORWARD']
@@ -302,7 +305,8 @@ if __name__ == "__main__":
             dim_feedforward=GENERATOR_ENCODER_DIM_FEEDFORWARD,
             dropout=GENERATOR_ENCODER_DROPOUT,
             activation=GENERATOR_ENCODER_ACTIVATION,
-            norm=GENERATOR_ENCODER_NORM
+            norm=GENERATOR_ENCODER_NORM,
+            normalize_before=GENERATOR_ENCODER_NORM_FIRST
         )
         discriminator_encoder = ValueDataEncoder(
             n_features=n_val_feats,
@@ -313,7 +317,8 @@ if __name__ == "__main__":
             dim_feedforward=DISCRIMINATOR_ENCODER_DIM_FEEDFORWARD,
             dropout=DISCRIMINATOR_ENCODER_DROPOUT,
             activation=DISCRIMINATOR_ENCODER_ACTIVATION,
-            norm=DISCRIMINATOR_ENCODER_NORM
+            norm=DISCRIMINATOR_ENCODER_NORM,
+            normalize_before=DISCRIMINATOR_ENCODER_NORM_FIRST
         )
         thp_encoder = EventDataEncoder(
             num_types=n_event_types,
@@ -323,7 +328,8 @@ if __name__ == "__main__":
             n_head=THP_ENCODER_N_HEADS,
             d_k=THP_ENCODER_D_K,
             d_v=THP_ENCODER_D_V,
-            dropout=THP_ENCODER_DROPOUT
+            dropout=THP_ENCODER_DROPOUT,
+            normalize_before=THP_ENCODER_NORM_FIRST
         )
         generator = MaskedTokenGenerator(
             encoder=generator_encoder,
@@ -498,7 +504,8 @@ if __name__ == "__main__":
                 dim_feedforward=DISCRIMINATOR_ENCODER_DIM_FEEDFORWARD,
                 dropout=DISCRIMINATOR_ENCODER_DROPOUT,
                 activation=DISCRIMINATOR_ENCODER_ACTIVATION,
-                norm=DISCRIMINATOR_ENCODER_NORM
+                norm=DISCRIMINATOR_ENCODER_NORM,
+                normalize_before=DISCRIMINATOR_ENCODER_NORM_FIRST
             )
             predictor_event_encoder = EventDataEncoder(
                 num_types=n_event_types,
@@ -508,7 +515,8 @@ if __name__ == "__main__":
                 n_head=THP_ENCODER_N_HEADS,
                 d_k=THP_ENCODER_D_K,
                 d_v=THP_ENCODER_D_V,
-                dropout=THP_ENCODER_DROPOUT
+                dropout=THP_ENCODER_DROPOUT,
+                normalize_before=THP_ENCODER_NORM_FIRST
             )
             downstream_predictor = MixedClassifier(
                 event_encoder=predictor_event_encoder,
@@ -614,7 +622,8 @@ if __name__ == "__main__":
                 dim_feedforward=DISCRIMINATOR_ENCODER_DIM_FEEDFORWARD,
                 dropout=DISCRIMINATOR_ENCODER_DROPOUT,
                 activation=DISCRIMINATOR_ENCODER_ACTIVATION,
-                norm=DISCRIMINATOR_ENCODER_NORM
+                norm=DISCRIMINATOR_ENCODER_NORM,
+                normalize_before=DISCRIMINATOR_ENCODER_NORM_FIRST
             )
             predictor_event_encoder = EventDataEncoder(
                 num_types=n_event_types,
@@ -624,7 +633,8 @@ if __name__ == "__main__":
                 n_head=THP_ENCODER_N_HEADS,
                 d_k=THP_ENCODER_D_K,
                 d_v=THP_ENCODER_D_V,
-                dropout=THP_ENCODER_DROPOUT
+                dropout=THP_ENCODER_DROPOUT,
+                normalize_before=THP_ENCODER_NORM_FIRST
             )
             downstream_predictor = MixedClassifier(
                 event_encoder=predictor_event_encoder,
