@@ -80,13 +80,10 @@ class MaskedGeneratorLoss(torch.nn.Module):
         """
         # Extract predictions at masked positions to match sparse target format
         pred_at_masked = pred_indicators[indicator_mask]
-        
         # Cast target to match prediction dtype for mixed precision compatibility
         target_casted = target_indicators.to(pred_at_masked.dtype)
-        
         # Calculate BCE loss on the sparse tensors
         indicator_loss = self.bce_loss(pred_at_masked, target_casted)
-        
         # Sum the loss
         masked_indicator_loss = indicator_loss.sum()
         n_masked = target_indicators.numel()
@@ -117,13 +114,6 @@ class MaskedGeneratorLoss(torch.nn.Module):
         total_loss = 0.0
         n_masked = 0
         
-        # # TODO REMOVE DEBUG
-        # print(f"\n=== MaskedGeneratorLoss._forward_sparse DEBUG ===")
-        # print(f"predictions keys: {predictions.keys() if predictions else 'None'}")
-        # print(f"masked_targets keys: {masked_targets.keys() if masked_targets else 'None'}")
-        # print(f"record_masks keys: {record_masks.keys() if record_masks else 'None'}")
-        # # END DEBUG
-        
         # Process numeric features
         if 'numeric' in predictions and 'numeric' in masked_targets:
             pred_values = predictions['numeric']['values']
@@ -133,44 +123,16 @@ class MaskedGeneratorLoss(torch.nn.Module):
             
             numeric_loss = 0.0
             numeric_n_masked = 0
-            
-            # # TODO REMOVE DEBUG
-            # print(f"\n[NUMERIC] n_features: {len(pred_values)}")
-            # # END DEBUG
-            
             for f, (pred, target) in enumerate(zip(pred_values, target_values)):
                 if target.numel() == 0:
-                    # # TODO REMOVE DEBUG
-                    # print(f"  Feature {f}: SKIPPED (target empty)")
-                    # # END DEBUG
                     continue
-                
                 value_mask = value_masks[f].bool()
                 pred_at_masked = pred[value_mask]
                 target_casted = target.to(pred_at_masked.dtype)
-                
-                # # TODO REMOVE DEBUG
-                # print(f"  Feature {f}: pred_at_masked shape={pred_at_masked.shape}, "
-                #     f"has_nan={torch.isnan(pred_at_masked).any().item()}, "
-                #     f"has_inf={torch.isinf(pred_at_masked).any().item()}")
-                # print(f"             target shape={target_casted.shape}, "
-                #     f"has_nan={torch.isnan(target_casted).any().item()}, "
-                #     f"has_inf={torch.isinf(target_casted).any().item()}")
-                # # END DEBUG
-                
                 feature_loss = self.mse_loss(pred_at_masked, target_casted)
-                
-                # # TODO REMOVE DEBUG
-                # print(f"             feature_loss sum={feature_loss.sum().item()}, "
-                #     f"has_nan={torch.isnan(feature_loss).any().item()}")
-                # # END DEBUG
-                
                 numeric_loss += feature_loss.sum()
                 numeric_n_masked += target.numel()
             
-            # # TODO REMOVE DEBUG
-            # print(f"[NUMERIC] total loss={numeric_loss}, n_masked={numeric_n_masked}")
-            # # END DEBUG
             total_loss += self.numeric_weight * numeric_loss
             n_masked += numeric_n_masked
             
@@ -182,14 +144,6 @@ class MaskedGeneratorLoss(torch.nn.Module):
                         masked_targets['numeric']['indicators'],
                         feature_masks.bool()
                     )
-                    # # TODO REMOVE DEBUG
-                    # print(f"[NUMERIC INDICATORS] loss={indicator_loss.item()}, n_masked={indicator_n_masked}")
-                    # if torch.isnan(indicator_loss):
-                    #     print(f"  WARNING: NaN in numeric indicator loss!")
-                    #     print(f"  pred indicators has_nan={torch.isnan(predictions['numeric']['indicators']).any().item()}")
-                    #     print(f"  target indicators has_nan={torch.isnan(masked_targets['numeric']['indicators']).any().item()}")
-                    # # END DEBUG
-                    
                     total_loss += self.indicator_weight * indicator_loss
                     n_masked += indicator_n_masked
         
@@ -201,44 +155,16 @@ class MaskedGeneratorLoss(torch.nn.Module):
             
             cat_loss = 0.0
             cat_n_masked = 0
-            
-            # # TODO REMOVE DEBUG
-            # print(f"\n[CATEGORICAL] n_features: {len(pred_values)}")
-            # # END DEBUG
-
             for f, (pred, target) in enumerate(zip(pred_values, target_values)):
                 if target.numel() == 0:
-                    # # TODO REMOVE DEBUG
-                    # print(f"  Feature {f}: SKIPPED (target empty)")
-                    # # END DEBUG
                     continue
-                
                 feat_mask = feature_masks[:, :, f].bool()
                 pred_at_masked = pred[feat_mask]
                 target_classes = torch.argmax(target, dim=-1)
-                
-                # # TODO REMOVE DEBUG
-                # print(f"  Feature {f}: pred_at_masked shape={pred_at_masked.shape}, "
-                #     f"has_nan={torch.isnan(pred_at_masked).any().item()}, "
-                #     f"has_inf={torch.isinf(pred_at_masked).any().item()}")
-                # print(f"             target_classes shape={target_classes.shape}, "
-                #     f"min={target_classes.min().item()}, max={target_classes.max().item()}, "
-                #     f"n_classes={pred_at_masked.shape[-1] if pred_at_masked.dim() > 1 else 'N/A'}")
-                # # END DEBUG
-                
                 feature_loss = self.ce_loss(pred_at_masked, target_classes)
-                
-                # # TODO REMOVE DEBUG
-                # print(f"             feature_loss sum={feature_loss.sum().item()}, "
-                #     f"has_nan={torch.isnan(feature_loss).any().item()}")
-                # # END DEBUG
-                
                 cat_loss += feature_loss.sum()
                 cat_n_masked += target_classes.numel()
             
-            # # TODO REMOVE DEBUG
-            # print(f"[CATEGORICAL] total loss={cat_loss}, n_masked={cat_n_masked}")
-            # # END DEBUG
             total_loss += self.categorical_weight * cat_loss
             n_masked += cat_n_masked
             
@@ -250,12 +176,6 @@ class MaskedGeneratorLoss(torch.nn.Module):
                         masked_targets['categorical']['indicators'],
                         feature_masks.bool()
                     )
-                    # # TODO REMOVE DEBUG
-                    # print(f"[CATEGORICAL INDICATORS] loss={indicator_loss.item()}, n_masked={indicator_n_masked}")
-                    # if torch.isnan(indicator_loss):
-                    #     print(f"  WARNING: NaN in categorical indicator loss!")
-                    # # END DEBUG
-
                     total_loss += self.indicator_weight * indicator_loss
                     n_masked += indicator_n_masked
         
@@ -268,34 +188,32 @@ class MaskedGeneratorLoss(torch.nn.Module):
                 
                 text_loss = 0.0
                 text_n_masked = 0
-                
                 for f, (pred, target) in enumerate(zip(pred_values, target_values)):
                     if target.numel() == 0:
                         continue
-                    
                     feat_mask = feature_masks[:, :, f].bool()
                     pred_at_masked = pred[feat_mask]
                     target_casted = target.to(pred_at_masked.dtype)
-                    
                     # Filter out zero vectors to avoid NaN from F.normalize
                     pred_norms = torch.norm(pred_at_masked, p=2, dim=-1)
                     target_norms = torch.norm(target_casted, p=2, dim=-1)
-                    
+                    # Create valid mask: feature is masked AND both vectors are non-zero
                     eps = 1e-8
                     valid_mask = (pred_norms > eps) & (target_norms > eps)
-                    
                     if valid_mask.sum() == 0:
                         continue
-                    
+                    # Extract valid vectors
                     pred_valid = pred_at_masked[valid_mask]
                     target_valid = target_casted[valid_mask]
-                    
+                    # Normalize embeddings for cosine similarity
                     pred_norm = F.normalize(pred_valid, p=2, dim=-1)
                     target_norm = F.normalize(target_valid, p=2, dim=-1)
-                    
+                    # Calculate cosine similarity (dot product of normalized vectors)
                     cosine_sim = torch.sum(pred_norm * target_norm, dim=-1)
+                    # Convert similarity [-1,1] to distance [0,2] and rescale to [0,1]
                     cosine_distance = (1.0 - cosine_sim) / 2.0
                     
+                    # For text, count each valid masked embedding as one loss unit
                     text_loss += cosine_distance.sum()
                     text_n_masked += cosine_distance.numel()
                 
@@ -313,24 +231,10 @@ class MaskedGeneratorLoss(torch.nn.Module):
                         total_loss += self.indicator_weight * indicator_loss
                         n_masked += indicator_n_masked
         
-        # # TODO REMOVE DEBUG
-        # print(f"\n[GENERATOR LOSS SUMMARY]")
-        # print(f"  total_loss (before normalization): {total_loss}")
-        # print(f"  n_masked: {n_masked}")
-        # # END DEBUG
-        
         # Normalize the total loss by the number of masked values
         if n_masked > 0:
             total_loss = total_loss / n_masked
-        # else:
-        #     print(f"  WARNING: n_masked is 0! This will cause division issues.")
-        
-        # # TODO REMOVE DEBUG
-        # print(f"  total_loss (after normalization): {total_loss}")
-        # print(f"  has_nan: {torch.isnan(torch.tensor(total_loss)).item() if isinstance(total_loss, float) else torch.isnan(total_loss).item()}")
-        # print(f"=== END MaskedGeneratorLoss DEBUG ===\n")
-        # # END DEBUG
-        
+
         return total_loss
     
     def _forward_full_batch(
@@ -366,36 +270,28 @@ class MaskedGeneratorLoss(torch.nn.Module):
             feature_masks = record_masks['numeric']['indicators']  # [batch_size, max_ts_len, n_numeric_feats]
             value_masks = record_masks['numeric']['values']  # List of [batch_size, max_ts_len, feature_dim]
             
-            numeric_loss = 0.0
-            
             # Process each numeric feature
+            numeric_loss = 0.0
             for f, (pred, target, value_mask) in enumerate(zip(pred_values, target_values, value_masks)):
                 # Extract feature mask for this feature
                 feat_mask = feature_masks[:, :, f].bool()  # [batch_size, max_ts_len]
-                
                 # Skip if no masked values
                 if not feat_mask.any():
                     continue
-                
                 # Calculate loss only for masked positions
                 feature_loss = self.mse_loss(pred, target)  # [batch_size, max_ts_len, feature_dim]
-
                 # Apply the component-level mask (vectorized)
                 mask = value_mask.bool()
                 masked_loss = torch.where(mask, feature_loss, torch.zeros_like(feature_loss))
-
                 # Reshape for vectorized operations
                 # Create mask for valid entries (batch, time positions where feature is masked)
                 batch_time_mask = feat_mask.unsqueeze(-1)  # [batch_size, max_ts_len, 1]
-                
                 # Sum across feature dimensions for each (batch, time) position, then mask with batch_time_mask
                 # to get only the loss for positions where feature is masked
                 pos_loss = masked_loss.sum(dim=-1, keepdim=True)  # [batch_size, max_ts_len, 1]
                 pos_loss = torch.where(batch_time_mask, pos_loss, torch.zeros_like(pos_loss))
-
                 # Sum total loss and count masked components
                 numeric_loss += pos_loss.sum()
-                
                 # Count masked components (vectorized)
                 # For each (batch, time) position where feature is masked, count number of component masks
                 component_counts = (value_mask.bool() & batch_time_mask).sum()
@@ -406,8 +302,7 @@ class MaskedGeneratorLoss(torch.nn.Module):
             # Process indicator predictions if available
             if 'indicators' in predictions['numeric'] and predictions['numeric']['indicators'] is not None:
                 pred_indicators = predictions['numeric']['indicators']  # [batch_size, max_ts_len, n_numeric_feats]
-                target_indicators = targets['val_data']['numeric']['indicators']  # [batch_size, max_ts_len, n_numeric_feats]
-                
+                target_indicators = targets['val_data']['numeric']['indicators']  # [b_sz, max_ts_len, n_numeric_fts]
                 # Calculate indicator loss
                 indicator_loss = self.bce_loss(pred_indicators, target_indicators.float())
                 masked_indicator_loss = (indicator_loss * feature_masks.bool()).sum()
@@ -420,7 +315,6 @@ class MaskedGeneratorLoss(torch.nn.Module):
         if 'categorical' in predictions and 'categorical' in targets['val_data']:
             # Get predicted values
             pred_values = predictions['categorical']['values']  # List of tensors, one per feature
-            
             # Get ground truth values - need to convert from one-hot to class indices
             target_values = []
             for target in targets['val_data']['categorical']['values']:
@@ -432,28 +326,22 @@ class MaskedGeneratorLoss(torch.nn.Module):
             feature_masks = record_masks['categorical']['indicators']  # [batch_size, max_ts_len, n_cat_feats]
             
             cat_loss = 0.0
-            
             # Process each categorical feature
             for f, (pred, target) in enumerate(zip(pred_values, target_values)):
                 # Extract feature mask for this feature
                 feat_mask = feature_masks[:, :, f].bool().flatten()  # [batch_size * max_ts_len]
-                
                 # Skip if no masked values
                 if not feat_mask.any():
                     continue
-                
                 # Reshape for cross entropy loss (vectorized)
                 batch_size, max_ts_len, n_classes = pred.shape
                 pred_flat = pred.reshape(-1, n_classes)
                 target_flat = target.reshape(-1)
-                
                 # Calculate CE loss for all positions
                 feature_loss = self.ce_loss(pred_flat, target_flat)  # [batch_size * max_ts_len]
-                
                 # Apply mask and sum
                 masked_loss = feature_loss * feat_mask
                 cat_loss += masked_loss.sum()
-                
                 # Count masked elements
                 n_masked += feat_mask.sum().item()
             
@@ -463,12 +351,11 @@ class MaskedGeneratorLoss(torch.nn.Module):
             if 'indicators' in predictions['categorical'] and predictions['categorical']['indicators'] is not None:
                 pred_indicators = predictions['categorical']['indicators']
                 target_indicators = targets['val_data']['categorical']['indicators']
-                
                 # Calculate indicator loss
                 indicator_loss = self.bce_loss(pred_indicators, target_indicators.float())
                 masked_indicator_loss = (indicator_loss * feature_masks.bool()).sum()
                 indicator_n_masked = feature_masks.bool().sum().item()
-                
+
                 total_loss += self.indicator_weight * masked_indicator_loss
                 n_masked += indicator_n_masked
         
@@ -487,33 +374,24 @@ class MaskedGeneratorLoss(torch.nn.Module):
                 has_target_embeddings = False
             
             if has_target_embeddings:
-                # Get masks for text features
-                feature_masks = record_masks['text']['indicators']  # [batch_size, max_ts_len, n_text_feats]
-                value_masks = record_masks['text']['embedded_values']  # List of [batch_size, max_ts_len, TEXT_EMBED_DIM]
-                
-                text_loss = 0.0
-                
                 # Process each text feature
+                feature_masks = record_masks['text']['indicators']  # [batch_size, max_ts_len, n_text_feats]
+                value_masks = record_masks['text']['embedded_values']  # List: [batch_size, max_ts_len, TEXT_EMBED_DIM]
+                text_loss = 0.0
                 for f, (pred, target, value_mask) in enumerate(zip(pred_values, target_values, value_masks)):
                     # Extract feature mask for this feature
                     feat_mask = feature_masks[:, :, f].bool()  # [batch_size, max_ts_len]
-                    
                     # Skip if no masked values
                     if not feat_mask.any():
                         continue
-                    
                     # Compute norms to identify zero vectors
                     pred_norms = torch.norm(pred, p=2, dim=-1)  # [batch_size, max_ts_len]
                     target_norms = torch.norm(target, p=2, dim=-1)  # [batch_size, max_ts_len]
-                    
                     # Create valid mask: feature is masked AND both vectors are non-zero
                     eps = 1e-8
                     valid_mask = feat_mask & (pred_norms > eps) & (target_norms > eps)
-                    
-                    # Skip if no valid pairs
                     if not valid_mask.any():
                         continue
-                    
                     # Extract valid vectors
                     pred_valid = pred[valid_mask]  # [n_valid, TEXT_EMBED_DIM]
                     target_valid = target[valid_mask]  # [n_valid, TEXT_EMBED_DIM]
@@ -521,10 +399,8 @@ class MaskedGeneratorLoss(torch.nn.Module):
                     # Normalize embeddings for cosine similarity
                     pred_norm = F.normalize(pred_valid, p=2, dim=-1)
                     target_norm = F.normalize(target_valid, p=2, dim=-1)
-                    
                     # Calculate cosine similarity (dot product of normalized vectors)
                     cosine_sim = torch.sum(pred_norm * target_norm, dim=-1)  # [n_valid]
-                    
                     # Convert similarity [-1,1] to distance [0,2] and rescale to [0,1]
                     cosine_distance = (1.0 - cosine_sim) / 2.0
                     
@@ -542,7 +418,6 @@ class MaskedGeneratorLoss(torch.nn.Module):
                             targets['text']['indicators'],
                             feature_masks.bool()
                         )
-                        
                         total_loss += self.indicator_weight * indicator_loss
                         n_masked += indicator_n_masked
         
@@ -629,67 +504,24 @@ class MaskedDiscriminatorLoss(torch.nn.Module):
         """
         total_loss = 0.0
         n_predictions = 0
-
-        # # TODO REMOVE DEBUG
-        # print(f"\n=== MaskedDiscriminatorLoss DEBUG ===")
-        # print(f"predictions keys: {predictions.keys() if predictions else 'None'}")
-        # print(f"record_masks keys: {record_masks.keys() if record_masks else 'None'}")
-        # # END DEBUG
         
         # Process each feature type
         for feat_type in ['numeric', 'categorical', 'text']:
             if feat_type not in predictions or feat_type not in record_masks:
-                # # TODO REMOVE DEBUG
-                # print(f"[{feat_type.upper()}] SKIPPED (not in predictions or record_masks)")
-                # # END DEBUG
-                continue
-                
+                continue 
             pred_logits = predictions[feat_type]  # (batch_size, max_ts_len, n_features)
             indicator_mask = record_masks[feat_type]['indicators']  # (batch_size, max_ts_len, n_features)
-        
-            # # TODO REMOVE DEBUG
-            # print(f"\n[{feat_type.upper()}]")
-            # print(f"  pred_logits shape: {pred_logits.shape}")
-            # print(f"  pred_logits has_nan: {torch.isnan(pred_logits).any().item()}")
-            # print(f"  pred_logits has_inf: {torch.isinf(pred_logits).any().item()}")
-            # print(f"  pred_logits min: {pred_logits.min().item():.4f}, max: {pred_logits.max().item():.4f}")
-            # print(f"  indicator_mask shape: {indicator_mask.shape}")
-            # print(f"  indicator_mask sum (n_masked): {indicator_mask.sum().item()}")
-            # # END DEBUG
-        
             # Create target labels: 1 for generated (masked), 0 for real (not masked)
             targets = indicator_mask.float()
-            
             # Calculate BCE loss for all positions
             feature_loss = self.bce_loss(pred_logits, targets)  # (batch_size, max_ts_len, n_features)
-            
-            # # TODO REMOVE DEBUG
-            # print(f"  feature_loss has_nan: {torch.isnan(feature_loss).any().item()}")
-            # print(f"  feature_loss has_inf: {torch.isinf(feature_loss).any().item()}")
-            # print(f"  feature_loss sum: {feature_loss.sum().item()}")
-            # # END DEBUG
-
             # Sum loss across all dimensions
             total_loss += feature_loss.sum()
             n_predictions += feature_loss.numel()
-
-        # # TODO REMOVE DEBUG
-        # print(f"\n[DISCRIMINATOR LOSS SUMMARY]")
-        # print(f"  total_loss (before normalization): {total_loss}")
-        # print(f"  n_predictions: {n_predictions}")
-        # # END DEBUG
         
         # Normalize by number of predictions
         if n_predictions > 0:
             total_loss = total_loss / n_predictions
-        # else:
-        #     print(f"  WARNING: n_predictions is 0!")
-        
-        # # TODO REMOVE DEBUG
-        # print(f"  total_loss (after normalization): {total_loss}")
-        # print(f"  weighted loss: {self.weight * total_loss}")
-        # print(f"=== END MaskedDiscriminatorLoss DEBUG ===\n")
-        # # END DEBUG
 
         return self.weight * total_loss
 

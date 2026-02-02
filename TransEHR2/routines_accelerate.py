@@ -31,76 +31,6 @@ MetadataDict: TypeAlias = Dict[str, Any]
 StateDict: TypeAlias = OrderedDict[str, Tensor]
 
 
-# TODO REMOVE DEBUG
-# Global state for attention hooks
-_debug_state = {'epoch': 0, 'enabled': False, 'batch_idx': 0}
-# Add hooks to attention layers
-def check_attention_inputs(name):
-    def hook(module, args):
-        if not _debug_state['enabled'] or _debug_state['epoch'] < 15:
-            return
-        # MultiheadAttention forward signature: (query, key, value, ...)
-        if len(args) >= 3:
-            query, key, value = args[0], args[1], args[2]
-            q_max = query.abs().max().item()
-            k_max = key.abs().max().item()
-            v_max = value.abs().max().item()
-            if q_max > 100 or k_max > 100 or v_max > 100:
-                print(f"WARNING [{name}]: Large attention inputs - Q_max={q_max:.1f}, K_max={k_max:.1f}, V_max={v_max:.1f}")
-            # Check for NaN in inputs
-            if torch.isnan(query).any() or torch.isnan(key).any() or torch.isnan(value).any():
-                print(f"WARNING [{name}]: NaN in attention inputs!")
-        # Check attn_mask if present (usually args[3] or args[4])
-        for i, arg in enumerate(args[3:], start=3):
-            if isinstance(arg, torch.Tensor) and arg.dtype in [torch.bool, torch.float32, torch.float16]:
-                if arg.dtype == torch.bool:
-                    all_masked = arg.all(dim=-1).any().item()
-                else:
-                    all_masked = (arg == float('-inf')).all(dim=-1).any().item()
-                if all_masked:
-                    print(f"WARNING [{name}]: Some queries have all keys masked!")
-                break
-    return hook
-def check_attention_outputs(name):
-    def hook(module, args, output):
-        if not _debug_state['enabled'] or _debug_state['epoch'] < 15:
-            return
-        # output is (attn_output, attn_weights) or just attn_output
-        attn_out = output[0] if isinstance(output, tuple) else output
-        out_max = attn_out.abs().max().item()
-        has_nan = torch.isnan(attn_out).any().item()
-        has_inf = torch.isinf(attn_out).any().item()
-        if has_nan or has_inf or out_max > 1000:
-            print(f"ATTENTION [{name}]: out_max={out_max:.1f}, has_nan={has_nan}, has_inf={has_inf}")
-    return hook
-def check_encoder_input(name):
-    def hook(module, args):
-        if not _debug_state['enabled'] or _debug_state['epoch'] < 20:
-            return
-        # Only log first batch of each epoch to reduce noise
-        if _debug_state['batch_idx'] > 0:
-            return
-        x = args[0]
-        x_max = x.abs().max().item()
-        x_mean = x.abs().mean().item()
-        has_nan = torch.isnan(x).any().item()
-        print(f"ENCODER INPUT [{name}]: max={x_max:.1f}, mean={x_mean:.4f}, has_nan={has_nan}")
-    return hook
-def check_encoder_output(name):
-    def hook(module, args, output):
-        if not _debug_state['enabled'] or _debug_state['epoch'] < 20:
-            return
-        if _debug_state['batch_idx'] > 0:
-            return
-        out = output[0] if isinstance(output, tuple) else output
-        out_max = out.abs().max().item()
-        out_mean = out.abs().mean().item()
-        has_nan = torch.isnan(out).any().item()
-        print(f"ENCODER OUTPUT [{name}]: max={out_max:.1f}, mean={out_mean:.4f}, has_nan={has_nan}")
-    return hook
-# END DEBUG
-
-
 def is_fsdp_enabled(accelerator: Accelerator) -> bool:
     """Check if the accelerator is using FSDP.
     
@@ -493,7 +423,6 @@ def pretrain_one_epoch(
     obs_unobs_sample_ratio: float,
     cmpnt_mask_ratio: float,
     accelerator: Accelerator,
-    epoch: int,  # TODO REMOVE DEBUG
     desc: str = "Training",
     mem_test_mode: bool = False,
 ) -> Dict[str, float]:
@@ -501,12 +430,8 @@ def pretrain_one_epoch(
     
     Returns dictionary of average losses for the epoch.
     """
-    model.train()
 
-    # TODO REMOVE DEBUG
-    _debug_state['epoch'] = epoch
-    _debug_state['enabled'] = accelerator.is_main_process
-    # END DEBUG
+    model.train()
     
     train_losses = []
     train_gen_losses = []
@@ -520,190 +445,65 @@ def pretrain_one_epoch(
     
     for i, batch in tqdm(enumerate(loader), desc=desc, leave=False, disable=disable_tqdm):
 
-        _debug_state['batch_idx'] = i  # TODO REMOVE DEBUG
-
         batch = move_batch_to_device(batch, device=accelerator.device)
-
         value_associated_data_masks, _ = generate_record_masks(
             batch,
             feature_sample_rate=record_mask_ratio,
             obs_unobs_ratio=obs_unobs_sample_ratio,
             subsample_rate=cmpnt_mask_ratio
         )
-
         accelerator.wait_for_everyone()
 
-        if epoch >= 15:  # TODO REMOVE DEBUG
-            with torch.autograd.detect_anomaly(check_nan=True):  # TODO REMOVE DEBUG
-                electra_output = model(
-                    batch,
-                    value_associated_data_masks,
-                    device=accelerator.device,
-                    trace_grads=False,
-                    compute_intensities=True,
-                    thp_loss_mc_samples=thp_loss_mc_samples
-                )
+        electra_output = model(
+            batch,
+            value_associated_data_masks,
+            device=accelerator.device,
+            trace_grads=False,
+            compute_intensities=True,
+            thp_loss_mc_samples=thp_loss_mc_samples
+        )
 
-                generator_preds = electra_output['generator']
-                discriminator_preds = electra_output['discriminator']
-                thp_encodings = electra_output.get('hawkes_encodings', None)
-                thp_preds = electra_output.get('hawkes_predictions', (None, None))
-                
-                if thp_preds != (None, None):
-                    thp_type_preds, thp_time_preds = thp_preds
-                else:
-                    thp_type_preds, thp_time_preds = (None, None)
+        generator_preds = electra_output['generator']
+        discriminator_preds = electra_output['discriminator']
+        thp_encodings = electra_output.get('hawkes_encodings', None)
+        thp_preds = electra_output.get('hawkes_predictions', (None, None))
+        if thp_preds != (None, None):
+            thp_type_preds, thp_time_preds = thp_preds
+        else:
+            thp_type_preds, thp_time_preds = (None, None)
 
-                gen_loss = gen_loss_fn(generator_preds, electra_output['masked_targets'], value_associated_data_masks)
-                disc_loss = disc_loss_fn(discriminator_preds, value_associated_data_masks)
+        gen_loss = gen_loss_fn(generator_preds, electra_output['masked_targets'], value_associated_data_masks)
+        disc_loss = disc_loss_fn(discriminator_preds, value_associated_data_masks)
 
-                if thp_encodings is not None and 'thp_intensities' in electra_output:
-                    intensities = electra_output['thp_intensities']
-                    event_data = batch['event_data']
-
-                    thp_loss, (thp_nll_loss, thp_type_loss, thp_time_loss) = thp_loss_fn(
-                        intensities['obs_initial'],
-                        intensities['obs_conditional'],
-                        intensities['sampled'],
-                        event_data,
-                        thp_type_preds,
-                        thp_time_preds
-                    )
-
-                    loss = gen_loss + disc_loss + thp_loss
-                    train_thp_losses.append(thp_loss.item())
-                    train_thp_nll_losses.append(thp_nll_loss.item())
-                    train_thp_type_losses.append(thp_type_loss.item())
-                    train_thp_time_losses.append(thp_time_loss.item())
-                else:
-                    loss = gen_loss + disc_loss
-                    train_thp_losses.append(0.0)
-                    train_thp_nll_losses.append(0.0)
-                    train_thp_type_losses.append(0.0)
-                    train_thp_time_losses.append(0.0)
-
-                train_losses.append(loss.item())
-                train_gen_losses.append(gen_loss.item())
-                train_disc_losses.append(disc_loss.item())
-
-                optimizer.zero_grad()
-
-                # TODO REMOVE DEBUG
-                if accelerator.is_main_process:
-                    with torch.no_grad():
-                        # Check generator output stats
-                        for feat_type in ['numeric', 'categorical', 'text']:
-                            if feat_type in electra_output['generator']:
-                                if 'values' in electra_output['generator'][feat_type]:
-                                    for i, v in enumerate(electra_output['generator'][feat_type]['values']):
-                                        print(f"Gen {feat_type}[{i}]: min={v.min():.4f}, max={v.max():.4f}, "
-                                            f"mean={v.mean():.4f}, has_nan={torch.isnan(v).any()}")
-                                if 'embedded_values' in electra_output['generator'][feat_type]:
-                                    for i, v in enumerate(electra_output['generator'][feat_type]['embedded_values']):
-                                        print(f"Gen {feat_type}_emb[{i}]: min={v.min():.4f}, max={v.max():.4f}, "
-                                            f"mean={v.mean():.4f}, has_nan={torch.isnan(v).any()}")
-                        # Check discriminator output stats
-                        for feat_type in ['numeric', 'categorical', 'text']:
-                            if feat_type in electra_output['discriminator']:
-                                v = electra_output['discriminator'][feat_type]
-                                print(f"Disc {feat_type}: min={v.min():.4f}, max={v.max():.4f}, "
-                                    f"mean={v.mean():.4f}, has_nan={torch.isnan(v).any()}")
-                # END DEBUG
-                
-                accelerator.backward(loss)
-        else:  # TODO REMOVE DEBUG
-            electra_output = model(
-                batch,
-                value_associated_data_masks,
-                device=accelerator.device,
-                trace_grads=False,
-                compute_intensities=True,
-                thp_loss_mc_samples=thp_loss_mc_samples
+        if thp_encodings is not None and 'thp_intensities' in electra_output:
+            intensities = electra_output['thp_intensities']
+            event_data = batch['event_data']
+            thp_loss, (thp_nll_loss, thp_type_loss, thp_time_loss) = thp_loss_fn(
+                intensities['obs_initial'],
+                intensities['obs_conditional'],
+                intensities['sampled'],
+                event_data,
+                thp_type_preds,
+                thp_time_preds
             )
+            loss = gen_loss + disc_loss + thp_loss
+            train_thp_losses.append(thp_loss.item())
+            train_thp_nll_losses.append(thp_nll_loss.item())
+            train_thp_type_losses.append(thp_type_loss.item())
+            train_thp_time_losses.append(thp_time_loss.item())
+        else:
+            loss = gen_loss + disc_loss
+            train_thp_losses.append(0.0)
+            train_thp_nll_losses.append(0.0)
+            train_thp_type_losses.append(0.0)
+            train_thp_time_losses.append(0.0)
 
-            generator_preds = electra_output['generator']
-            discriminator_preds = electra_output['discriminator']
-            thp_encodings = electra_output.get('hawkes_encodings', None)
-            thp_preds = electra_output.get('hawkes_predictions', (None, None))
-            
-            if thp_preds != (None, None):
-                thp_type_preds, thp_time_preds = thp_preds
-            else:
-                thp_type_preds, thp_time_preds = (None, None)
+        train_losses.append(loss.item())
+        train_gen_losses.append(gen_loss.item())
+        train_disc_losses.append(disc_loss.item())
 
-            gen_loss = gen_loss_fn(generator_preds, electra_output['masked_targets'], value_associated_data_masks)
-            disc_loss = disc_loss_fn(discriminator_preds, value_associated_data_masks)
-
-            if thp_encodings is not None and 'thp_intensities' in electra_output:
-                intensities = electra_output['thp_intensities']
-                event_data = batch['event_data']
-
-                thp_loss, (thp_nll_loss, thp_type_loss, thp_time_loss) = thp_loss_fn(
-                    intensities['obs_initial'],
-                    intensities['obs_conditional'],
-                    intensities['sampled'],
-                    event_data,
-                    thp_type_preds,
-                    thp_time_preds
-                )
-
-                loss = gen_loss + disc_loss + thp_loss
-                train_thp_losses.append(thp_loss.item())
-                train_thp_nll_losses.append(thp_nll_loss.item())
-                train_thp_type_losses.append(thp_type_loss.item())
-                train_thp_time_losses.append(thp_time_loss.item())
-            else:
-                loss = gen_loss + disc_loss
-                train_thp_losses.append(0.0)
-                train_thp_nll_losses.append(0.0)
-                train_thp_type_losses.append(0.0)
-                train_thp_time_losses.append(0.0)
-
-            train_losses.append(loss.item())
-            train_gen_losses.append(gen_loss.item())
-            train_disc_losses.append(disc_loss.item())
-
-            optimizer.zero_grad()
-
-            # TODO REMOVE DEBUG
-            if accelerator.is_main_process:
-                with torch.no_grad():
-                    # Check generator output stats
-                    for feat_type in ['numeric', 'categorical', 'text']:
-                        if feat_type in electra_output['generator']:
-                            if 'values' in electra_output['generator'][feat_type]:
-                                for i, v in enumerate(electra_output['generator'][feat_type]['values']):
-                                    print(f"Gen {feat_type}[{i}]: min={v.min():.4f}, max={v.max():.4f}, "
-                                        f"mean={v.mean():.4f}, has_nan={torch.isnan(v).any()}")
-                            if 'embedded_values' in electra_output['generator'][feat_type]:
-                                for i, v in enumerate(electra_output['generator'][feat_type]['embedded_values']):
-                                    print(f"Gen {feat_type}_emb[{i}]: min={v.min():.4f}, max={v.max():.4f}, "
-                                        f"mean={v.mean():.4f}, has_nan={torch.isnan(v).any()}")
-                    # Check discriminator output stats
-                    for feat_type in ['numeric', 'categorical', 'text']:
-                        if feat_type in electra_output['discriminator']:
-                            v = electra_output['discriminator'][feat_type]
-                            print(f"Disc {feat_type}: min={v.min():.4f}, max={v.max():.4f}, "
-                                f"mean={v.mean():.4f}, has_nan={torch.isnan(v).any()}")
-            # END DEBUG
-
-            accelerator.backward(loss)
-
-        # TODO REMOVE DEBUG: Monitor gradient norms before clipping
-        if accelerator.is_main_process and i % 50 == 0:
-            total_norm = 0.0
-            for p in model.parameters():
-                if p.grad is not None:
-                    param_norm = p.grad.data.norm(2)
-                    total_norm += param_norm.item() ** 2
-            total_norm = total_norm ** 0.5
-            print(f"Batch {i}: grad_norm={total_norm:.4f}, loss={loss.item():.4f}")
-            if torch.isnan(loss) or torch.isinf(loss):
-                print("  WARNING: Loss is NaN/Inf!")
-            if total_norm > 100:
-                print(f"  WARNING: Large gradient norm!")
-        # END DEBUG
-
+        optimizer.zero_grad()
+        accelerator.backward(loss)
         accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         accelerator.wait_for_everyone()
@@ -1828,23 +1628,6 @@ def pretrain_with_hyperparameter(
     model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
     accelerator.wait_for_everyone()  # Ensure model is fully prepared before dataloaders - reduces peak memory usage
 
-
-    # TODO REMOVE DEBUG
-    # Register hook on all attention modules
-    for name, module in model.named_modules():
-        if isinstance(module, torch.nn.MultiheadAttention):
-            module.register_forward_pre_hook(check_attention_inputs(name))
-            module.register_forward_hook(check_attention_outputs(name))
-        # Hook on the TransformerEncoder or TransformerEncoderLayer
-        if 'transformer_encoder' in name and not 'layers' in name:
-            module.register_forward_pre_hook(check_encoder_input(name))
-            module.register_forward_hook(check_encoder_output(name))
-        # Hook on position encoding
-        if 'position_encoding' in name:
-            module.register_forward_hook(check_encoder_output(name + '_pos_enc'))
-    # END DEBUG
-
-
     # Prepare dataloaders - only use accelerator.prepare if not using balanced sampler
     if not hasattr(train_loader.sampler, 'set_epoch'):
         train_loader = accelerator.prepare_data_loader(train_loader)
@@ -1922,8 +1705,7 @@ def pretrain_with_hyperparameter(
             obs_unobs_sample_ratio=obs_unobs_sample_ratio,
             cmpnt_mask_ratio=cmpnt_mask_ratio,
             accelerator=accelerator,
-            desc=f"Epoch {epoch + 1} Training",
-            epoch=epoch + 1  # TODO REMOVE DEBUG        
+            desc=f"Epoch {epoch + 1} Training"     
         )
 
         # Validation phase
