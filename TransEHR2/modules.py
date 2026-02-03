@@ -13,23 +13,31 @@ from TransEHR2.utils import combine_value_and_text_data
 class GradientTraceableLLM(torch.nn.Module):
     """A wrapper for a language model that allows gradients to be traced through it."""
 
-    def __init__(self, model_name: str = LLM_NAME, max_length: int = MAX_TOKEN_LENGTH):
+    def __init__(
+        self, 
+        model_name: str = LLM_NAME,
+        max_length: int = MAX_TOKEN_LENGTH,
+        use_gradient_checkpointing: bool = True
+    ):
 
         super().__init__()
+        self.use_gradient_checkpointing = use_gradient_checkpointing
         # Initialize the model on CPU to avoid GPU memory issues during FSDP wrapping
         # Try to load from local files to avoid hitting rate limits on Hugging Face
+        # Explicitly use the 3.1-8B tokenizer because the 3.2-1B tokenizer is giving errors
+        tokenizer_name = 'meta-llama/Llama-3.1-8B'
         try:
             self.tokenizer = AutoTokenizer.from_pretrained(
-                model_name, 
+                tokenizer_name, 
                 token=HF_API_TOKEN, 
                 device_map='cpu',
-                local_files_only=True
+                local_files_only=True,
             )
         except OSError:
             self.tokenizer = AutoTokenizer.from_pretrained(
-                model_name,
+                tokenizer_name,
                 token=HF_API_TOKEN,
-                device_map='cpu'
+                device_map='cpu',
             )
         # Using add_special_tokens so that pad_token_id is set automatically
         self.tokenizer.add_special_tokens({'pad_token': TOKENIZER_PAD_TOKEN})
@@ -45,6 +53,9 @@ class GradientTraceableLLM(torch.nn.Module):
         # Freeze the LLM parameters to prevent them from being updated during training
         for param in self.model.parameters():
             param.requires_grad = False
+        
+        if self.use_gradient_checkpointing:
+            self.model.gradient_checkpointing_enable()
 
     def forward(
         self, 
@@ -172,7 +183,8 @@ class EventDataEncoder(torch.nn.Module):
             n_head: int, 
             d_k: int, 
             d_v: int,
-            dropout: float
+            dropout: float,
+            normalize_before: bool = False
     ):
         """Initialize an instance.
 
@@ -185,6 +197,9 @@ class EventDataEncoder(torch.nn.Module):
             d_k (int): The dimensionality of the key vectors.
             d_v (int): The dimensionality of the value vectors.
             dropout (float): The dropout rate applied throughout the encoder.
+            normalize_before (bool, optional): Whether to apply layer normalization before the attention and
+                feed-forward layers in each encoder layer. If False, layer normalization is applied after.
+                Defaults to False.
         """
 
         super().__init__()
@@ -196,6 +211,7 @@ class EventDataEncoder(torch.nn.Module):
         self.d_k = d_k
         self.d_v = d_v
         self.dropout = dropout
+        self.normalize_before = normalize_before
         
         # NOTE Xu et al. used a torch.nn.Embedding layer to project event types to the model dimension. That worked
         # because the original implementation of the forward pass expected one event ID per timestep (i.e. [batch_size, 
@@ -212,7 +228,7 @@ class EventDataEncoder(torch.nn.Module):
         self.position_encoding_layer = TemporalPositionEncoding(d_model=self.d_model, dropout=0.1)
         enc_args, enc_kwargs = (
             [self.d_model, self.d_inner, self.n_head, self.d_k, self.d_v],
-            {'dropout': self.dropout, 'normalize_before': False}
+            {'dropout': self.dropout, 'normalize_before': self.normalize_before}
         )
         self.layer_stack = torch.nn.ModuleList([EncoderLayer(*enc_args, **enc_kwargs) for _ in range(self.n_layers)])
 
@@ -298,8 +314,7 @@ class EventDataEncoder(torch.nn.Module):
         # Apply the indicator input projection layer to the indicators to get the initial embedding
         enc_output = self.indicator_input_projection_layer(indicators.float())
         for enc_layer in self.layer_stack:
-            position_encoding = self.position_encoding_layer(enc_output, timestamps, non_padding_mask)
-            enc_output += position_encoding
+            enc_output = self.position_encoding_layer(enc_output, timestamps, non_padding_mask)
             enc_output, _ = enc_layer(enc_output, non_padding_mask=non_padding_mask, self_attention_mask=self_attn_mask)
 
         return enc_output
@@ -334,6 +349,7 @@ class ValueDataEncoder(torch.nn.Module):
         dropout: float = 0.1,
         activation: str = 'gelu',
         norm: str = 'BatchNorm',
+        normalize_before: bool = False,
     ):
         r"""Initialize an instance.
 
@@ -350,7 +366,12 @@ class ValueDataEncoder(torch.nn.Module):
             pos_encoding (str, optional): The strategy to use for generating a positional encoding of a timestamp.
                 If 'learnable', use `LearnablePositionalEncoding`. If 'fixed', use `FixedPositionalEncoding`. Defaults to 'fixed'.
             activation (str, optional): The activation function applied throughout the network. Defaults to 'gelu'.
-                norm (str, optional): The type of normalization to use in the `TransformerEncoder`. If 'LayerNorm', `self.transformer_encoder` will be initialized with an instance of `TransformerEncoder` that uses `TransformerEncoderLayer'. Otherwise, `self.transformer_encoder` will be initialized with an instance of `TransformerEncoder` that uses `TransformerBatchNormEncoderLayer`.
+            norm (str, optional): The type of normalization to use in the `TransformerEncoder`. If 'LayerNorm', 
+                `self.transformer_encoder` will be initialized with an instance of `TransformerEncoder` that uses 
+                `TransformerEncoderLayer'. Otherwise, `self.transformer_encoder` will be initialized with an instance 
+                of `TransformerEncoder` that uses `TransformerBatchNormEncoderLayer`.
+            normalize_before (bool, optional): Whether to apply normalization before attention and feedforward 
+                operations (Pre-LN). If False, normalization is applied after (Post-LN). Defaults to False.
         """
 
         super().__init__()
@@ -361,6 +382,7 @@ class ValueDataEncoder(torch.nn.Module):
         self.n_encoder_blocks = n_encoder_blocks
         self.dim_feedforward = dim_feedforward
         self.norm = norm
+        self.normalize_before = normalize_before
         # NOTE Xu et al. only used the value_input_projection_layer in their code, but in the paper they described
         # using two separate projection layers for the indicator and value-associated data. We follow the paper.
         # The value input projection uses bias, but the indicator input projection does not.
@@ -382,7 +404,7 @@ class ValueDataEncoder(torch.nn.Module):
 
         enc_args, enc_kwargs = (
             [self.d_model, self.n_heads, self.dim_feedforward, dropout],
-            {'activation': activation, 'batch_first': True}
+            {'activation': activation, 'batch_first': True, 'norm_first': self.normalize_before}
         )
         if norm == 'LayerNorm':
             return torch.nn.TransformerEncoderLayer(*enc_args, **enc_kwargs)
@@ -874,31 +896,21 @@ class TransformerHawkesProcess(torch.nn.Module):
             Tensor: A `Tensor` of shape [batch size, seq_len - 1, n_event_types] or 
                 [batch size, seq_len - 1, n_samples, n_event_types] containing the pre-softplus intensity states for each event type at each time step.
         """
-        eps = torch.finfo(torch.float32).eps
         
         if time_diff.dim() == 2:  # Observed event times
+            time_diff_expanded = time_diff[..., None]  # (batch_size, seq_len - 1, 1)
             decay = self.intensity_decay[None, ...]  # (1, 1, n_event_types)
             base_intensity = self.intensity_base[None, ...]  # (1, 1, n_event_types)
-            
-            prev_times = prev_event_times[..., None]  # (batch_size, seq_len - 1, 1)
-            time_diff_expanded = time_diff[..., None]  # (batch_size, seq_len - 1, 1)
-
-            current = decay * (time_diff_expanded / (prev_times + eps))
+            current = decay * time_diff_expanded  # (batch_size, seq_len - 1, n_event_types)
             history = self.intensity_linear(encodings)
             
-            conditional_intensity_state = current + history + base_intensity
-            
         elif time_diff.dim() == 3:  # Sampled inter-event times for Monte Carlo integration
+            time_diff_expanded = time_diff[..., None]  # (batch_size, seq_len - 1, n_samples, 1)
             decay = self.intensity_decay[None, None, ...]  # (1, 1, 1, n_event_types)
             base_intensity = self.intensity_base[None, None, ...]  # (1, 1, 1, n_event_types)
-            
-            prev_times = prev_event_times[..., None, None]  # (batch_size, seq_len - 1, 1, 1)
-            time_diff_expanded = time_diff[..., None]  # (batch_size, seq_len - 1, n_samples, 1)
-            
-            current = decay * (time_diff_expanded / (prev_times + eps))
+            current = decay * time_diff_expanded  # (batch_size, seq_len - 1, n_samples, n_event_types)
             history = self.intensity_linear(encodings)[:, :, None, :]
             
-            conditional_intensity_state = current + history + base_intensity
 
         else:
 
@@ -907,6 +919,8 @@ class TransformerHawkesProcess(torch.nn.Module):
                 f"Expected shape (batch_size, seq_len) or (batch_size, seq_len, n_samples)."
             )
         
+        conditional_intensity_state = current + history + base_intensity
+
         return self.softplus(conditional_intensity_state)
 
     def forward(self, batch: EventAssociatedTensorData) -> Tuple[Tensor, Tuple[Tensor, Tensor]]:

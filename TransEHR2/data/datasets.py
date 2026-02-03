@@ -1,648 +1,177 @@
-import h5py
 import numpy as np
+import torch
 
-from typing import Any, Dict, List
+from torch.utils.data import Dataset
+from typing import Dict, List
 
 
-
-class MixedDataset(object):
+class MixedDataset(Dataset):
     """A dataset for input to a TransEHR2 model.
     
-    The dataset is a list of patient-episodes where data from each episode are contained 
-    in a nested dictionary with the following structure:
+    The dataset stores patient-episode data using memory-mapped numpy arrays for efficient
+    multi-worker DataLoader compatibility. Conversion to torch tensors happens only in 
+    __getitem__ for the requested episode.
 
-    * *id* (int): The patient-episode ID.
+    The dataset contains the following data structures:
 
-    * *val_data* (Dict): A dictionary containing value-associated data that will be used as 
-      input to the ELECTRA-style generator-discriminator networks.
-      
-      * *numeric* (Dict): Contains real-valued feature data.
-        * *indicators* (List[List[np.ndarray]]): A timesteps -> features nested list of scalar 
-          arrays indicating whether the feature was recorded at that timestep. Defaults to 
-          an array of zeros at masked timesteps.
-        * *values* (List[List[np.ndarray]]): A timesteps -> features nested list of arrays 
-          containing the actual values recorded at that timestep. The length of the arrays 
-          may vary, but should be consistent for each feature across timesteps and episodes.
-          Arrays default to zeros if the feature was not recorded at that timestep.
+    * *val_numeric_indicators* (np.ndarray): Array of shape (n_episodes, max_ts_len, n_numeric_features)
+      indicating whether each numeric feature was recorded at each timestep (1) or not (0).
 
-      * *categorical* (Dict): Contains categorical feature data.
-        * *indicators* (List[List[np.ndarray]]): see above.
-        * *values* (List[List[np.ndarray]]): Values should be scalar arrays of category indices, 
-          with zero reserved to indicate that the categorical feature was not recorded at a 
-          particular timestep.
+    * *val_numeric_values* (List[np.ndarray]): List of n_numeric_features arrays, each of shape 
+      (n_episodes, max_ts_len, feature_dim), containing the actual numeric values recorded.
+      Arrays default to zeros if the feature was not recorded at that timestep.
 
-      * *text* (Dict): Contains text feature data.
-        * *indicators* (List[List[np.ndarray]]): see above.
-        * *values* (List[List[np.ndarray]]): Values should be arrays of token IDs representing 
-          the original strings, with zeros reserved to indicate that the text feature was not 
-          recorded at a particular timestep.
-        * *masks* (List[List[np.ndarray]]): A timesteps -> features nested list of attention masks for length-padded 
-          token sequences.
+    * *val_categorical_indicators* (np.ndarray): Array of shape (n_episodes, max_ts_len, n_categorical_features)
+      indicating whether each categorical feature was recorded at each timestep.
 
-      * *times* (List[np.ndarray]): A list of scalar arrays containing the times at which the values were recorded. Padded with zeros up to the maximum timeseries length.
+    * *val_categorical_values* (List[np.ndarray]): List of n_categorical_features arrays, each of shape
+      (n_episodes, max_ts_len, n_classes), containing one-hot encoded categorical values.
 
-      * *masks* (List[np.ndarray]): A list of arrays indicating whether each timestep is part of the episode (1) or length padding (0).
+    * *val_text_indicators* (np.ndarray): Array of shape (n_episodes, max_ts_len, n_text_features)
+      indicating whether each text feature was recorded at each timestep.
 
-    * *event_data* (Dict): A dictionary containing event-associated data that will be used as 
-      input to the Hawkes process encoder network.
-      
-      * *indicators* (List[List[np.ndarray]]): See above.
-      * *times* (List[np.ndarray]): See above.
-      * *masks* (List[np.ndarray]): See above.
-    
-    * *static_data* (List[np.ndarray]): A list of arrays containing static data (i.e., data that does not change over time)
+    * *val_times* (np.ndarray): Array of shape (n_episodes, max_ts_len) containing the times 
+      at which values were recorded. Padded with zeros up to max_ts_len.
 
-    * *targets* (Dict[str, np.ndarray]): A dictionary of target arrays keyed by target names. For benchmarking with MIMIC, this should be 'mortality', 'length_of_stay', or 'phenotyping'.
+    * *val_masks* (np.ndarray): Array of shape (n_episodes, max_ts_len) indicating whether each 
+      timestep is part of the episode (1) or length padding (0).
+
+    * *val_text_offsets* (List[np.ndarray]): List of n_text_features arrays, each of shape 
+      (n_episodes + 1,), containing CSR-style offsets into the sparse text storage.
+
+    * *val_text_values* (List[np.ndarray]): List of n_text_features arrays containing sparse 
+      token ID sequences. Shape is (n_non_empty_entries, token_len) for each feature.
+
+    * *val_text_masks* (List[np.ndarray]): List of n_text_features arrays containing sparse 
+      attention masks for the token sequences, matching val_text_values shapes.
+
+    * *val_text_timesteps* (List[np.ndarray]): List of n_text_features arrays containing the 
+      timestep indices for each sparse text entry.
+
+    * *event_indicators* (np.ndarray): Array of shape (n_episodes, max_ts_len, n_event_types)
+      indicating whether each event type occurred at each timestep.
+
+    * *event_times* (np.ndarray): Array of shape (n_episodes, max_ts_len) containing event times.
+
+    * *event_masks* (np.ndarray): Array of shape (n_episodes, max_ts_len) indicating valid 
+      event timesteps vs padding.
+
+    * *static_data* (np.ndarray): Array of shape (n_episodes, n_static_features) containing 
+      time-invariant patient features.
+
+    * *mortality* (np.ndarray): Array of shape (n_episodes,) containing binary mortality labels.
+
+    * *length_of_stay* (np.ndarray): Array of shape (n_episodes,) containing length of stay values.
+
+    * *phenotype* (np.ndarray): Array of shape (n_episodes, n_phenotypes) containing multi-label 
+      phenotype indicators.
+
+    * *max_ts_len* (int): Maximum timeseries length across all episodes.
+
+    * *text_token_len* (List[int]): List of token sequence lengths for each text feature.
+
+    The __getitem__ method returns a dictionary with torch tensors, reconstructing dense text 
+    arrays on-the-fly from the sparse storage format.
     """
-
+    
     def __init__(
-            self,
-            id: List[int],
-            val_data: List[Dict[str, Dict[str, List]]],
-            event_data: List[Dict[str, List[List[np.ndarray]]]],
-            static_data: List[List[np.ndarray]],
-            targets: List[Dict[str, np.ndarray]]
-        ):
-
-        self.patient_episodes = []
-        for i in range(len(targets)):
-            patient_episode = {
-                'id': id[i],
-                'val_data': val_data[i],
-                'event_data': event_data[i],
-                'static_data': static_data[i],
-                'targets': targets[i]
-            }
-            self.patient_episodes.append(patient_episode)
-
-    def __getitem__(self, i):
-        return self.patient_episodes[i]
+        self,
+        # All inputs are numpy arrays (potentially memory-mapped)
+        val_numeric_indicators: np.ndarray,
+        val_numeric_values: List[np.ndarray],
+        val_categorical_indicators: np.ndarray,
+        val_categorical_values: List[np.ndarray],
+        val_text_indicators: np.ndarray,
+        val_times: np.ndarray,
+        val_masks: np.ndarray,
+        val_text_offsets: List[np.ndarray],
+        val_text_values: List[np.ndarray],
+        val_text_masks: List[np.ndarray],
+        val_text_timesteps: List[np.ndarray],
+        event_indicators: np.ndarray,
+        event_times: np.ndarray,
+        event_masks: np.ndarray,
+        static_data: np.ndarray,
+        mortality: np.ndarray,
+        length_of_stay: np.ndarray,
+        phenotype: np.ndarray,
+        max_ts_len: int,
+        text_token_len: List[int],
+    ):
+        self.n_episodes = val_times.shape[0]
+        self.max_ts_len = max_ts_len
+        self.n_text_feats = len(text_token_len)
+        self.text_token_len = text_token_len
         
-    def __len__(self):
-        return len(self.patient_episodes)
-
-
-class HDF5Dataset:
-    """
-    A dataset backed by HDF5 files with hybrid sparse storage.
-    
-    Numeric, categorical, and event features are stored without right-padding.
-    Text features are stored sparsely (only timesteps with actual text).
-    On read, data is reconstructed to the dense padded format expected by
-    the collation and model code.
-    
-    Supports two modes:
-    - preload=True: Load all data into RAM at init (recommended with sufficient RAM)
-    - preload=False: Load data lazily per __getitem__ call
-    """
-    
-    def __init__(self, h5_path: str, preload: bool = True):
-        """
-        Initialize the HDF5Dataset.
-        
-        Args:
-            h5_path: Path to HDF5 file created by extract_mimic_hdf5
-            preload: If True, load all data into RAM at initialization
-        """
-        
-        self.h5_path = h5_path
-        self.preload = preload
-        self._h5_file = None
-        self._cache = None
-        
-        # Read metadata
-        with h5py.File(h5_path, 'r') as f:
-            meta = f['metadata']
-            self.n_episodes = meta.attrs['n_episodes']
-            self.max_ts_len_val = meta.attrs['max_ts_len_val']
-            self.max_ts_len_event = meta.attrs['max_ts_len_event']
-            self.n_numeric_feats = meta.attrs['n_numeric_feats']
-            self.n_categorical_feats = meta.attrs['n_categorical_feats']
-            self.n_text_feats = meta.attrs['n_text_feats']
-            self.n_event_feats = meta.attrs['n_event_feats']
-            self.static_total_dim = meta.attrs['static_total_dim']
-            self.phenotype_dim = meta.attrs['phenotype_dim']
-            
-            self.numeric_feat_dims = list(meta['numeric_feat_dims'][:]) if 'numeric_feat_dims' in meta else []
-            self.categorical_feat_dims = list(meta['categorical_feat_dims'][:]) if 'categorical_feat_dims' in meta else []
-            self.text_feat_dims = list(meta['text_feat_dims'][:]) if 'text_feat_dims' in meta else []
-            self.static_feat_dims = list(meta['static_feat_dims'][:]) if 'static_feat_dims' in meta else []
-        
-        if preload:
-            self._preload_all_data()
-    
-    def _preload_all_data(self):
-        """Load all data from HDF5 into memory."""
-        
-        print(f"Preloading {self.h5_path} into RAM...")
-        
-        self._cache = {}
-        
-        with h5py.File(self.h5_path, 'r') as f:
-            # IDs
-            ids_data = f['ids'][:]
-            if len(ids_data) > 0 and isinstance(ids_data[0], bytes):
-                self._cache['ids'] = [id_.decode('utf-8') for id_ in ids_data]
-            else:
-                self._cache['ids'] = list(ids_data)
-            
-            # Val data
-            self._cache['val_episode_offsets'] = f['val_data/episode_offsets'][:]
-            self._cache['val_times'] = f['val_data/times'][:]
-            
-            if self.n_numeric_feats > 0:
-                self._cache['val_numeric_indicators'] = f['val_data/numeric/indicators'][:]
-                self._cache['val_numeric_values'] = []
-                for feat_idx in range(self.n_numeric_feats):
-                    self._cache['val_numeric_values'].append(f[f'val_data/numeric/values_{feat_idx}'][:])
-            
-            if self.n_categorical_feats > 0:
-                self._cache['val_categorical_indicators'] = f['val_data/categorical/indicators'][:]
-                self._cache['val_categorical_values'] = []
-                for feat_idx in range(self.n_categorical_feats):
-                    self._cache['val_categorical_values'].append(f[f'val_data/categorical/values_{feat_idx}'][:])
-            
-            if self.n_text_feats > 0:
-                self._cache['val_text_indicators'] = f['val_data/text/indicators'][:]
-                self._cache['val_text_feats'] = []
-                for feat_idx in range(self.n_text_feats):
-                    feat_data = {
-                        'episode_offsets': f[f'val_data/text/feat_{feat_idx}/episode_offsets'][:],
-                        'timestep_indices': f[f'val_data/text/feat_{feat_idx}/timestep_indices'][:],
-                        'values': f[f'val_data/text/feat_{feat_idx}/values'][:],
-                        'masks': f[f'val_data/text/feat_{feat_idx}/masks'][:]
-                    }
-                    self._cache['val_text_feats'].append(feat_data)
-            
-            # Event data
-            self._cache['event_episode_offsets'] = f['event_data/episode_offsets'][:]
-            self._cache['event_times'] = f['event_data/times'][:]
-            if self.n_event_feats > 0:
-                self._cache['event_indicators'] = f['event_data/indicators'][:]
-            
-            # Static data
-            self._cache['static_data'] = f['static_data'][:]
-            
-            # Targets
-            self._cache['mortality'] = f['targets/mortality'][:]
-            self._cache['length_of_stay'] = f['targets/length_of_stay'][:]
-            self._cache['phenotype'] = f['targets/phenotype'][:]
-        
-        print(f"Preload complete: {self.n_episodes} episodes loaded")
-    
-    @property
-    def h5_file(self):
-        """Lazy file handle for non-preloaded access."""
-
-        if self._h5_file is None:
-            self._h5_file = h5py.File(self.h5_path, 'r', swmr=True)
-        return self._h5_file
+        # Store numpy arrays directly
+        self.val_numeric_indicators = val_numeric_indicators
+        self.val_numeric_values = val_numeric_values
+        self.val_categorical_indicators = val_categorical_indicators
+        self.val_categorical_values = val_categorical_values
+        self.val_text_indicators = val_text_indicators
+        self.val_times = val_times
+        self.val_masks = val_masks
+        self.val_text_offsets = val_text_offsets
+        self.val_text_values = val_text_values
+        self.val_text_masks = val_text_masks
+        self.val_text_timesteps = val_text_timesteps
+        self.event_indicators = event_indicators
+        self.event_times = event_times
+        self.event_masks = event_masks
+        self.static_data = static_data
+        self.mortality = mortality
+        self.length_of_stay = length_of_stay
+        self.phenotype = phenotype
     
     def __len__(self) -> int:
         return self.n_episodes
     
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
+    def __getitem__(self, idx: int) -> Dict:
         """
-        Load and reconstruct a single episode to dense padded format.
-        
-        Returns dictionary matching MixedDataset.__getitem__ structure.
+        Return episode as torch tensors, reconstructing dense text on-the-fly.
         """
-        if self.preload:
-            return self._getitem_preloaded(idx)
-        else:
-            return self._getitem_lazy(idx)
-    
-    def _getitem_preloaded(self, idx: int) -> Dict[str, Any]:
-        """Get item from preloaded cache."""
-        cache = self._cache
+        # Reconstruct dense text
+        text_values_dense = []
+        text_masks_dense = []
         
-        episode_id = cache['ids'][idx]
+        for f in range(self.n_text_feats):
+            token_len = self.text_token_len[f]
+            dense_vals = np.zeros((self.max_ts_len, token_len), dtype=np.int64)
+            dense_masks = np.zeros((self.max_ts_len, token_len), dtype=np.float32)
+            
+            start = int(self.val_text_offsets[f][idx])
+            end = int(self.val_text_offsets[f][idx + 1])
+            
+            if end > start:
+                timesteps = self.val_text_timesteps[f][start:end]
+                values = self.val_text_values[f][start:end]
+                masks = self.val_text_masks[f][start:end]
+                
+                for i in range(end - start):
+                    ts = int(timesteps[i])
+                    dense_vals[ts] = values[i]
+                    dense_masks[ts] = masks[i]
+            
+            text_values_dense.append(torch.from_numpy(dense_vals))
+            text_masks_dense.append(torch.from_numpy(dense_masks))
         
-        # Get val_data slice boundaries
-        val_start = cache['val_episode_offsets'][idx]
-        val_end = cache['val_episode_offsets'][idx + 1]
-        val_len = val_end - val_start
-        
-        # Reconstruct val_data
-        val_data = self._reconstruct_val_data_preloaded(idx, val_start, val_end, val_len)
-        
-        # Get event_data slice boundaries
-        event_start = cache['event_episode_offsets'][idx]
-        event_end = cache['event_episode_offsets'][idx + 1]
-        event_len = event_end - event_start
-        
-        # Reconstruct event_data
-        event_data = self._reconstruct_event_data_preloaded(event_start, event_end, event_len)
-        
-        # Reconstruct static_data
-        static_data = self._reconstruct_static_data_preloaded(idx)
-        
-        # Targets
-        targets = {
-            'mortality': np.array(cache['mortality'][idx], dtype=np.float32),
-            'length_of_stay': np.array(cache['length_of_stay'][idx], dtype=np.float32),
-            'phenotype': cache['phenotype'][idx].astype(np.float32)
-        }
-        
+        # Return tensors (copy from mmap)
         return {
-            'id': episode_id,
-            'val_data': val_data,
-            'event_data': event_data,
-            'static_data': static_data,
-            'targets': targets
+            'val_numeric_indicators': torch.from_numpy(self.val_numeric_indicators[idx].copy()),
+            'val_numeric_values': [torch.from_numpy(v[idx].copy()) for v in self.val_numeric_values],
+            'val_categorical_indicators': torch.from_numpy(self.val_categorical_indicators[idx].copy()),
+            'val_categorical_values': [torch.from_numpy(v[idx].copy()) for v in self.val_categorical_values],
+            'val_text_indicators': torch.from_numpy(self.val_text_indicators[idx].copy()),
+            'val_text_values': text_values_dense,
+            'val_text_masks': text_masks_dense,
+            'val_times': torch.from_numpy(self.val_times[idx].copy()),
+            'val_masks': torch.from_numpy(self.val_masks[idx].copy()),
+            'event_indicators': torch.from_numpy(self.event_indicators[idx].copy()),
+            'event_times': torch.from_numpy(self.event_times[idx].copy()),
+            'event_masks': torch.from_numpy(self.event_masks[idx].copy()),
+            'static_data': torch.from_numpy(self.static_data[idx].copy()),
+            'mortality': torch.tensor(float(self.mortality[idx]), dtype=torch.float32),
+            'length_of_stay': torch.tensor(float(self.length_of_stay[idx]), dtype=torch.float32),
+            'phenotype': torch.from_numpy(self.phenotype[idx].copy()),
         }
     
-    def _reconstruct_val_data_preloaded(self, idx: int, val_start: int, val_end: int, val_len: int) -> Dict:
-        """Reconstruct dense padded val_data from sparse storage."""
-        cache = self._cache
-        max_ts = self.max_ts_len_val
-        
-        val_data = {
-            'numeric': {'indicators': [], 'values': []},
-            'categorical': {'indicators': [], 'values': []},
-            'text': {'indicators': [], 'values': [], 'masks': []},
-            'times': [],
-            'masks': []
-        }
-        
-        # Get times for real timesteps
-        real_times = cache['val_times'][val_start:val_end]
-        
-        # Reconstruct numeric
-        if self.n_numeric_feats > 0:
-            real_indicators = cache['val_numeric_indicators'][val_start:val_end]
-            real_values = [cache['val_numeric_values'][f][val_start:val_end] for f in range(self.n_numeric_feats)]
-            
-            for t in range(max_ts):
-                if t < val_len:
-                    feat_indicators = [np.array([real_indicators[t, f]], dtype=np.uint8) 
-                                       for f in range(self.n_numeric_feats)]
-                    feat_values = [real_values[f][t].astype(np.float32) 
-                                   for f in range(self.n_numeric_feats)]
-                else:
-                    feat_indicators = [np.array([0], dtype=np.uint8) for _ in range(self.n_numeric_feats)]
-                    feat_values = [np.zeros(self.numeric_feat_dims[f], dtype=np.float32) 
-                                   for f in range(self.n_numeric_feats)]
-                val_data['numeric']['indicators'].append(feat_indicators)
-                val_data['numeric']['values'].append(feat_values)
-        else:
-            for t in range(max_ts):
-                val_data['numeric']['indicators'].append([])
-                val_data['numeric']['values'].append([])
-        
-        # Reconstruct categorical
-        if self.n_categorical_feats > 0:
-            real_indicators = cache['val_categorical_indicators'][val_start:val_end]
-            real_values = [cache['val_categorical_values'][f][val_start:val_end] for f in range(self.n_categorical_feats)]
-            
-            for t in range(max_ts):
-                if t < val_len:
-                    feat_indicators = [np.array([real_indicators[t, f]], dtype=np.uint8) 
-                                       for f in range(self.n_categorical_feats)]
-                    feat_values = [real_values[f][t].astype(np.int32) 
-                                   for f in range(self.n_categorical_feats)]
-                else:
-                    feat_indicators = [np.array([0], dtype=np.uint8) for _ in range(self.n_categorical_feats)]
-                    feat_values = [np.zeros(self.categorical_feat_dims[f], dtype=np.int32) 
-                                   for f in range(self.n_categorical_feats)]
-                val_data['categorical']['indicators'].append(feat_indicators)
-                val_data['categorical']['values'].append(feat_values)
-        else:
-            for t in range(max_ts):
-                val_data['categorical']['indicators'].append([])
-                val_data['categorical']['values'].append([])
-        
-        # Reconstruct text (sparse within timesteps)
-        if self.n_text_feats > 0:
-            real_indicators = cache['val_text_indicators'][val_start:val_end]
-            
-            # Build per-feature maps of timestep -> text data
-            text_maps = []
-            for f in range(self.n_text_feats):
-                feat_data = cache['val_text_feats'][f]
-                text_start = feat_data['episode_offsets'][idx]
-                text_end = feat_data['episode_offsets'][idx + 1]
-                
-                timestep_indices = feat_data['timestep_indices'][text_start:text_end]
-                values = feat_data['values'][text_start:text_end]
-                masks = feat_data['masks'][text_start:text_end]
-                
-                # Map timestep index -> (values, masks)
-                ts_map = {}
-                for j, ts_idx in enumerate(timestep_indices):
-                    ts_map[ts_idx] = (values[j], masks[j])
-                text_maps.append(ts_map)
-            
-            for t in range(max_ts):
-                if t < val_len:
-                    feat_indicators = [np.array([real_indicators[t, f]], dtype=np.uint8) 
-                                       for f in range(self.n_text_feats)]
-                    feat_values = []
-                    feat_masks = []
-                    for f in range(self.n_text_feats):
-                        if t in text_maps[f]:
-                            feat_values.append(text_maps[f][t][0].astype(np.int32))
-                            feat_masks.append(text_maps[f][t][1].astype(np.uint8))
-                        else:
-                            feat_values.append(np.zeros(self.text_feat_dims[f], dtype=np.int32))
-                            feat_masks.append(np.zeros(self.text_feat_dims[f], dtype=np.uint8))
-                else:
-                    feat_indicators = [np.array([0], dtype=np.uint8) for _ in range(self.n_text_feats)]
-                    feat_values = [np.zeros(self.text_feat_dims[f], dtype=np.int32) 
-                                   for f in range(self.n_text_feats)]
-                    feat_masks = [np.zeros(self.text_feat_dims[f], dtype=np.uint8) 
-                                  for f in range(self.n_text_feats)]
-                val_data['text']['indicators'].append(feat_indicators)
-                val_data['text']['values'].append(feat_values)
-                val_data['text']['masks'].append(feat_masks)
-        else:
-            for t in range(max_ts):
-                val_data['text']['indicators'].append([])
-                val_data['text']['values'].append([])
-                val_data['text']['masks'].append([])
-        
-        # Reconstruct times and masks
-        for t in range(max_ts):
-            if t < val_len:
-                val_data['times'].append(np.array([real_times[t]], dtype=np.float32))
-                val_data['masks'].append(np.array([1], dtype=np.uint8))
-            else:
-                val_data['times'].append(np.array([0.0], dtype=np.float32))
-                val_data['masks'].append(np.array([0], dtype=np.uint8))
-        
-        return val_data
-    
-    def _reconstruct_event_data_preloaded(self, event_start: int, event_end: int, event_len: int) -> Dict:
-        """Reconstruct dense padded event_data from sparse storage."""
-        cache = self._cache
-        max_ts = self.max_ts_len_event
-        
-        event_data = {
-            'indicators': [],
-            'times': [],
-            'masks': []
-        }
-        
-        real_times = cache['event_times'][event_start:event_end]
-        
-        if self.n_event_feats > 0:
-            real_indicators = cache['event_indicators'][event_start:event_end]
-            
-            for t in range(max_ts):
-                if t < event_len:
-                    feat_indicators = [np.array([real_indicators[t, f]], dtype=np.uint8) 
-                                       for f in range(self.n_event_feats)]
-                else:
-                    feat_indicators = [np.array([0], dtype=np.uint8) for _ in range(self.n_event_feats)]
-                event_data['indicators'].append(feat_indicators)
-        else:
-            for t in range(max_ts):
-                event_data['indicators'].append([])
-        
-        for t in range(max_ts):
-            if t < event_len:
-                event_data['times'].append(np.array([real_times[t]], dtype=np.float32))
-                event_data['masks'].append(np.array([1], dtype=np.uint8))
-            else:
-                event_data['times'].append(np.array([0.0], dtype=np.float32))
-                event_data['masks'].append(np.array([0], dtype=np.uint8))
-        
-        return event_data
-    
-    def _reconstruct_static_data_preloaded(self, idx: int) -> List[np.ndarray]:
-        """Reconstruct static_data list from flat array."""
-        static_flat = self._cache['static_data'][idx]
-        
-        static_data = []
-        offset = 0
-        for feat_dim in self.static_feat_dims:
-            static_data.append(static_flat[offset:offset + feat_dim].astype(np.float32))
-            offset += feat_dim
-        
-        return static_data
-    
-    def _getitem_lazy(self, idx: int) -> Dict[str, Any]:
-        """Get item with lazy loading from HDF5 file."""
-        f = self.h5_file
-        
-        # Get episode ID
-        episode_id = f['ids'][idx]
-        if isinstance(episode_id, bytes):
-            episode_id = episode_id.decode('utf-8')
-        
-        # Get val_data slice boundaries
-        val_offsets = f['val_data/episode_offsets'][:]
-        val_start = val_offsets[idx]
-        val_end = val_offsets[idx + 1]
-        val_len = val_end - val_start
-        
-        # Reconstruct val_data
-        val_data = self._reconstruct_val_data_lazy(f, idx, val_start, val_end, val_len)
-        
-        # Get event_data slice boundaries
-        event_offsets = f['event_data/episode_offsets'][:]
-        event_start = event_offsets[idx]
-        event_end = event_offsets[idx + 1]
-        event_len = event_end - event_start
-        
-        # Reconstruct event_data
-        event_data = self._reconstruct_event_data_lazy(f, event_start, event_end, event_len)
-        
-        # Reconstruct static_data
-        static_data = self._reconstruct_static_data_lazy(f, idx)
-        
-        # Targets
-        targets = {
-            'mortality': np.array(f['targets/mortality'][idx], dtype=np.float32),
-            'length_of_stay': np.array(f['targets/length_of_stay'][idx], dtype=np.float32),
-            'phenotype': f['targets/phenotype'][idx].astype(np.float32)
-        }
-        
-        return {
-            'id': episode_id,
-            'val_data': val_data,
-            'event_data': event_data,
-            'static_data': static_data,
-            'targets': targets
-        }
-    
-    def _reconstruct_val_data_lazy(self, f, idx: int, val_start: int, val_end: int, val_len: int) -> Dict:
-        """Reconstruct dense padded val_data with lazy loading."""
-        max_ts = self.max_ts_len_val
-        
-        val_data = {
-            'numeric': {'indicators': [], 'values': []},
-            'categorical': {'indicators': [], 'values': []},
-            'text': {'indicators': [], 'values': [], 'masks': []},
-            'times': [],
-            'masks': []
-        }
-        
-        real_times = f['val_data/times'][val_start:val_end]
-        
-        # Numeric
-        if self.n_numeric_feats > 0:
-            real_indicators = f['val_data/numeric/indicators'][val_start:val_end]
-            real_values = [f[f'val_data/numeric/values_{feat}'][val_start:val_end] 
-                           for feat in range(self.n_numeric_feats)]
-            
-            for t in range(max_ts):
-                if t < val_len:
-                    feat_indicators = [np.array([real_indicators[t, feat]], dtype=np.uint8) 
-                                       for feat in range(self.n_numeric_feats)]
-                    feat_values = [real_values[feat][t].astype(np.float32) 
-                                   for feat in range(self.n_numeric_feats)]
-                else:
-                    feat_indicators = [np.array([0], dtype=np.uint8) for _ in range(self.n_numeric_feats)]
-                    feat_values = [np.zeros(self.numeric_feat_dims[feat], dtype=np.float32) 
-                                   for feat in range(self.n_numeric_feats)]
-                val_data['numeric']['indicators'].append(feat_indicators)
-                val_data['numeric']['values'].append(feat_values)
-        else:
-            for t in range(max_ts):
-                val_data['numeric']['indicators'].append([])
-                val_data['numeric']['values'].append([])
-        
-        # Categorical
-        if self.n_categorical_feats > 0:
-            real_indicators = f['val_data/categorical/indicators'][val_start:val_end]
-            real_values = [f[f'val_data/categorical/values_{feat}'][val_start:val_end] 
-                           for feat in range(self.n_categorical_feats)]
-            
-            for t in range(max_ts):
-                if t < val_len:
-                    feat_indicators = [np.array([real_indicators[t, feat]], dtype=np.uint8) 
-                                       for feat in range(self.n_categorical_feats)]
-                    feat_values = [real_values[feat][t].astype(np.int32) 
-                                   for feat in range(self.n_categorical_feats)]
-                else:
-                    feat_indicators = [np.array([0], dtype=np.uint8) for _ in range(self.n_categorical_feats)]
-                    feat_values = [np.zeros(self.categorical_feat_dims[feat], dtype=np.int32) 
-                                   for feat in range(self.n_categorical_feats)]
-                val_data['categorical']['indicators'].append(feat_indicators)
-                val_data['categorical']['values'].append(feat_values)
-        else:
-            for t in range(max_ts):
-                val_data['categorical']['indicators'].append([])
-                val_data['categorical']['values'].append([])
-        
-        # Text (sparse)
-        if self.n_text_feats > 0:
-            real_indicators = f['val_data/text/indicators'][val_start:val_end]
-            
-            text_maps = []
-            for feat in range(self.n_text_feats):
-                text_offsets = f[f'val_data/text/feat_{feat}/episode_offsets'][:]
-                text_start = text_offsets[idx]
-                text_end = text_offsets[idx + 1]
-                
-                timestep_indices = f[f'val_data/text/feat_{feat}/timestep_indices'][text_start:text_end]
-                values = f[f'val_data/text/feat_{feat}/values'][text_start:text_end]
-                masks = f[f'val_data/text/feat_{feat}/masks'][text_start:text_end]
-                
-                ts_map = {}
-                for j, ts_idx in enumerate(timestep_indices):
-                    ts_map[ts_idx] = (values[j], masks[j])
-                text_maps.append(ts_map)
-            
-            for t in range(max_ts):
-                if t < val_len:
-                    feat_indicators = [np.array([real_indicators[t, feat]], dtype=np.uint8) 
-                                       for feat in range(self.n_text_feats)]
-                    feat_values = []
-                    feat_masks = []
-                    for feat in range(self.n_text_feats):
-                        if t in text_maps[feat]:
-                            feat_values.append(text_maps[feat][t][0].astype(np.int32))
-                            feat_masks.append(text_maps[feat][t][1].astype(np.uint8))
-                        else:
-                            feat_values.append(np.zeros(self.text_feat_dims[feat], dtype=np.int32))
-                            feat_masks.append(np.zeros(self.text_feat_dims[feat], dtype=np.uint8))
-                else:
-                    feat_indicators = [np.array([0], dtype=np.uint8) for _ in range(self.n_text_feats)]
-                    feat_values = [np.zeros(self.text_feat_dims[feat], dtype=np.int32) 
-                                   for feat in range(self.n_text_feats)]
-                    feat_masks = [np.zeros(self.text_feat_dims[feat], dtype=np.uint8) 
-                                  for feat in range(self.n_text_feats)]
-                val_data['text']['indicators'].append(feat_indicators)
-                val_data['text']['values'].append(feat_values)
-                val_data['text']['masks'].append(feat_masks)
-        else:
-            for t in range(max_ts):
-                val_data['text']['indicators'].append([])
-                val_data['text']['values'].append([])
-                val_data['text']['masks'].append([])
-        
-        # Times and masks
-        for t in range(max_ts):
-            if t < val_len:
-                val_data['times'].append(np.array([real_times[t]], dtype=np.float32))
-                val_data['masks'].append(np.array([1], dtype=np.uint8))
-            else:
-                val_data['times'].append(np.array([0.0], dtype=np.float32))
-                val_data['masks'].append(np.array([0], dtype=np.uint8))
-        
-        return val_data
-    
-    def _reconstruct_event_data_lazy(self, f, event_start: int, event_end: int, event_len: int) -> Dict:
-        """Reconstruct dense padded event_data with lazy loading."""
-        max_ts = self.max_ts_len_event
-        
-        event_data = {
-            'indicators': [],
-            'times': [],
-            'masks': []
-        }
-        
-        real_times = f['event_data/times'][event_start:event_end]
-        
-        if self.n_event_feats > 0:
-            real_indicators = f['event_data/indicators'][event_start:event_end]
-            
-            for t in range(max_ts):
-                if t < event_len:
-                    feat_indicators = [np.array([real_indicators[t, feat]], dtype=np.uint8) 
-                                       for feat in range(self.n_event_feats)]
-                else:
-                    feat_indicators = [np.array([0], dtype=np.uint8) for _ in range(self.n_event_feats)]
-                event_data['indicators'].append(feat_indicators)
-        else:
-            for t in range(max_ts):
-                event_data['indicators'].append([])
-        
-        for t in range(max_ts):
-            if t < event_len:
-                event_data['times'].append(np.array([real_times[t]], dtype=np.float32))
-                event_data['masks'].append(np.array([1], dtype=np.uint8))
-            else:
-                event_data['times'].append(np.array([0.0], dtype=np.float32))
-                event_data['masks'].append(np.array([0], dtype=np.uint8))
-        
-        return event_data
-    
-    def _reconstruct_static_data_lazy(self, f, idx: int) -> List[np.ndarray]:
-        """Reconstruct static_data list with lazy loading."""
-        static_flat = f['static_data'][idx]
-        
-        static_data = []
-        offset = 0
-        for feat_dim in self.static_feat_dims:
-            static_data.append(static_flat[offset:offset + feat_dim].astype(np.float32))
-            offset += feat_dim
-        
-        return static_data
-    
-    def __del__(self):
-        """Clean up file handle."""
-        if self._h5_file is not None:
-            try:
-                self._h5_file.close()
-            except:
-                pass
-    
-    def close(self):
-        """Explicitly close file handle and free cache."""
-        if self._h5_file is not None:
-            self._h5_file.close()
-            self._h5_file = None
-        self._cache = None

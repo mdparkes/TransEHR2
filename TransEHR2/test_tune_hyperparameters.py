@@ -226,7 +226,6 @@ if __name__ == "__main__":
     GENERATOR_ENCODER_DROPOUT = experiment_config['GENERATOR_ENCODER_DROPOUT']
     GENERATOR_ENCODER_ACTIVATION = experiment_config['GENERATOR_ENCODER_ACTIVATION']
     GENERATOR_ENCODER_NORM = experiment_config['GENERATOR_ENCODER_NORM']
-    GENERATOR_ENCODER_NORM_FIRST = experiment_config.get('GENERATOR_ENCODER_NORM_FIRST', False)
     DISCRIMINATOR_ENCODER_D_MODEL = experiment_config['DISCRIMINATOR_ENCODER_D_MODEL']
     DISCRIMINATOR_ENCODER_N_HEADS = experiment_config['DISCRIMINATOR_ENCODER_N_HEADS']
     DISCRIMINATOR_ENCODER_N_ENCODER_BLOCKS = experiment_config['DISCRIMINATOR_ENCODER_N_ENCODER_BLOCKS']
@@ -234,7 +233,6 @@ if __name__ == "__main__":
     DISCRIMINATOR_ENCODER_DROPOUT = experiment_config['DISCRIMINATOR_ENCODER_DROPOUT']
     DISCRIMINATOR_ENCODER_ACTIVATION = experiment_config['DISCRIMINATOR_ENCODER_ACTIVATION']
     DISCRIMINATOR_ENCODER_NORM = experiment_config['DISCRIMINATOR_ENCODER_NORM']
-    DISCRIMINATOR_ENCODER_NORM_FIRST = experiment_config.get('DISCRIMINATOR_ENCODER_NORM_FIRST', False)
     THP_ENCODER_D_MODEL = experiment_config['THP_ENCODER_D_MODEL']
     THP_ENCODER_D_INNER = experiment_config['THP_ENCODER_D_INNER']
     THP_ENCODER_N_LAYERS = experiment_config['THP_ENCODER_N_LAYERS']
@@ -242,7 +240,6 @@ if __name__ == "__main__":
     THP_ENCODER_D_K = experiment_config['THP_ENCODER_D_K']
     THP_ENCODER_D_V = experiment_config['THP_ENCODER_D_V']
     THP_ENCODER_DROPOUT = experiment_config['THP_ENCODER_DROPOUT']
-    THP_ENCODER_NORM_FIRST = experiment_config.get('THP_ENCODER_NORM_FIRST', False)
     GENERATOR_D_MODEL = experiment_config['GENERATOR_D_MODEL']
     GENERATOR_DIM_FEEDFORWARD = experiment_config['GENERATOR_DIM_FEEDFORWARD']
     DISCRIMINATOR_DIM_FEEDFORWARD = experiment_config['DISCRIMINATOR_DIM_FEEDFORWARD']
@@ -306,28 +303,15 @@ if __name__ == "__main__":
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(evaluation_dir, exist_ok=True)
 
-    # Get distributed info for dataloader creation
-    # We need world_size and rank before creating dataloaders for text-balanced sampling
-    _temp_accelerator = initialize_accelerator(USE_TEXT)
-    _world_size = _temp_accelerator.num_processes
-    _rank = _temp_accelerator.process_index
-    _temp_accelerator.free_memory()
-    del _temp_accelerator
-    gc.collect()
-    torch.cuda.empty_cache()
 
-    # Create dataloaders using the optimized tensorized format with text-balanced sampling
+    # Create dataloaders using the optimized tensorized format
     dataloader_list = prepare_dataloaders(
         fold_dir, 
         BATCH_SIZE, 
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
-        prefetch_factor=2 if num_workers > 0 else 1,
-        balance_text=USE_TEXT,
-        world_size=_world_size,
-        rank=_rank
+        prefetch_factor=2 if num_workers > 0 else None
     )
-    
     # For HP tuning, we use train and test loaders only (test is used for model selection)
     if len(dataloader_list) == 3:
         train_loader, _, test_loader = dataloader_list
@@ -396,8 +380,7 @@ if __name__ == "__main__":
                     dim_feedforward=GENERATOR_ENCODER_DIM_FEEDFORWARD,
                     dropout=GENERATOR_ENCODER_DROPOUT,
                     activation=GENERATOR_ENCODER_ACTIVATION,
-                    norm=GENERATOR_ENCODER_NORM,
-                    normalize_before=GENERATOR_ENCODER_NORM_FIRST
+                    norm=GENERATOR_ENCODER_NORM
                 )
                 discriminator_encoder = ValueDataEncoder(
                     n_features=n_val_feats, feat_dim=tot_val_feat_dim,
@@ -406,15 +389,13 @@ if __name__ == "__main__":
                     dim_feedforward=DISCRIMINATOR_ENCODER_DIM_FEEDFORWARD,
                     dropout=DISCRIMINATOR_ENCODER_DROPOUT,
                     activation=DISCRIMINATOR_ENCODER_ACTIVATION,
-                    norm=DISCRIMINATOR_ENCODER_NORM,
-                    normalize_before=DISCRIMINATOR_ENCODER_NORM_FIRST
+                    norm=DISCRIMINATOR_ENCODER_NORM
                 )
                 thp_encoder = EventDataEncoder(
                     num_types=n_event_types, d_model=THP_ENCODER_D_MODEL,
                     d_inner=THP_ENCODER_D_INNER, n_layers=THP_ENCODER_N_LAYERS,
                     n_head=THP_ENCODER_N_HEADS, d_k=THP_ENCODER_D_K,
-                    d_v=THP_ENCODER_D_V, dropout=THP_ENCODER_DROPOUT,
-                    normalize_before=THP_ENCODER_NORM_FIRST
+                    d_v=THP_ENCODER_D_V, dropout=THP_ENCODER_DROPOUT
                 )
                 generator = MaskedTokenGenerator(
                     encoder=generator_encoder, d_model=GENERATOR_D_MODEL,

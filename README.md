@@ -19,13 +19,16 @@ git clone https://github.com/mdparkes/TransEHR2.git && cd TransEHR2
 python -m venv venv/TransEHR2
 ```
 
-Install the required libraries.
+Install the required libraries. Note for high performance compute cluster users: you may have to build `transformer-engine` before installing other libraries from `requirements.txt` to use fp8 precision.
+
+Otherwise, if you don't need fp8 precision, just do
 
 ```shell
 source venv/TransEHR2/bin/activate
 pip install -r requirements.txt
 deactivate
 ```
+
 
 If you intend to use text features, you will require authorization to use Meta's Llama model. TransEHR2 uses HuggingFace to obtain the Llama module, and the exact version is specified in `TransEHR2/constants.py`. You must have an authorization token to use the model. TransEHR2 assumes that the authorization token is stored in a .env file at the root of the local repository. You will have to create this file with your own token.
 

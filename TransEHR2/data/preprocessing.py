@@ -1,4 +1,4 @@
-import h5py
+import gc
 import multiprocessing as mp
 import numpy as np
 import os
@@ -11,31 +11,30 @@ import yaml
 
 from collections import namedtuple
 from functools import partial
-from sklearn.model_selection import train_test_split
-from torch.utils.data import DataLoader, default_collate
+from torch.utils.data import DataLoader, Sampler
 from tqdm import tqdm
 from transformers import AutoTokenizer
-from typing import Any, Dict, List, Optional, Tuple, Union
-from warnings import warn
+from typing import Dict, Iterator, List, Optional, Tuple, Union
 
 from TransEHR2.constants import HF_API_TOKEN, LLM_NAME, MAX_TOKEN_LENGTH, TOKENIZER_PAD_TOKEN
-from TransEHR2.data.custom_types import EventAssociatedDataEntry, StaticDataEntry, ValueAssociatedDataEntry
-from TransEHR2.data.custom_types import MixedTensorDataset
+from TransEHR2.data.custom_types import EpisodeData, MixedTensorDataset, TensorDimensions
 from TransEHR2.data.datareaders import MIMICDataReader
-from TransEHR2.data.datasets import MixedDataset, HDF5Dataset
+from TransEHR2.data.datasets import MixedDataset
 
 
-_worker_processor = None  # Global variable to hold DataProcessor instance in each worker in parallel processing
+# Global variables for multi-process data extraction
+_tensorized_processor = None
+_tensorized_dims = None
 
 
-class LlamaTextProcessor:
+class LLMTextProcessor:
 
     def __init__(self, model_name: str = LLM_NAME, max_length: int = MAX_TOKEN_LENGTH):
         """
-        Initialize the LLAMA text processor.
+        Initialize the LLM text processor.
         
         Args:
-            model_name (str): The LLAMA model name to use for tokenization
+            model_name (str): The LLM model name to use for tokenization
             max_length (int): Maximum sequence length for tokenized text
         """
 
@@ -84,639 +83,824 @@ class LlamaTextProcessor:
 
 class DataProcessor:
     """
-    A callable base class for preprocessing electronic health record data read from disk.
+    Processes patient episodes directly into numpy arrays for tensor insertion.
     
-    This class prepares data so that it can be served by DataLoaders later on. It handles 
-    different data types and feature types according to a variable properties map.
+    This processor outputs flat numpy arrays that can be directly inserted into pre-allocated
+    tensors. This eliminates the intermediate representation and reduces memory overhead.
+    
+    The processor handles:
+    - Numeric features: float32 arrays
+    - Categorical features: int64 arrays (0 = missing, 1+ = category index)
+    - Text features: int64 token arrays + float32 attention masks
+    - Event indicators: float32 arrays
+    - Static features: concatenated float32 array
     """
     
     def __init__(
         self,
-        max_timeseries_length: int,
-        var_properties_path: Optional[str] = None,
-        tokenizer: Optional[LlamaTextProcessor] = None
+        var_properties_path: str,
+        valued_feats: List[str],
+        event_feats: List[str],
+        text_feats: Optional[List[str]],
+        static_feats: List[str],
+        dims: TensorDimensions,
+        tokenizer: Optional[LLMTextProcessor] = None
     ):
         """
-        Initialize the DataProcessor.
+        Initialize the tensorized data processor.
         
         Args:
-            max_timeseries_length (int): Maximum length of the timeseries data. This is used for padding.
-            var_properties_path (str, optional): Path to the variable properties YAML file. If None, will look in default locations.
-            tokenizer (LlamaTextProcessor, optional): Optional tokenizer for text features. Must be provided if text features are present.
+            var_properties_path: Path to variable_properties.yaml
+            valued_feats: List of value-associated feature names
+            event_feats: List of event-associated feature names
+            text_feats: List of text feature names (may be None)
+            static_feats: List of static feature names
+            dims: Pre-computed tensor dimensions
+            tokenizer: Text tokenizer (required if text_feats is not empty)
         """
-
-        self.max_timeseries_length = max_timeseries_length
-
-        # Load variable properties map
-        if var_properties_path is None:
-            # Try to find the properties file in standard locations
-            root = os.path.dirname(os.path.abspath(__file__))
-            potential_paths = (
-                os.path.join(root, 'variable_properties.yaml'),
-                os.path.join(root, '..', 'data', 'variable_properties.yaml'),
-                os.path.join(root, '..', '..', 'data', 'variable_properties.yaml')
-            )
-            
-            var_properties_path = next(
-                (path for path in potential_paths if os.path.exists(path)), None
-            )
-            
-            if var_properties_path is None:
-                raise FileNotFoundError(
-                    "Could not find variable_properties.yaml in standard locations. Please provide an explicit path."
-                )
-        
         with open(var_properties_path, 'r') as f:
             self.var_properties = yaml.safe_load(f)
-
+        
+        # Separate valued_feats by type
+        self.numeric_feats = []
+        self.categorical_feats = []
+        for feat in valued_feats:
+            feat_type = self.var_properties[feat]['type']
+            if feat_type == 'numeric':
+                self.numeric_feats.append(feat)
+            elif feat_type == 'categorical':
+                self.categorical_feats.append(feat)
+        
+        self.text_feats = text_feats or []
+        self.event_feats = event_feats
+        self.static_feats = static_feats
+        self.dims = dims
         self.tokenizer = tokenizer
-
-    def __call__(
+        
+        if self.text_feats and tokenizer is None:
+            raise ValueError("Tokenizer required when text_feats is not empty")
+    
+    def process_valued_data(
         self,
-        data_type: str,
-        data: pd.DataFrame,
-        candidate_feats: List[str]
-    ) -> Union[EventAssociatedDataEntry, ValueAssociatedDataEntry, StaticDataEntry]:
+        data: pd.DataFrame
+    ) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], np.ndarray, List[np.ndarray],
+               np.ndarray, List[np.ndarray], List[np.ndarray]]:
         """
-        Extract timeseries data according to data_type and feature types.
+        Process value-associated data into flat numpy arrays.
         
         Args:
-            data_type (str): One of 'value', 'event', or 'static'.
-            data (pd.DataFrame): DataFrame containing timeseries data
-            candidate_feats (list): List of feature names to extract
+            data: DataFrame with TimedeltaIndex containing valued features
             
         Returns:
-            Union[EventAssociatedDataEntry, ValueAssociatedDataEntry, StaticDataEntry]: Processed data that can be used as an entry in a MixedDataset.
+            Tuple of:
+            - times: (n_timesteps,) float32
+            - numeric_indicators: (n_timesteps, n_numeric_feats) float32
+            - numeric_values: List of (n_timesteps, feat_dim) float32 arrays
+            - categorical_indicators: (n_timesteps, n_categorical_feats) float32
+            - categorical_values: List of (n_timesteps, feat_dim) int64 arrays
+            - text_indicators: (n_timesteps, n_text_feats) float32
+            - text_values: List of (n_timesteps, token_len) int64 arrays
+            - text_masks: List of (n_timesteps, token_len) float32 arrays
         """
-
-        if data_type == 'static':
-            # Prepare a StaticDataEntry for a MixedDataset
-            return self.extract_static_data(data, candidate_feats)
-
-        # If data_type is 'value' or 'event', ensure the DataFrame has a TimedeltaIndex
-        if not isinstance(data.index, pd.TimedeltaIndex):
-            raise ValueError('Value and event data must have a pd.TimedeltaIndex')
-        
-        if data_type == 'value':
-            # Prepare a ValueAssociatedDataEntry for a MixedDataset
-            return self.extract_value_timeseries(data, candidate_feats)
-        elif data_type == 'event':
-            # Prepare an EventAssociatedDataEntry for a MixedDataset
-            return self.extract_event_timeseries(data, candidate_feats)
+        if data.empty:
+            n_ts = 0
         else:
-            # Raise an error for unsupported data types
-            raise ValueError(f"Unsupported data_type: {data_type}. Use 'value', 'event', or 'static'.")
+            n_ts = len(data)
         
-    def _get_feature_type(self, feature_name: str) -> str:
-        """
-        Get the type of a feature from the variable properties map.
+        # Pre-allocate output arrays
+        times = np.zeros(n_ts, dtype=np.float32)
         
-        Args:
-            feature_name (str): Name of the feature
+        # Numeric
+        n_num = self.dims.n_numeric_feats
+        numeric_indicators = np.zeros((n_ts, n_num), dtype=np.float32)
+        numeric_values = [
+            np.zeros((n_ts, dim), dtype=np.float32)
+            for dim in self.dims.numeric_feat_dims
+        ]
+        
+        # Categorical
+        n_cat = self.dims.n_categorical_feats
+        categorical_indicators = np.zeros((n_ts, n_cat), dtype=np.float32)
+        categorical_values = [
+            np.zeros((n_ts, dim), dtype=np.int64)
+            for dim in self.dims.categorical_feat_dims
+        ]
+        
+        # Text
+        n_txt = self.dims.n_text_feats
+        text_indicators = np.zeros((n_ts, n_txt), dtype=np.float32)
+        text_values = [
+            np.zeros((n_ts, dim), dtype=np.int64)
+            for dim in self.dims.text_feat_dims
+        ]
+        text_masks = [
+            np.zeros((n_ts, dim), dtype=np.float32)
+            for dim in self.dims.text_feat_dims
+        ]
+        
+        if data.empty:
+            return (times, numeric_indicators, numeric_values,
+                    categorical_indicators, categorical_values,
+                    text_indicators, text_values, text_masks)
+        
+        # Convert column names for namedtuple compatibility
+        data = data.copy()
+        data.columns = [col.replace(' ', '_').replace('-', '_') for col in data.columns]
+        
+        # Process each timestep
+        for t, record in enumerate(data.itertuples(index=True, name='Record')):
+            # Timestamp in hours
+            times[t] = record.Index / np.timedelta64(1, 'h')
             
-        Returns:
-            str: Feature type ('numeric', 'categorical', or 'text')
-        """
-        if feature_name not in self.var_properties:
-            raise KeyError(f"Feature '{feature_name}' not found in variable properties.")
-        
-        return self.var_properties[feature_name]['type']
-    
-    def _get_feature_size(self, feature_name: str) -> int:
-        """
-        Get the size of a feature from the variable properties map.
-        
-        Args:
-            feature_name (str): Name of the feature
-            
-        Returns:
-            int: Feature size (number of components)
-        """
-        if feature_name not in self.var_properties:
-            raise KeyError(f"Feature '{feature_name}' not found in variable properties.")
-        
-        return self.var_properties[feature_name]['size']
-    
-    def _get_feature_column_names(self, base_name: str, data: Union[pd.DataFrame, namedtuple]) -> List[str]:
-        """Get feature names from a DataFrame based on the provided base feature name.
-        
-        This method finds columns in the DataFrame that start with the base feature name. It is assumed that vector-valued features have one column per vector dimension, and the column names of vector-valued features are the base feature name followed by an underscore and the dimension index (e.g., 'feature_0', 'feature_1', etc.). Scalar features' column names are simply the base feature name without any suffix.
-
-        Args:
-            base_name (str): The base feature names to search for in the DataFrame.
-            data (Union[pd.DataFrame, namedtuple]): The DataFrame or namedtuple to search for feature columns.
-        
-        Returns:
-            List[str]: A list of column names that correspond to the feature.
-        """
-        feature_columns = []
-        
-        if isinstance(data, pd.DataFrame):
-            # Handle DataFrame case
-            matching_columns = [col for col in data.columns if re.search(f'^{re.escape(base_name)}(_\d+)?$', col)]
-            if matching_columns:
-                feature_columns.extend(matching_columns)
-        else:
-            # Handle namedtuple case
-            fields = data._fields if hasattr(data, '_fields') else []
-            matching_columns = [f for f in fields if re.search(f'^{re.escape(base_name)}(_\d+)?$', f)]
-            if matching_columns:
-                feature_columns.extend(matching_columns)
+            # Numeric features
+            for f, feat in enumerate(self.numeric_feats):
+                feat_name = feat.replace(' ', '_').replace('-', '_')
+                feat_dim = self.dims.numeric_feat_dims[f]
+                cols = self._get_feature_columns(feat_name, record)
                 
-        return feature_columns
-    
-    def _get_category_map(self, feature_name: str) -> Dict[int, str]:
-        """
-        Get the category map for a categorical feature.
-        
-        Args:
-            feature_name (str): Name of the categorical feature
-            
-        Returns:
-            dict: Dictionary mapping integer codes to category labels
-        """
-        if feature_name not in self.var_properties:
-            raise KeyError(f"Feature '{feature_name}' not found in variable properties.")
-        
-        if self.var_properties[feature_name]['type'] != 'categorical':
-            warn(f"Feature '{feature_name}' is not categorical. No category map available.")
-            return {}
-        
-        return self.var_properties[feature_name]['category_map']
-
-    def _set_category_map(self, feature_name: str, category_map: Dict[int, str]) -> None:
-        """
-        Update the category map for a categorical feature in the variable properties dictionary.
-        
-        Args:
-            feature_name (str): Name of the categorical feature
-            category_map (Dict[int, str]): New dictionary mapping integer codes to category labels
-            
-        Raises:
-            KeyError: If feature_name does not exist in the variable properties
-            ValueError: If the feature is not of categorical type
-        """
-        if feature_name not in self.var_properties:
-            raise KeyError(f"Feature '{feature_name}' not found in variable properties.")
-        
-        if self.var_properties[feature_name]['type'] != 'categorical':
-            raise ValueError(f"Cannot set category map for feature '{feature_name}' because it is not categorical.")
-        
-        # Update the category map
-        self.var_properties[feature_name]['category_map'] = category_map
-    
-    def _extract_numeric(
-        self,
-        data: namedtuple,
-        candidate_feats: List[str]
-    ) -> Tuple[List[List[np.ndarray]], List[List[np.ndarray]]]:
-        
-        feat_indicator_list = []  # A list of all features' indicators for this timestep
-        feat_value_list = []  # A list of all features' values for this timestep
-        for ft in candidate_feats:
-            ft_size = self._get_feature_size(ft)
-            # Convert the candidate feature to valid Python identifiers that match the new column names
-            ft = ft.replace(' ', '_').replace('-', '_')
-            cols = sorted(self._get_feature_column_names(ft, data))
-            # If the feature is present, extract its values. Otherwise, store a zero-valued array.
-            if cols:
-                if ft_size != len(cols):
-                    raise ValueError(
-                        f"The number of columns for '{ft}' does not match its expected dimension ({ft_size})"
-                    )
-                value = [getattr(data, col) for col in cols]
-                # If the feature value is missing in all dims the indicator bit is set to zero
-                if all([pd.isna(v) for v in value]):
-                    indicator = np.array([0], dtype=np.ubyte)
-                # If at least one feature dimension has a value recorded, the indicator bit is set to one
-                else:
-                    indicator = np.array([1], dtype=np.ubyte)
-                # Replace missing values with zero and convert to an array
-                value = np.array([v if pd.notna(v) else 0 for v in value], dtype=np.float32)
-            else:
-                # Feature is not present in the dataframe
-                indicator = np.array([0], dtype=np.ubyte)
-                value = np.zeros([ft_size], dtype=np.float32)
-            feat_indicator_list.append(indicator)
-            feat_value_list.append(value)
-
-        return feat_indicator_list, feat_value_list
-
-    def _extract_categorical(
-            self,
-            data: namedtuple,
-            candidate_feats: List[str]
-    ) -> Tuple[List[List[np.ndarray]], List[List[np.ndarray]]]:
-        """
-        Extract categorical features from the data.
-        
-        Args:
-            data: Named tuple containing the timeseries data for a single timestep.
-            candidate_feats: List of names of candidate features to extract.
-        
-        Returns:
-            Tuple of lists containing indicators and values for each categorical feature.
-        """
-        feat_indicator_list = []  # A list of all features' indicators for this timestep
-        feat_value_list = []  # A list of all features' values for this timestep
-        for ft in candidate_feats:
-            # Look up the category value map. If the data are already integer indices, work with them as they 
-            # are. Otherwise, convert the labels to the corresponding integer indices. The indices need to 
-            # start from 1 because zero exclusively represents unrecorded categorical features. If the category
-            # map does not start at 1, adjust the category map and, if necessary, the data values.
-            category_map = self._get_category_map(ft)
-            # Verify whether the map indexes labels from 1 and calculate an adjustment factor
-            first_cat_idx = min([int(k) for k in category_map.keys()])
-            adjustment = 1 - first_cat_idx  # Zero if no adjustment needed
-            if first_cat_idx != 1:
-                # Adjust category_map keys to start from 1 and update self.var_properties
-                category_map = dict((int(k) + adjustment, v) for k, v in category_map.items())
-                self._set_category_map(ft, category_map)
-            # Convert the candidate feature to valid Python identifiers that match the new column names
-            ft = ft.replace(' ', '_').replace('-', '_')
-            # Check if this feature exists in the data
-            if ft in data._fields:
-                # Get the value for this feature at this timestep
-                value = getattr(data, ft)
-                if pd.isna(value):
-                    # Missing value
-                    indicator = np.array([0], dtype=np.ubyte)
-                    value = np.array([0], dtype=np.int32)
-                else:  # Feature value is recorded
-                    if isinstance(value, str):
-                        if value not in category_map.values():
-                            raise ValueError(
-                                f"Category label '{value}' not found in category_map for feature {ft}. "
-                                f"Ensure that all category labels are represented in category_map for this "
-                                f"feature in variable_properties.yaml."
-                            )
-                        idx_map = {lab: idx for idx, lab in category_map.items()}
-                        value = idx_map[value]  # Convert label to index
-                    else:  # Assume value is already an integer index
-                        value += adjustment  # `adjustment` = 0 if no adjustment needed
-                    indicator = np.array([1], dtype=np.ubyte)
-                    value = np.array([value], dtype=np.int32)  # Convert to numpy array
-            else:  # Feature not in the DataFrame
-                indicator = np.array([0], dtype=np.ubyte)
-                value = np.array([0], dtype=np.int32)  # Default value for absent feature
-            feat_indicator_list.append(indicator)
-            feat_value_list.append(value)
-        
-        return feat_indicator_list, feat_value_list
-
-    def _extract_text(
-        self,
-        data: namedtuple,
-        candidate_feats: List[str]
-    ) -> Tuple[List[List[np.ndarray]], List[List[np.ndarray]]]:
-        """
-        Extract text features from a single timestep in the timeseries data.
-        
-        Args:
-            data: Named tuple containing the timeseries data
-            candidate_feats: List of candidate feature names to extract.
-        
-        Returns:
-            Tuple of lists containing indicators and values for each text feature.
-        """
-        if self.tokenizer is None:
-            raise ValueError(
-                "Text features are present but no tokenizer is set. Provide a tokenizer in the constructor."
-            )
-        feat_indicator_list = []
-        feat_value_list = []
-        feat_mask_list = []  # Will hold attention masks for token sequences of each text feature
-        for ft in candidate_feats:
-            # Convert the candidate feature to valid Python identifiers that match the new column names
-            ft = ft.replace(' ', '_').replace('-', '_')
-            if ft in data._fields:
-                value = getattr(data, ft)
-                if pd.isna(value):
-                    indicator = np.array([0], dtype=np.ubyte)
-                    value = np.zeros((self.tokenizer.max_length,), dtype=np.int32)  # Placeholder for empty text
-                    mask = np.zeros((self.tokenizer.max_length,), dtype=np.ubyte)  # Placeholder for empty attn mask
-                else:
-                    # Tokenize the text value
-                    tokenizer_output = self.tokenizer.process_text(value)
-                    tokenized_text = tokenizer_output['input_ids']
-                    token_attn_mask = tokenizer_output['attention_mask']
-                    indicator = np.array([1], dtype=np.ubyte)
-                    value = np.array(tokenized_text, dtype=np.int32)
-                    mask = np.array(token_attn_mask, dtype=np.ubyte)
-            else:  # Feature not in the DataFrame
-                indicator = np.array([0], dtype=np.ubyte)
-                value = np.zeros((self.tokenizer.max_length,), dtype=np.int32)  # Placeholder for absent text
-                mask = np.zeros((self.tokenizer.max_length,), dtype=np.ubyte)  # Placeholder for absent attention mask
-            feat_indicator_list.append(indicator)
-            feat_value_list.append(value)
-            feat_mask_list.append(mask)
-
-        return feat_indicator_list, feat_value_list, feat_mask_list
-
-    def extract_value_timeseries(
-        self,
-        data: pd.DataFrame,
-        candidate_feats: List[str],
-    ) -> ValueAssociatedDataEntry:
-        """
-        Prepares a value-associated data timeseries for one patient-episode.
-        
-        Args:
-            data: DataFrame with timeseries data from a single patient-episode.
-            candidate_feats: List of candidate feature names to extract.
-        """
-
-        if data.empty:
-            return {}
-        
-        data = data.copy(deep=True)
-        
-        # Get lists of candidate features by type
-        numeric_features = []
-        categorical_features = []
-        text_features = []
-
-        for ft in candidate_feats:
-            feat_type = self._get_feature_type(ft)
-            if feat_type == 'numeric':
-                numeric_features.append(ft)
-            elif feat_type == 'categorical':
-                categorical_features.append(ft)
-            elif feat_type == 'text':
-                text_features.append(ft)
-
-        if not (numeric_features or categorical_features or text_features):
-            warn(
-                "No valid feature types found in candidate_feats. Returning empty data. "
-                "Ensure that the variable_properties.yaml file contains the correct type information "
-                "for each of the features (valid types are 'numeric', 'categorical', or 'text')."
-            )
-            return {}
-
-        # Prepare dicts for each feature type
-        val_data = {}
-        # Initialize dict items for feature types that are present in the data
-        val_data['numeric'] = {'indicators': [], 'values': []}
-        val_data['categorical'] = {'indicators': [], 'values': []}
-        # Text gets attention masks for length-padded token sequences -- not the same as timestep padding masks
-        val_data['text'] = {'indicators': [], 'values': [], 'masks': []}
-
-        if text_features:
-            if self.tokenizer is None:
-                raise ValueError(
-                    "Text features are present but no tokenizer is set. Provide a tokenizer in the constructor."
-                )
-
-        val_data['times'] = []  # Fill with scalar timestamp arrays
-        val_data['masks'] = []  # Fill with scalar mask arrays (1 for part of timeseries, 0 for masked out)
-
-        # Convert column names to valid Python identifiers that are compatible with namedtuples
-        data.columns = [col.replace(' ', '_').replace('-', '_') for col in data.columns]
-
-        # Iterate over rows (timesteps) in the DataFrame and extract each feature type
-        for record in data.itertuples(index=True, name='PatientRecord'):
-            timestamp = record.Index / np.timedelta64(1, 'h')  # Convert to hours relative to start of episode
-            val_data['times'].append(np.array([timestamp], dtype=np.float32))  # Store as scalar array
-            val_data['masks'].append(np.array([1], dtype=np.ubyte))  # Mask is 1 for records in timeseries, 0 if masked
-            
-            feat_indicator_list, feat_value_list = self._extract_numeric(record, numeric_features)
-            val_data['numeric']['indicators'].append(feat_indicator_list)
-            val_data['numeric']['values'].append(feat_value_list)
-
-            feat_indicator_list, feat_value_list = self._extract_categorical(record, categorical_features)
-            val_data['categorical']['indicators'].append(feat_indicator_list)
-            val_data['categorical']['values'].append(feat_value_list)
-
-            feat_indicator_list, feat_value_list, feat_mask_list = self._extract_text(record, text_features)
-            val_data['text']['indicators'].append(feat_indicator_list)
-            val_data['text']['values'].append(feat_value_list)
-            val_data['text']['masks'].append(feat_mask_list)
-
-        # Pad the data to the maximum timeseries length. Memory-intensive, but necessary for batching
-        ts_length = len(val_data['times'])
-        if ts_length < self.max_timeseries_length:
-            pad_length = self.max_timeseries_length - ts_length
-            for data_type in ['numeric', 'categorical', 'text']:
-                for key in ['indicators', 'values', 'masks']:
-                        # Select the appropriate dtype for the arrays
-                        if key == 'indicators':
-                            arr_dtype = np.ubyte
-                        elif key == 'values':
-                            arr_dtype = np.float32 if data_type == 'numeric' else np.int32
-                        elif key == 'masks':
-                            if data_type == 'text':
-                                arr_dtype = np.ubyte
-                            else:
-                                continue  # The 'masks' key is only present for text features
-                        # Pad with lists of like-sized zero arrays to max_timeseries_length
-                        n_features = len(val_data[data_type][key][-1])
-                        padding = [np.zeros_like(val_data[data_type][key][-1][i], dtype=arr_dtype)
-                                   for i in range(n_features)]
-                        # Extend the list with references -- NOT copies -- to the padding zero arrays
-                        # e.g. `padding[0] is padding[1]` evaluates to True
-                        padding = [padding for _ in range(pad_length)]
-                        val_data[data_type][key].extend(padding)
-            time_padding = np.zeros((1, ), dtype=np.float32)
-            mask_padding = np.zeros((1, ), dtype=np.ubyte)
-            val_data['times'].extend([time_padding for _ in range(pad_length)])  # Not copies
-            val_data['masks'].extend([mask_padding for _ in range(pad_length)])  # Not copies
-
-        return val_data
-
-    def extract_event_timeseries(
-        self,
-        data: pd.DataFrame,
-        candidate_feats: List[str]
-    ) -> EventAssociatedDataEntry:
-        """
-        Extract event-associated timeseries data.
-        
-        Events maintain their original timestamps without resampling.
-        """
-
-        data = data.copy(deep=True)
-        
-        if data.empty:
-            return {}
-        
-        event_data = {}
-
-        event_data['indicators'] = []  # Fill with scalar event indicator arrays for each feature
-        event_data['times'] = []  # Fill with scalar timestamp arrays
-        event_data['masks'] = []  # Fill with scalar mask arrays (1 for part of timeseries, 0 for masked out)
-
-        # Convert column names to valid Python identifiers that are compatible with namedtuples
-        data.columns = [col.replace(' ', '_').replace('-', '_') for col in data.columns]
-        
-        # Iterate over rows (timesteps) in the DataFrame and extract each feature type
-        for record in data.itertuples(index=True, name='PatientRecord'):
-            feat_indicator_list = []  # A list of all features' indicators for this timestep
-            timestamp = record.Index / np.timedelta64(1, 'h')
-            event_data['times'].append(np.array([timestamp], dtype=np.float32))  # Store as scalar array
-            event_data['masks'].append(np.array([1], dtype=np.ubyte))  # Mask is 1 for all recorded events
-            for ft in candidate_feats:
-                ft_size = self._get_feature_size(ft)
-                # Convert the candidate feature to valid Python identifiers that match the new column names
-                ft = ft.replace(' ', '_').replace('-', '_')
-                cols = sorted(self._get_feature_column_names(ft, data))
                 if cols:
-                    if ft_size != len(cols):
-                        raise ValueError(
-                            f"The number of columns for '{ft}' does not match its expected dimension ({ft_size})"
-                        )
-                # Check whether there is at least one recorded value for a component of the feature
-                # This is to cover vector-valued features where some components may be missing.
-                value = [getattr(record, col) for col in cols]
-                # If the feature value is missing in all dims the indicator bit is set to zero
-                if all([(pd.isna(v) or v == '') for v in value]):
-                    indicator = np.array([0], dtype=np.ubyte)
-                # If at least one feature dimension has a value recorded, the indicator bit is set to one
-                else:
-                    indicator = np.array([1], dtype=np.ubyte)
-                # Append the indicator to the list for this timestep
-                feat_indicator_list.append(indicator)
-            # Append the feature indicator for this timestamp to the event data
-            event_data['indicators'].append(feat_indicator_list)
-
-        # Pad the data to the maximum timeseries length. Memory-intensive, but necessary for batching
-        ts_length = len(event_data['times'])
-        if ts_length < self.max_timeseries_length:
-            pad_length = self.max_timeseries_length - ts_length
-            n_features = len(event_data['indicators'][-1])
-            event_padding = np.zeros((1, ), dtype=np.ubyte)
-            # Extend with references -- NOT copies -- of the padding array
-            padding = [[event_padding for _ in range(n_features)] for _ in range(pad_length)]
-            event_data['indicators'].extend(padding)
-            # Pad the timestamps and masks with references to zero arrays
-            time_padding = np.zeros((1, ), dtype=np.float32)
-            mask_padding = np.zeros((1, ), dtype=np.ubyte)
-            event_data['times'].extend([time_padding for _ in range(pad_length)])
-            event_data['masks'].extend([mask_padding for _ in range(pad_length)])
+                    values = [getattr(record, c) for c in cols]
+                    if not all(pd.isna(v) for v in values):
+                        numeric_indicators[t, f] = 1.0
+                        for d, v in enumerate(values):
+                            if d < feat_dim and pd.notna(v):
+                                numeric_values[f][t, d] = v
+            
+            # Categorical features
+            for f, feat in enumerate(self.categorical_feats):
+                feat_name = feat.replace(' ', '_').replace('-', '_')
+                if hasattr(record, feat_name):
+                    value = getattr(record, feat_name)
+                    if pd.notna(value):
+                        categorical_indicators[t, f] = 1.0
+                        # Convert to 1-indexed category
+                        cat_map = self.var_properties[feat].get('category_map', {})
+                        if isinstance(value, str):
+                            idx_map = {v: int(k) for k, v in cat_map.items()}
+                            cat_idx = idx_map.get(value, 0)
+                        else:
+                            cat_idx = int(value)
+                        # Ensure 1-indexed (0 = missing)
+                        first_idx = min(int(k) for k in cat_map.keys()) if cat_map else 0
+                        cat_idx = cat_idx - first_idx + 1
+                        categorical_values[f][t, 0] = cat_idx
+            
+            # Text features
+            for f, feat in enumerate(self.text_feats):
+                feat_name = feat.replace(' ', '_').replace('-', '_')
+                if hasattr(record, feat_name):
+                    value = getattr(record, feat_name)
+                    if pd.notna(value) and value.strip():
+                        text_indicators[t, f] = 1.0
+                        tokenized = self.tokenizer.process_text(value)
+                        text_values[f][t, :] = tokenized['input_ids']
+                        text_masks[f][t, :] = tokenized['attention_mask'].astype(np.float32)
         
-        return event_data  
-
-    def extract_static_data(
+        return (times, numeric_indicators, numeric_values,
+                categorical_indicators, categorical_values,
+                text_indicators, text_values, text_masks)
+    
+    def process_event_data(
         self,
-        data: Union[pd.Series, pd.DataFrame],
-        candidate_feats: List[str]
-    ) -> StaticDataEntry:
+        data: pd.DataFrame
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Extract static data (single values per patient).
+        Process event-associated data into flat numpy arrays.
+        
+        Args:
+            data: DataFrame with TimedeltaIndex containing event features
+            
+        Returns:
+            Tuple of:
+            - times: (n_timesteps,) float32
+            - indicators: (n_timesteps, n_event_feats) float32
         """
         if data.empty:
-            return []
-        
-        # Convert to namedtuple only if data is a pandas Series
-        if isinstance(data, pd.Series):
-            data = namedtuple('StaticData', data.index)(*data)
-        elif isinstance(data, pd.DataFrame):
-            data = namedtuple('StaticData', data.columns)(*data.iloc[0])
+            n_ts = 0
         else:
-            raise TypeError(f'Unsupported data type: {type(data)}. Expected pd.Series or pd.DataFrame.')
+            n_ts = len(data)
         
-        static_data = []
+        n_feats = self.dims.n_event_feats
+        times = np.zeros(n_ts, dtype=np.float32)
+        indicators = np.zeros((n_ts, n_feats), dtype=np.float32)
         
-        # Process each feature according to its type
-        for ft in candidate_feats:
-            feat_type = self._get_feature_type(ft)
-            if feat_type == 'numeric':
-                _, value = self._extract_numeric(data, [ft])
-                static_data.extend(value)
-            elif feat_type == 'categorical':
-                _, value = self._extract_categorical(data, [ft])
-                static_data.extend(value)
-            elif feat_type == 'text':
-                _, value = self._extract_text(data, [ft])
-                static_data.extend(value)
+        if data.empty:
+            return times, indicators
         
-        return static_data
-
-
-def standardize_feats(
-    x: List[ValueAssociatedDataEntry], 
-    save_path: Optional[str] = None, 
-    load_path: Optional[str] = None
-) -> List[ValueAssociatedDataEntry]:
-    """Scale and center the non-zero values of features using their mean and the 5th-95th percentile range.
-
-    This function standardizes the non-zero values of the input array `x`. If `load_path` is provided, the function 
-    loads the 5th and 95th percentiles and means of feature values from a .npz file and uses the them for the 
-    standardization. If `load_path` is not provided, the function calculates the means and percentiles of each feature 
-    from its non-zero values across all samples and timesteps. If `save_path` is provided, the calculated percentiles 
-    and means are saved to a .npz file. The function returns the input with standardized values.
-
-    Args:
-        x (List[ValueAssociatedDataEntry]): A list of dictionaries containing feature value data. A ValueAssocatedDataEntry is a dictionary with keys that correspond to different data types (numeric, categorical, text) as well as timestamps for each record. Each of those keys maps to a dictionary with keys for feature indicators and values. Each item is a list of lists of numpy arrays where the outer list corresponds to timestamps and the innter list corresponds to features. This function only standardizes the numeric features.
-        save_path (str, optional): The path to save the calculated percentiles and means to a .npz file.
-        load_path (str, optional): The path to load the calculated percentiles and means from a .npz file.
-
-    Returns:
-        List[ValueAssociatedDataEntry]: The input list of ValueAssociatedDataEntry dictionaries with standardized numeric feature values.
-    """
-
-    if load_path is not None:
-        # Load the 5th, 95th percentiles and means of feature values
-        data = np.load(load_path) 
-        p5 = data['p5']
-        p95 = data['p95']
-        means = data['means']
-    else:
-        num_ind_data = []  # EpisodeList[TimestepList[FeatList[np.ndarray]]]
-        num_val_data = []  # EpisodeList[TimestepList[FeatList[np.ndarray]]]
-        for episode in x:
-            num_ind_data.append(episode['numeric']['indicators'])
-            num_val_data.append(episode['numeric']['values'])
-
-        n_features = len(num_val_data[0][0])  # Number of features is the same for all records
+        data = data.copy()
+        data.columns = [col.replace(' ', '_').replace('-', '_') for col in data.columns]
         
-        # Pre-allocate arrays to avoid memory fragmentation
-        means = np.zeros(n_features)
-        p5 = np.zeros(n_features)
-        p95 = np.zeros(n_features)
-        
-        # Process one feature at a time to minimize memory usage
-        for i in range(n_features):
-            obs_values = []  # Store (feat_dim, ) value arrays for feature i across all episodes and timesteps
-            # Iterate over patient-episodes
-            for episode_indicators, episode_values in zip(num_ind_data, num_val_data):
-                # Iterate over individual timesteps in the episode
-                for record_indicators, record_values in zip(episode_indicators, episode_values):
-                    if record_indicators[i] == 1:  # Only append values of features that were actually observed
-                        obs_values.append(record_values[i])
+        for t, record in enumerate(data.itertuples(index=True, name='Record')):
+            times[t] = record.Index / np.timedelta64(1, 'h')
             
-            if obs_values:
-                # Stack and compute statistics immediately, then discard the array
-                obs_array = np.stack(obs_values, axis=0)
-                means[i] = np.mean(obs_array)
-                norms = np.linalg.norm(obs_array, ord=2, axis=0 if obs_array.ndim > 1 else None)
-                if np.isscalar(norms):
-                    norms = np.array([norms])
-                p5[i] = np.percentile(norms, 5)
-                p95[i] = np.percentile(norms, 95)
-                # Free memory immediately
-                del obs_array, obs_values, norms
+            for f, feat in enumerate(self.event_feats):
+                feat_name = feat.replace(' ', '_').replace('-', '_')
+                cols = self._get_feature_columns(feat_name, record)
+                if cols:
+                    values = [getattr(record, c) for c in cols]
+                    if not all(pd.isna(v) or v == '' for v in values):
+                        indicators[t, f] = 1.0
+        
+        return times, indicators
+    
+    def process_static_data(
+        self,
+        data: Union[pd.Series, pd.DataFrame]
+    ) -> np.ndarray:
+        """
+        Process static data into a flat numpy array.
+        
+        Args:
+            data: Series or DataFrame containing static features
+            
+        Returns:
+            Concatenated array of shape (static_total_dim,) as float32
+        """
+        static_array = np.zeros(self.dims.static_total_dim, dtype=np.float32)
+        
+        if data is None or (hasattr(data, 'empty') and data.empty):
+            return static_array
+        
+        # Convert to namedtuple
+        if isinstance(data, pd.Series):
+            Record = namedtuple('StaticData', data.index)
+            record = Record(*data)
+        elif isinstance(data, pd.DataFrame):
+            Record = namedtuple('StaticData', data.columns)
+            record = Record(*data.iloc[0])
+        else:
+            return static_array
+        
+        offset = 0
+        for f, feat in enumerate(self.static_feats):
+            feat_name = feat.replace(' ', '_').replace('-', '_')
+            feat_dim = self.dims.static_feat_dims[f]
+            feat_type = self.var_properties[feat]['type']
+            
+            if hasattr(record, feat_name):
+                value = getattr(record, feat_name)
+                
+                if feat_type == 'numeric':
+                    if pd.notna(value):
+                        static_array[offset] = float(value)
+                
+                elif feat_type == 'categorical':
+                    if pd.notna(value):
+                        cat_map = self.var_properties[feat].get('category_map', {})
+                        if isinstance(value, str):
+                            idx_map = {v: int(k) for k, v in cat_map.items()}
+                            cat_idx = idx_map.get(value, 0)
+                        else:
+                            cat_idx = int(value)
+                        first_idx = min(int(k) for k in cat_map.keys()) if cat_map else 0
+                        cat_idx = cat_idx - first_idx + 1
+                        static_array[offset] = float(cat_idx)
+                
+                elif feat_type == 'text':
+                    if pd.notna(value) and value.strip():
+                        tokenized = self.tokenizer.process_text(value)
+                        # Store token IDs as floats (will be cast later if needed)
+                        static_array[offset:offset + feat_dim] = tokenized['input_ids'].astype(np.float32)
+            
+            offset += feat_dim
+        
+        return static_array
+    
+    def _get_feature_columns(self, base_name: str, record: namedtuple) -> List[str]:
+        """Find columns matching a feature name in a namedtuple."""
+        fields = record._fields if hasattr(record, '_fields') else []
+        return [f for f in fields if re.match(f'^{re.escape(base_name)}(_\\d+)?$', f)]
+
+
+class TextBalancedDistributedSampler(Sampler):
+    """
+    Distributed sampler that balances text density across ranks.
+    
+    Within each meta-batch (batch_size * world_size samples), episodes are
+    sorted by text density and assigned to ranks via round-robin, ensuring
+    each rank gets a mix of text-heavy and text-light episodes.
+    
+    This prevents memory imbalance where one GPU gets all text-heavy episodes
+    and OOMs while others sit idle with light batches.
+    
+    Randomness is preserved through:
+    - Global shuffle at start of each epoch
+    - Different episodes grouped into meta-batches each epoch
+    - Only the within-meta-batch distribution is deterministic
+    """
+    
+    def __init__(
+        self,
+        dataset,
+        text_counts: np.ndarray,
+        batch_size: int,
+        num_replicas: Optional[int] = None,
+        rank: Optional[int] = None,
+        shuffle: bool = True,
+        seed: int = 0,
+        drop_last: bool = False
+    ):
+        """
+        Args:
+            dataset: The dataset to sample from
+            text_counts: Array of shape (n_episodes,) with text entry count per episode
+            batch_size: Per-GPU batch size
+            num_replicas: Number of distributed processes (defaults to world size)
+            rank: Rank of current process (defaults to current rank)
+            shuffle: Whether to shuffle indices each epoch
+            seed: Random seed for shuffling
+            drop_last: Whether to drop incomplete final meta-batch
+        """
+        if num_replicas is None:
+            if not torch.distributed.is_available():
+                raise RuntimeError("Requires distributed package")
+            if torch.distributed.is_initialized():
+                num_replicas = torch.distributed.get_world_size()
             else:
-                means[i] = 0
-                p5[i] = 0
-                p95[i] = 0
+                num_replicas = 1
+        
+        if rank is None:
+            if not torch.distributed.is_available():
+                raise RuntimeError("Requires distributed package")
+            if torch.distributed.is_initialized():
+                rank = torch.distributed.get_rank()
+            else:
+                rank = 0
+        
+        if rank >= num_replicas or rank < 0:
+            raise ValueError(f"Invalid rank {rank}, must be in [0, {num_replicas})")
+        
+        self.dataset = dataset
+        self.text_counts = np.asarray(text_counts)
+        self.batch_size = batch_size
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.shuffle = shuffle
+        self.seed = seed
+        self.drop_last = drop_last
+        self.epoch = 0
+        
+        # Calculate number of samples per replica
+        self.meta_batch_size = batch_size * num_replicas
+        self.total_size = len(dataset)
+        
+        if self.drop_last and self.total_size % self.meta_batch_size != 0:
+            # Number of complete meta-batches
+            self.num_meta_batches = self.total_size // self.meta_batch_size
+            self.num_samples = (self.num_meta_batches * self.meta_batch_size) // self.num_replicas
+        else:
+            # Pad to make evenly divisible
+            self.num_meta_batches = (self.total_size + self.meta_batch_size - 1) // self.meta_batch_size
+            self.num_samples = (self.num_meta_batches * self.meta_batch_size) // self.num_replicas
 
-    if save_path is not None:
-        # Save arrays of feature-wise percentiles and means to a .npz file
-        np.savez(save_path, p5=p5, p95=p95, means=means)
-
-    # Center the original feature values on the mean and scale by the 5th-95th %ile range
-    for i, episode in enumerate(x):
-        for j, timestep in enumerate(episode['numeric']['values']):
-            for k, feature in enumerate(timestep):
-                if p5[k] == p95[k]:
-                    # If the 5th and 95th percentiles are equal, set the feature value to 0
-                    episode['numeric']['values'][j][k] = np.zeros_like(feature)
+    def __iter__(self) -> Iterator[int]:
+        # Create generator with seed + epoch for reproducibility
+        g = torch.Generator()
+        g.manual_seed(self.seed + self.epoch)
+        
+        # Get all indices
+        n = len(self.dataset)
+        
+        if self.shuffle:
+            indices = torch.randperm(n, generator=g).tolist()
+        else:
+            indices = list(range(n))
+        
+        # Pad if necessary to make evenly divisible by meta_batch_size
+        if not self.drop_last:
+            padding_size = self.num_meta_batches * self.meta_batch_size - n
+            if padding_size > 0:
+                # Pad with repeated indices from the beginning
+                indices += indices[:padding_size]
+        else:
+            # Truncate to complete meta-batches only
+            indices = indices[:self.num_meta_batches * self.meta_batch_size]
+        
+        # Balance within each meta-batch and extract this rank's indices
+        balanced_indices = []
+        
+        for start in range(0, len(indices), self.meta_batch_size):
+            meta_batch = indices[start:start + self.meta_batch_size]
+            
+            if len(meta_batch) < self.meta_batch_size:
+                # Incomplete meta-batch at end (shouldn't happen with padding, but safety check)
+                if self.drop_last:
+                    continue
+            
+            # Sort meta-batch by text density (ascending: lightest first)
+            meta_batch_sorted = sorted(meta_batch, key=lambda i: self.text_counts[i])
+            
+            # Pair lightest with heaviest to balance each rank's total text load
+            # E.g., for 16 items [0..15] sorted by density, create pairs:
+            #   (0, 15), (1, 14), (2, 13), ..., (7, 8)
+            # Then assign pairs round-robin to ranks so each rank gets balanced load
+            n_items = len(meta_batch_sorted)
+            n_pairs = n_items // 2
+            
+            # Build pairs: (lightest, heaviest), (2nd lightest, 2nd heaviest), ...
+            pairs = []
+            for i in range(n_pairs):
+                light_idx = meta_batch_sorted[i]
+                heavy_idx = meta_batch_sorted[n_items - 1 - i]
+                pairs.append((light_idx, heavy_idx))
+            
+            # Handle odd item (middle element) if present
+            middle_item = None
+            if n_items % 2 == 1:
+                middle_item = meta_batch_sorted[n_pairs]
+            
+            # Assign pairs to ranks using snake/boustrophedon pattern
+            # This reverses direction each pass through ranks to balance any
+            # systematic bias from pair ordering
+            # E.g., with 4 ranks and 8 pairs:
+            #   Pass 0: pair 0->rank 0, pair 1->rank 1, pair 2->rank 2, pair 3->rank 3
+            #   Pass 1: pair 4->rank 3, pair 5->rank 2, pair 6->rank 1, pair 7->rank 0
+            for pair_idx, (light_idx, heavy_idx) in enumerate(pairs):
+                pass_num = pair_idx // self.num_replicas
+                pos_in_pass = pair_idx % self.num_replicas
+                
+                if pass_num % 2 == 0:
+                    # Forward pass: rank 0, 1, 2, ...
+                    assigned_rank = pos_in_pass
                 else:
-                    # Standardize the feature by centering on the mean and scaling by the 5th-95th %ile range
-                    std_vals = (feature - means[k]) / (p95[k] - p5[k])
-                    x[i]['numeric']['values'][j][k] = std_vals
+                    # Reverse pass: rank n-1, n-2, ..., 0
+                    assigned_rank = self.num_replicas - 1 - pos_in_pass
+                
+                if assigned_rank == self.rank:
+                    balanced_indices.append(light_idx)
+                    balanced_indices.append(heavy_idx)
+            
+            # Assign middle item (if any) to rank based on number of passes
+            # Alternate which rank gets the middle item for additional balancing
+            if middle_item is not None:
+                n_passes = (n_pairs + self.num_replicas - 1) // self.num_replicas
+                middle_rank = n_passes % self.num_replicas
+                if self.rank == middle_rank:
+                    balanced_indices.append(middle_item)
+        
+        return iter(balanced_indices)
 
-    return x
+    def __len__(self) -> int:
+        return self.num_samples
+    
+    def set_epoch(self, epoch: int) -> None:
+        """Set epoch for deterministic shuffling across epochs."""
+        self.epoch = epoch
+
+
+def get_text_counts_from_dataset(dataset) -> np.ndarray:
+    """
+    Compute total text entry count per episode from MixedDataset sparse storage.
+    
+    Args:
+        dataset: MixedDataset instance with sparse text storage
+        
+    Returns:
+        Array of shape (n_episodes,) with total text entries per episode
+    """
+    n_episodes = dataset.n_episodes
+    text_counts = np.zeros(n_episodes, dtype=np.int32)
+    
+    # Sum across all text features
+    for f in range(dataset.n_text_feats):
+        offsets = dataset.val_text_offsets[f]
+        # offsets[i+1] - offsets[i] gives count for episode i
+        for i in range(n_episodes):
+            text_counts[i] += int(offsets[i + 1]) - int(offsets[i])
+    
+    return text_counts
+
+
+def _init_tensorized_worker(
+    var_properties_path: str,
+    valued_feats: List[str],
+    event_feats: List[str],
+    text_feats: Optional[List[str]],
+    static_feats: List[str],
+    dims_dict: dict
+):
+    """
+    Initialize worker process with TensorizedDataProcessor.
+    
+    Called once per worker when the process pool is created.
+    """
+    global _tensorized_processor, _tensorized_dims
+    
+    # Reconstruct TensorDimensions from dict (can't pickle dataclass directly in some cases)
+    _tensorized_dims = TensorDimensions(**dims_dict)
+    
+    tokenizer = LLMTextProcessor() if text_feats else None
+    
+    _tensorized_processor = DataProcessor(
+        var_properties_path=var_properties_path,
+        valued_feats=valued_feats,
+        event_feats=event_feats,
+        text_feats=text_feats,
+        static_feats=static_feats,
+        dims=_tensorized_dims,
+        tokenizer=tokenizer
+    )
+
+
+def _process_single_episode(
+    i: int,
+    reader: MIMICDataReader,
+    max_history_len_steps: int,
+    max_episode_len_steps: int,
+    max_episode_len_hours: Optional[int],
+    min_episode_len_steps: Optional[int],
+    min_episode_len_hours: Optional[int]
+) -> Optional[EpisodeData]:
+    """
+    Process a single episode into EpisodeData for tensor insertion.
+    
+    This function runs in a worker process and returns minimal numpy arrays
+    that the main process will insert into pre-allocated tensors.
+    
+    Args:
+        i: Index in the reader
+        reader: MIMICDataReader instance
+        max_history_len_steps: Maximum historic timesteps
+        max_episode_len_steps: Maximum episode timesteps
+        max_episode_len_hours: Maximum hours to include
+        min_episode_len_steps: Minimum required timesteps
+        min_episode_len_hours: Minimum required hours
+        
+    Returns:
+        EpisodeData if episode passes filters, None otherwise
+    """
+    global _tensorized_processor, _tensorized_dims
+    
+    try:
+        _, statics, val_data, event_data, text_data, targets = reader[i]
+        targets = dict(zip(
+            ['mortality', 'length_of_stay', 'phenotype'],
+            [np.array(t) for t in targets]
+        ))
+        
+        # Apply filtering criteria
+        if min_episode_len_hours is not None:
+            if targets['length_of_stay'] < min_episode_len_hours:
+                return None
+        
+        # Check minimum timesteps
+        if min_episode_len_steps is not None:
+            min_ts = np.timedelta64(0, 'h')
+            max_ts = np.timedelta64(max_episode_len_hours, 'h') if max_episode_len_hours else None
+            
+            if text_data is not None:
+                merged = val_data.merge(text_data, how='outer', left_index=True, right_index=True)
+                check_data = merged
+            else:
+                check_data = val_data
+            
+            if max_ts is not None:
+                is_current = (min_ts <= check_data.index) & (check_data.index < max_ts)
+            else:
+                is_current = min_ts <= check_data.index
+            
+            if is_current.sum() < min_episode_len_steps:
+                return None
+        
+        # Resample value-associated data to hourly
+        val_data = val_data.set_index(val_data.index.ceil('h')).resample(
+            '1h', closed='right', label='right'
+        ).mean()
+        val_data = val_data.dropna(axis=0, how='all')
+        
+        # Filter timeseries
+        val_data, event_data, text_data = filter_timeseries_records(
+            val_data, event_data, text_data,
+            max_history_len_steps, max_episode_len_steps, max_episode_len_hours
+        )
+        
+        # Merge text with value data
+        if text_data is not None:
+            val_data = val_data.merge(text_data, how='outer', left_index=True, right_index=True)
+            val_data.columns = [
+                col.rsplit('_', 1)[0] if col.endswith(('_left', '_right')) else col
+                for col in val_data.columns
+            ]
+        
+        # Process into numpy arrays
+        (val_times, num_ind, num_vals, cat_ind, cat_vals,
+         txt_ind, txt_vals, txt_masks) = _tensorized_processor.process_valued_data(val_data)
+        
+        event_times, event_ind = _tensorized_processor.process_event_data(event_data)
+        
+        static_arr = _tensorized_processor.process_static_data(statics)
+        
+        # Normalize length of stay
+        if max_episode_len_hours is not None:
+            los = targets['length_of_stay'] - max_episode_len_hours
+        else:
+            max_val_t = val_times.max() if len(val_times) > 0 else 0
+            max_event_t = event_times.max() if len(event_times) > 0 else 0
+            los = targets['length_of_stay'] - max(max_val_t, max_event_t)
+        
+        return EpisodeData(
+            idx=i,
+            val_len=len(val_times),
+            event_len=len(event_times),
+            val_times=val_times,
+            val_numeric_indicators=num_ind,
+            val_numeric_values=num_vals,
+            val_categorical_indicators=cat_ind,
+            val_categorical_values=cat_vals,
+            val_text_indicators=txt_ind,
+            val_text_values=txt_vals,
+            val_text_masks=txt_masks,
+            event_times=event_times,
+            event_indicators=event_ind,
+            static_data=static_arr,
+            mortality=float(targets['mortality']),
+            length_of_stay=float(los),
+            phenotype=targets['phenotype'].astype(np.float32)
+        )
+        
+    except Exception as e:
+        print(f"Error processing episode {i}: {e}")
+        return None
+
+
+def _get_tensor_dimensions(
+    var_properties_path: str,
+    valued_feats: List[str],
+    event_feats: List[str],
+    text_feats: Optional[List[str]],
+    static_feats: List[str],
+    max_ts_len: int,
+    n_episodes: int,
+    phenotype_dim: int,
+    max_token_length: int = MAX_TOKEN_LENGTH
+) -> TensorDimensions:
+    """
+    Compute tensor dimensions from configuration for pre-allocation.
+    
+    This function reads variable properties and computes the exact dimensions
+    needed for all output tensors, enabling single-allocation of the final
+    tensorized dataset.
+    
+    Args:
+        var_properties_path: Path to variable_properties.yaml
+        valued_feats: List of value-associated feature names (numeric + categorical in valued_feats)
+        event_feats: List of event-associated feature names
+        text_feats: List of text feature names (may be None)
+        static_feats: List of static feature names
+        max_ts_len: Maximum timeseries length (history + episode)
+        n_episodes: Total number of episodes to process
+        phenotype_dim: Number of phenotype labels
+        max_token_length: Maximum token sequence length for text
+        
+    Returns:
+        TensorDimensions dataclass with all dimension information
+    """
+    with open(var_properties_path, 'r') as f:
+        var_properties = yaml.safe_load(f)
+    
+    # Separate valued_feats by type
+    numeric_feats = []
+    categorical_feats = []
+    for feat in valued_feats:
+        feat_type = var_properties[feat]['type']
+        if feat_type == 'numeric':
+            numeric_feats.append(feat)
+        elif feat_type == 'categorical':
+            categorical_feats.append(feat)
+    
+    # Get dimensions for each feature type
+    numeric_feat_dims = [var_properties[f]['size'] for f in numeric_feats]
+    categorical_feat_dims = [var_properties[f]['size'] for f in categorical_feats]
+    
+    # Text features use max_token_length for their dimension
+    text_feats = text_feats or []
+    text_feat_dims = [max_token_length for _ in text_feats]
+    
+    # Static features - handle different types
+    static_feat_dims = []
+    for feat in static_feats:
+        feat_type = var_properties[feat]['type']
+        if feat_type == 'text':
+            static_feat_dims.append(max_token_length)
+        else:
+            static_feat_dims.append(var_properties[feat]['size'])
+    
+    return TensorDimensions(
+        n_episodes=n_episodes,
+        max_ts_len_val=max_ts_len,
+        max_ts_len_event=max_ts_len,
+        n_numeric_feats=len(numeric_feats),
+        n_categorical_feats=len(categorical_feats),
+        n_text_feats=len(text_feats),
+        n_event_feats=len(event_feats),
+        numeric_feat_dims=numeric_feat_dims,
+        categorical_feat_dims=categorical_feat_dims,
+        text_feat_dims=text_feat_dims,
+        static_feat_dims=static_feat_dims,
+        static_total_dim=sum(static_feat_dims),
+        phenotype_dim=phenotype_dim,
+    )
+
+
+def _get_phenotype_dim(phenotypes_listfile: str) -> int:
+    """
+    Get the number of phenotype labels from the listfile header.
+    
+    Args:
+        phenotypes_listfile: Path to phenotyping_<partition>_listfile.csv
+        
+    Returns:
+        Number of phenotype columns (excludes 'stay' and 'period_length')
+    """
+    with open(phenotypes_listfile, 'r') as f:
+        header = f.readline().strip()
+    columns = header.split(',')
+    # Header: "stay,period_length,<phenotype1>,<phenotype2>,..."
+    return len(columns) - 2
+
+
+def _allocate_output_arrays(dims: TensorDimensions) -> Dict[str, np.ndarray]:
+    """
+    Pre-allocate output arrays as numpy (not torch).
+    """
+    arrays = {}
+    
+    n = dims.n_episodes
+    ts_val = dims.max_ts_len_val
+    ts_event = dims.max_ts_len_event
+    
+    # Value-associated data
+    arrays['val_times'] = np.zeros((n, ts_val), dtype=np.float32)
+    arrays['val_masks'] = np.zeros((n, ts_val), dtype=np.float32)
+    
+    arrays['val_numeric_indicators'] = np.zeros((n, ts_val, dims.n_numeric_feats), dtype=np.float32)
+    arrays['val_numeric_values'] = [
+        np.zeros((n, ts_val, dim), dtype=np.float32)
+        for dim in dims.numeric_feat_dims
+    ]
+    
+    arrays['val_categorical_indicators'] = np.zeros((n, ts_val, dims.n_categorical_feats), dtype=np.float32)
+    arrays['val_categorical_values'] = [
+        np.zeros((n, ts_val, dim), dtype=np.int64)
+        for dim in dims.categorical_feat_dims
+    ]
+    
+    arrays['val_text_indicators'] = np.zeros((n, ts_val, dims.n_text_feats), dtype=np.float32)
+    
+    # Sparse text - collect as lists, finalize later
+    arrays['_text_values_lists'] = [[] for _ in range(dims.n_text_feats)]
+    arrays['_text_masks_lists'] = [[] for _ in range(dims.n_text_feats)]
+    arrays['_text_timesteps_lists'] = [[] for _ in range(dims.n_text_feats)]
+    arrays['_text_counts'] = [[] for _ in range(dims.n_text_feats)]
+    
+    # Event data
+    arrays['event_times'] = np.zeros((n, ts_event), dtype=np.float32)
+    arrays['event_masks'] = np.zeros((n, ts_event), dtype=np.float32)
+    arrays['event_indicators'] = np.zeros((n, ts_event, dims.n_event_feats), dtype=np.float32)
+    
+    # Static and targets
+    arrays['static_data'] = np.zeros((n, dims.static_total_dim), dtype=np.float32)
+    arrays['mortality'] = np.zeros(n, dtype=np.float32)
+    arrays['length_of_stay'] = np.zeros(n, dtype=np.float32)
+    arrays['phenotype'] = np.zeros((n, dims.phenotype_dim), dtype=np.float32)
+    
+    return arrays
+
+
+def _finalize_sparse_text(
+    arrays: Dict[str, np.ndarray],
+    dims: TensorDimensions
+) -> Tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray], List[np.ndarray]]:
+    """
+    Convert sparse text lists to numpy arrays.
+    """
+    val_text_offsets = []
+    val_text_values = []
+    val_text_masks = []
+    val_text_timesteps = []
+    
+    for f in range(dims.n_text_feats):
+        counts = arrays['_text_counts'][f]
+        offsets = np.zeros(len(counts) + 1, dtype=np.int64)
+        offsets[1:] = np.cumsum(counts)
+        val_text_offsets.append(offsets)
+        
+        if arrays['_text_values_lists'][f]:
+            val_text_values.append(np.stack(arrays['_text_values_lists'][f], axis=0))
+            val_text_masks.append(np.stack(arrays['_text_masks_lists'][f], axis=0))
+            val_text_timesteps.append(np.array(arrays['_text_timesteps_lists'][f], dtype=np.int32))
+        else:
+            token_len = dims.text_feat_dims[f]
+            val_text_values.append(np.zeros((0, token_len), dtype=np.int64))
+            val_text_masks.append(np.zeros((0, token_len), dtype=np.float32))
+            val_text_timesteps.append(np.zeros(0, dtype=np.int32))
+    
+    del arrays['_text_values_lists']
+    del arrays['_text_masks_lists']
+    del arrays['_text_timesteps_lists']
+    del arrays['_text_counts']
+    
+    return val_text_offsets, val_text_values, val_text_masks, val_text_timesteps
 
 
 def filter_timeseries_records(
@@ -773,138 +957,413 @@ def filter_timeseries_records(
     return numeric_data, event_data, text_data
 
 
-def _init_worker(max_timeseries_length: int):
-    """Initialize worker process with a DataProcessor instance."""
-    global _worker_processor
-    _worker_processor = DataProcessor(max_timeseries_length, tokenizer=LlamaTextProcessor())
-
-
-def _process_single_episode(
-    i: int,
-    reader: MIMICDataReader,
-    max_history_len_steps: int,
-    max_episode_len_steps: int,
-    max_episode_len_hours: Optional[int],
-    min_episode_len_steps: Optional[int],
-    min_episode_len_hours: Optional[int]
-) -> Optional[Tuple[int, dict, dict, list, dict]]:
-    """Process a single patient episode using the worker's processor."""
+def collate_tensorized(batch: MixedDataset) -> MixedTensorDataset:
+    """Collate function for MixedDataset.
     
-    global _worker_processor
-    processor = _worker_processor
+    Takes a list of episode dicts and stacks them into the MixedTensorDataset format expected by the model.
+    """
     
-    try:
-        _, statics, val_data, event_data, text_data, targets = reader[i]
-        targets = dict(zip(['mortality', 'length_of_stay', 'phenotype'], [np.array(t) for t in targets]))
+    # Stack simple tensors directly
+    val_times = torch.stack([b['val_times'] for b in batch], dim=0)
+    val_masks = torch.stack([b['val_masks'] for b in batch], dim=0)
+    event_times = torch.stack([b['event_times'] for b in batch], dim=0)
+    event_masks = torch.stack([b['event_masks'] for b in batch], dim=0)
+    static_data = torch.stack([b['static_data'] for b in batch], dim=0)
+    
+    # Stack indicator tensors
+    val_numeric_ind = torch.stack([b['val_numeric_indicators'] for b in batch], dim=0)
+    val_categorical_ind = torch.stack([b['val_categorical_indicators'] for b in batch], dim=0)
+    val_text_ind = torch.stack([b['val_text_indicators'] for b in batch], dim=0)
+    event_ind = torch.stack([b['event_indicators'] for b in batch], dim=0)
+    
+    # Stack per-feature value tensors
+    n_numeric_feats = len(batch[0]['val_numeric_values'])
+    n_categorical_feats = len(batch[0]['val_categorical_values'])
+    n_text_feats = len(batch[0]['val_text_values'])
+    
+    val_numeric_values = [
+        torch.stack([b['val_numeric_values'][f] for b in batch], dim=0)
+        for f in range(n_numeric_feats)
+    ]
+    val_categorical_values = [
+        torch.stack([b['val_categorical_values'][f] for b in batch], dim=0)
+        for f in range(n_categorical_feats)
+    ]
+    val_text_values = [
+        torch.stack([b['val_text_values'][f] for b in batch], dim=0)
+        for f in range(n_text_feats)
+    ]
+    val_text_masks = [
+        torch.stack([b['val_text_masks'][f] for b in batch], dim=0)
+        for f in range(n_text_feats)
+    ]
+    
+    # Stack targets
+    mortality = torch.stack([b['mortality'] for b in batch], dim=0).unsqueeze(-1)
+    length_of_stay = torch.stack([b['length_of_stay'] for b in batch], dim=0).unsqueeze(-1)
+    phenotype = torch.stack([b['phenotype'] for b in batch], dim=0)
+    
+    # Build the MixedTensorDataset structure expected by the model
+    return {
+        'val_data': {
+            'numeric': {
+                'indicators': val_numeric_ind,
+                'values': val_numeric_values,
+            },
+            'categorical': {
+                'indicators': val_categorical_ind,
+                'values': val_categorical_values,
+            },
+            'text': {
+                'indicators': val_text_ind,
+                'values': val_text_values,
+                'masks': val_text_masks,
+            },
+            'times': val_times,
+            'masks': val_masks,
+        },
+        'event_data': {
+            'indicators': event_ind,
+            'times': event_times,
+            'masks': event_masks,
+        },
+        'static_data': static_data,
+        'targets': {
+            'mortality': mortality,
+            'length_of_stay': length_of_stay,
+            'phenotype': phenotype,
+        },
+    }
+
+
+def save_dataset(dataset: MixedDataset, base_path: str) -> None:
+    """
+    Save tensorized dataset as directory of .npy files (memory-mappable).
+    """
+    os.makedirs(base_path, exist_ok=True)
+    
+    def save_array(name: str, arr: np.ndarray):
+        np.save(os.path.join(base_path, f'{name}.npy'), arr)
+    
+    # Dense arrays
+    save_array('val_numeric_indicators', dataset.val_numeric_indicators)
+    save_array('val_categorical_indicators', dataset.val_categorical_indicators)
+    save_array('val_text_indicators', dataset.val_text_indicators)
+    save_array('val_times', dataset.val_times)
+    save_array('val_masks', dataset.val_masks)
+    save_array('event_indicators', dataset.event_indicators)
+    save_array('event_times', dataset.event_times)
+    save_array('event_masks', dataset.event_masks)
+    save_array('static_data', dataset.static_data)
+    save_array('mortality', dataset.mortality)
+    save_array('length_of_stay', dataset.length_of_stay)
+    save_array('phenotype', dataset.phenotype)
+    
+    # Per-feature arrays
+    for i, arr in enumerate(dataset.val_numeric_values):
+        save_array(f'val_numeric_values_{i}', arr)
+    for i, arr in enumerate(dataset.val_categorical_values):
+        save_array(f'val_categorical_values_{i}', arr)
+    for i, arr in enumerate(dataset.val_text_offsets):
+        save_array(f'val_text_offsets_{i}', arr)
+    for i, arr in enumerate(dataset.val_text_values):
+        save_array(f'val_text_values_{i}', arr)
+    for i, arr in enumerate(dataset.val_text_masks):
+        save_array(f'val_text_masks_{i}', arr)
+    for i, arr in enumerate(dataset.val_text_timesteps):
+        save_array(f'val_text_timesteps_{i}', arr)
+    
+    # Metadata
+    metadata = {
+        'max_ts_len': dataset.max_ts_len,
+        'text_token_len': dataset.text_token_len,
+        'n_numeric_feats': len(dataset.val_numeric_values),
+        'n_categorical_feats': len(dataset.val_categorical_values),
+        'n_text_feats': dataset.n_text_feats,
+    }
+    with open(os.path.join(base_path, 'metadata.pkl'), 'wb') as f:
+        pickle.dump(metadata, f)
+    
+    print(f"Saved tensorized dataset to {base_path}/")
+
+
+def load_dataset(base_path: str) -> MixedDataset:
+    """
+    Load tensorized dataset with memory-mapped arrays.
+    """
+    def load_mmap(name: str) -> np.ndarray:
+        return np.load(os.path.join(base_path, f'{name}.npy'), mmap_mode='r')
+    
+    with open(os.path.join(base_path, 'metadata.pkl'), 'rb') as f:
+        metadata = pickle.load(f)
+    
+    n_num = metadata['n_numeric_feats']
+    n_cat = metadata['n_categorical_feats']
+    n_txt = metadata['n_text_feats']
+    
+    return MixedDataset(
+        val_numeric_indicators=load_mmap('val_numeric_indicators'),
+        val_numeric_values=[load_mmap(f'val_numeric_values_{i}') for i in range(n_num)],
+        val_categorical_indicators=load_mmap('val_categorical_indicators'),
+        val_categorical_values=[load_mmap(f'val_categorical_values_{i}') for i in range(n_cat)],
+        val_text_indicators=load_mmap('val_text_indicators'),
+        val_times=load_mmap('val_times'),
+        val_masks=load_mmap('val_masks'),
+        val_text_offsets=[load_mmap(f'val_text_offsets_{i}') for i in range(n_txt)],
+        val_text_values=[load_mmap(f'val_text_values_{i}') for i in range(n_txt)],
+        val_text_masks=[load_mmap(f'val_text_masks_{i}') for i in range(n_txt)],
+        val_text_timesteps=[load_mmap(f'val_text_timesteps_{i}') for i in range(n_txt)],
+        event_indicators=load_mmap('event_indicators'),
+        event_times=load_mmap('event_times'),
+        event_masks=load_mmap('event_masks'),
+        static_data=load_mmap('static_data'),
+        mortality=load_mmap('mortality'),
+        length_of_stay=load_mmap('length_of_stay'),
+        phenotype=load_mmap('phenotype'),
+        max_ts_len=metadata['max_ts_len'],
+        text_token_len=metadata['text_token_len'],
+    )
+
+
+def standardize_feats(
+    arrays: Dict[str, Union[np.ndarray, List[np.ndarray]]],
+    dims: TensorDimensions,
+    save_path: Optional[str] = None,
+    load_path: Optional[str] = None
+) -> None:
+    """Scale and center numeric feature values using their mean and the 5th-95th percentile range.
+
+    This function standardizes the observed values of numeric features in-place. If `load_path` 
+    is provided, the function loads the 5th and 95th percentiles and means from a .npz file and 
+    uses them for standardization. If `load_path` is not provided, the function calculates the 
+    means and percentiles from observed values (where indicator == 1.0) across all episodes and 
+    timesteps. If `save_path` is provided, the calculated percentiles and means are saved to a 
+    .npz file.
+
+    Args:
+        arrays (Dict[str, Union[np.ndarray, List[np.ndarray]]]): Dictionary containing pre-allocated numpy arrays with 
+            keys 'val_numeric_indicators' (observation masks) and 'val_numeric_values' (list of per-feature value arrays). The value arrays are modified in-place.
+        dims (TensorDimensions): Dataclass containing tensor dimension information, specifically 
+            `n_numeric_feats` for the number of features to process.
+        save_path (str, optional): Path to save the calculated percentiles and means to a .npz 
+            file.
+        load_path (str, optional): Path to load pre-calculated percentiles and means from a .npz 
+            file.
+
+    Returns:
+        None. The arrays['val_numeric_values'] list is modified in-place with standardized values.
+    """
+
+    n_feats = dims.n_numeric_feats
+    
+    if load_path is not None:
+        data = np.load(load_path)
+        means = data['means']
+        p5 = data['p5']
+        p95 = data['p95']
+    else:
+        means = np.zeros(n_feats, dtype=np.float32)
+        p5 = np.zeros(n_feats, dtype=np.float32)
+        p95 = np.zeros(n_feats, dtype=np.float32)
         
-        # ...existing filtering and processing logic...
+        indicators = arrays['val_numeric_indicators']
         
-        # Skip episodes with length of stay < minimum number of hours
-        if min_episode_len_hours is not None:
-            if targets['length_of_stay'] < min_episode_len_hours:
-                return None
-
-        # Skip episodes with fewer than minimum records
-        if min_episode_len_steps is not None:
-            min_timestamp = np.timedelta64(0, 'h')
-            if max_episode_len_hours is not None:
-                max_timestamp = np.timedelta64(max_episode_len_hours, 'h')
-                if text_data is not None:
-                    merged = val_data.merge(text_data, how='outer', left_index=True, right_index=True)
-                    is_current_record = (min_timestamp <= merged.index) & (merged.index < max_timestamp)
-                else:
-                    is_current_record = (min_timestamp <= val_data.index) & (val_data.index < max_timestamp)
-            else:
-                if text_data is not None:
-                    merged = val_data.merge(text_data, how='outer', left_index=True, right_index=True)
-                    is_current_record = (min_timestamp <= merged.index)
-                else:
-                    is_current_record = (min_timestamp <= val_data.index)
-            n_current_records = is_current_record.sum()
-            if n_current_records < min_episode_len_steps:
-                return None
+        for f in range(n_feats):
+            values = arrays['val_numeric_values'][f]
+            mask = indicators[:, :, f] == 1.0
+            
+            if mask.any():
+                observed = values[mask]
+                means[f] = observed.mean()
+                norms = np.linalg.norm(observed, ord=2, axis=-1)
+                p5[f] = np.percentile(norms, 5)
+                p95[f] = np.percentile(norms, 95)
         
-        # Resample value-associated data
-        val_data = val_data.set_index(val_data.index.ceil('h')).resample('1h', closed='right', label='right').mean()
-        val_data = val_data.dropna(axis=0, how='all')
-
-        val_data, event_data, text_data = filter_timeseries_records(
-            val_data, event_data, text_data, max_history_len_steps, max_episode_len_steps, max_episode_len_hours
-        )
-
-        if text_data is not None:
-            val_data = val_data.merge(text_data, how='outer', left_index=True, right_index=True)
-            val_data.columns = [col.rsplit('_', 1)[0] if col.endswith(('_left', '_right')) else col 
-                                for col in val_data.columns]
-
-        val_data = processor('value', val_data, reader.valued_feats + reader.text_feats)
-        event_data = processor('event', event_data, reader.event_feats)
-        static_data = processor('static', statics, reader.static_feats)
-
-        # Normalize length of stay
-        if max_episode_len_hours is not None:
-            targets['length_of_stay'] = targets['length_of_stay'] - max_episode_len_hours
+        if save_path is not None:
+            np.savez(save_path, means=means, p5=p5, p95=p95)
+    
+    for f in range(n_feats):
+        if p5[f] == p95[f]:
+            arrays['val_numeric_values'][f][:] = 0
         else:
-            max_val_ts_timestamp = max(val_data['times'])
-            max_event_ts_timestamp = max(event_data['times'])
-            max_observed_timestamp = max(max_val_ts_timestamp, max_event_ts_timestamp)
-            targets['length_of_stay'] = targets['length_of_stay'] - max_observed_timestamp
+            arrays['val_numeric_values'][f] -= means[f]
+            arrays['val_numeric_values'][f] /= (p95[f] - p5[f])
 
-        return (i, val_data, event_data, static_data, targets)
+
+def get_text_counts_from_dataset_vectorized(dataset) -> np.ndarray:
+    """
+    Compute total text entry count per episode (vectorized version).
+    
+    Args:
+        dataset: MixedDataset instance with sparse text storage
         
-    except Exception as e:
-        print(f"Error processing episode {i}: {e}")
-        return None
+    Returns:
+        Array of shape (n_episodes,) with total text entries per episode
+    """
+    n_episodes = dataset.n_episodes
+    text_counts = np.zeros(n_episodes, dtype=np.int32)
+    
+    for f in range(dataset.n_text_feats):
+        offsets = np.asarray(dataset.val_text_offsets[f])
+        text_counts += (offsets[1:] - offsets[:-1]).astype(np.int32)
+    
+    return text_counts
 
 
 def extract_mimic(
-        reader: MIMICDataReader, 
-        suffix: str,
-        output_dir: str,
-        max_episode_len_steps: int, 
-        max_history_len_steps: int = 0,
-        min_episode_len_steps: Optional[int] = 10,
-        min_episode_len_hours: Optional[int] = 48,
-        max_episode_len_hours: Optional[int] = 48,
-        n_workers: Optional[int] = None
+    reader: MIMICDataReader,
+    suffix: str,
+    output_dir: str,
+    var_properties_path: str,
+    max_episode_len_steps: int,
+    max_history_len_steps: int = 0,
+    min_episode_len_steps: Optional[int] = 10,
+    min_episode_len_hours: Optional[int] = 48,
+    max_episode_len_hours: Optional[int] = 48,
+    n_workers: Optional[int] = None
 ) -> None:
     """
-    Reads MIMIC ICU stay timeseries data from CSV files and pickles it in a format compatible with downstream predictive models. The pickled object is a dictionary with five keys: 'id', which is a list of patient-episode IDs; 'val_data', which stores value-associated data; 'event_data', which stores event-associated data; 'static_data', which stores time-invariant patient parameters; and 'targets', which stores in-hospital mortality, length of stay, and phenotype data for downstream prediction. This function trims the data contained in the CSV files to the desired records, extracts them, and standardizes the values of value-associated data (see the `standardize_feats` function) before dumping the restructured data to disk.
+    Extract MIMIC ICU stay timeseries data from CSV files into a tensorized format optimized for 
+    fast data loading during model training.
+
+    This function reads patient episode data using a MIMICDataReader, applies filtering criteria,
+    processes the data into pre-allocated numpy arrays, standardizes numeric features, and saves 
+    the result as a directory of memory-mappable .npy files. The output format is designed for 
+    efficient multi-worker DataLoader access with minimal memory overhead.
+
+    The extraction pipeline operates in two passes:
+        1. **Filtering pass**: Episodes are processed in parallel to apply inclusion criteria 
+           (minimum length, minimum timesteps) and extract raw data.
+        2. **Insertion pass**: Surviving episodes are inserted into pre-allocated arrays and 
+           text features are converted to sparse storage format.
+
+    Output Structure:
+        The function creates a directory at `{output_dir}/{suffix}/` containing:
+        
+        * Dense arrays (one .npy file each):
+            - `val_times.npy`: (n_episodes, max_ts_len) float32 - Timestamps in hours
+            - `val_masks.npy`: (n_episodes, max_ts_len) float32 - Valid timestep indicators
+            - `val_numeric_indicators.npy`: (n_episodes, max_ts_len, n_numeric_feats) float32
+            - `val_categorical_indicators.npy`: (n_episodes, max_ts_len, n_cat_feats) float32
+            - `val_text_indicators.npy`: (n_episodes, max_ts_len, n_text_feats) float32
+            - `event_times.npy`: (n_episodes, max_ts_len) float32
+            - `event_masks.npy`: (n_episodes, max_ts_len) float32
+            - `event_indicators.npy`: (n_episodes, max_ts_len, n_event_feats) float32
+            - `static_data.npy`: (n_episodes, static_total_dim) float32
+            - `mortality.npy`: (n_episodes,) float32
+            - `length_of_stay.npy`: (n_episodes,) float32
+            - `phenotype.npy`: (n_episodes, n_phenotypes) float32
+        
+        * Per-feature arrays:
+            - `val_numeric_values_{i}.npy`: (n_episodes, max_ts_len, feat_dim) float32
+            - `val_categorical_values_{i}.npy`: (n_episodes, max_ts_len, feat_dim) int64
+        
+        * Sparse text arrays (CSR-style storage for memory efficiency):
+            - `val_text_offsets_{i}.npy`: (n_episodes + 1,) int64 - CSR row pointers
+            - `val_text_values_{i}.npy`: (n_non_empty, token_len) int64 - Token IDs
+            - `val_text_masks_{i}.npy`: (n_non_empty, token_len) float32 - Attention masks
+            - `val_text_timesteps_{i}.npy`: (n_non_empty,) int32 - Original timestep indices
+        
+        * Metadata:
+            - `metadata.pkl`: Dictionary containing dimension information for reconstruction
+        
+        Additionally creates:
+            - `{suffix}_ids.pkl`: List of patient episode IDs that passed filtering
+            - `summary_statistics_train.npz`: (train only) Standardization parameters.
+
+    Standardization:
+        Numeric features are standardized using mean centering and percentile-based scaling.
+        For the training set, statistics (mean, 5th percentile, 95th percentile) are computed
+        and saved to `summary_statistics_train.npz`. Validation and test sets are standardized 
+        using the training set statistics, which must be extracted first.
 
     Args:
+        reader (MIMICDataReader): Configured data reader for the target partition. Must have 
+            `prediction_task='all'` to include all target labels.
+        suffix (str): Data partition identifier ('train', 'val', or 'test'). Determines output 
+            filenames and whether to compute or load standardization statistics.
+        output_dir (str): Directory where the tensorized dataset will be saved. Created if it 
+            does not exist.
+        var_properties_path (str): Path to variable_properties.yaml containing feature type 
+            information and category mappings.
+        max_episode_len_steps (int): Maximum number of timesteps to include from each ICU 
+            episode, counted from admission time.
+        max_history_len_steps (int, optional): Maximum number of pre-admission timesteps to 
+            include, counted backwards from admission. Defaults to 0.
+        min_episode_len_steps (int, optional): Minimum required timesteps within the inclusion 
+            window for an episode to be included. Episodes with fewer timesteps are filtered 
+            out. Defaults to 10. Set to None to disable this filter.
+        min_episode_len_hours (int, optional): Minimum ICU length of stay in hours for episode 
+            inclusion. Defaults to 48. Set to None to disable this filter.
+        max_episode_len_hours (int, optional): Maximum hours from admission to include in 
+            extracted data. Records after this time are excluded. Defaults to 48. Set to None 
+            to include all available records.
+        n_workers (int, optional): Number of parallel worker processes for data extraction. 
+            Each worker holds a tokenizer instance for text processing. Defaults to 1.
 
-        suffix (str): The data partition for which to extract data. Accepts 'train', 'val', or 'test'.
-        output_dir (str): The directory where the pickled data will be dumped. Saved as `{suffix}.pkl`.
-        max_episode_len_steps (int): The maximum number of records (timesteps) to include from within each ICU episode. 
-            These records are counted starting from the time of admission to ICU.
-        max_history_len_steps: The maximum number of records to include that predate admission to the ICU. These 
-            records are counted backwards starting from the time of admission to ICU. Defaults to 0.
-        min_episode_len_steps (int, optional): The minimum number of records that must exist in an ICU stay within the 
-            timeframe established by `max_episode_len_hours` if it was provided. If the number of records collected during that time is less than `min_episode_len_steps`, the episode is ignored. Defaults to 10. If None, there is no restriction on the number of records that must be present.
-        min_episode_episode_len_hours (int, optional): The minimum duration of an ICU stay, in hours, for it to be 
-            included in the dataset. Defaults to 48. If None, there is no restriction on the minimum length of ICU stay.
-        max_episode_len_hours (int, optional): The latest timestamp, in hours, which can be included in the extracted 
-            data. For example, if `max_episode_len_hours` is set to 48 (the default), only the records collected within the first 48 hours of the ICU stay are included. If None, all records will be included subject to the other restrictions.
-        n_workers (int, optional): The number of parallel worker processes to use for data extraction. If None, 
-            defaults to 1.
+    Raises:
+        ValueError: If reader.prediction_task is not 'all'.
+        FileNotFoundError: If extracting validation or test data before training data 
+            (standardization statistics are required).
+
+    Notes:
+        - Text features use sparse storage because most timesteps lack text data. The CSR-style
+          format stores only non-empty entries, reducing storage from O(n_episodes * max_ts_len * 
+          token_len) to O(n_non_empty * token_len).
+        - The output arrays are saved as separate .npy files to enable memory-mapped loading,
+          which allows multi-worker DataLoaders to share read-only memory efficiently.
+        - Value-associated data is resampled to hourly resolution before extraction.
+        - Length of stay targets are normalized relative to max_episode_len_hours (if set) or
+          the maximum observed timestamp.
     """
-    
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
-
+    
     if reader.prediction_task != 'all':
-        raise ValueError(f'reader.prediction_task: Expected "all", got {reader.prediction_task}')
-
+        raise ValueError(f"reader.prediction_task must be 'all', got {reader.prediction_task}")
+    
     total_episodes = len(reader.patient_episode_ids)
     max_ts_len = max_history_len_steps + max_episode_len_steps
-
-    # Set number of workers
+    
     if n_workers is None:
         n_workers = 1
     
     print(f"Processing {total_episodes} episodes using {n_workers} workers...")
-
-    # Create partial function with fixed arguments
+    sys.stdout.flush()
+    
+    # Get phenotype dimension
+    phenotype_dim = _get_phenotype_dim(reader.phenotypes_listfile)
+    
+    # Compute tensor dimensions
+    dims = _get_tensor_dimensions(
+        var_properties_path=var_properties_path,
+        valued_feats=reader.valued_feats,
+        event_feats=reader.event_feats,
+        text_feats=reader.text_feats,
+        static_feats=reader.static_feats,
+        max_ts_len=max_ts_len,
+        n_episodes=total_episodes,  # Will be updated after filtering
+        phenotype_dim=phenotype_dim
+    )
+    
+    # Convert dims to dict for pickling to workers
+    dims_dict = {
+        'n_episodes': dims.n_episodes,
+        'max_ts_len_val': dims.max_ts_len_val,
+        'max_ts_len_event': dims.max_ts_len_event,
+        'n_numeric_feats': dims.n_numeric_feats,
+        'n_categorical_feats': dims.n_categorical_feats,
+        'n_text_feats': dims.n_text_feats,
+        'n_event_feats': dims.n_event_feats,
+        'numeric_feat_dims': dims.numeric_feat_dims,
+        'categorical_feat_dims': dims.categorical_feat_dims,
+        'text_feat_dims': dims.text_feat_dims,
+        'static_feat_dims': dims.static_feat_dims,
+        'static_total_dim': dims.static_total_dim,
+        'phenotype_dim': dims.phenotype_dim,
+    }
+    
+    # Process episodes in parallel, collecting results
     process_fn = partial(
         _process_single_episode,
         reader=reader,
@@ -914,1006 +1373,302 @@ def extract_mimic(
         min_episode_len_steps=min_episode_len_steps,
         min_episode_len_hours=min_episode_len_hours
     )
-
-    # Process episodes in parallel with per-worker processor initialization
-    all_val_data = []
-    all_event_data = []
-    all_static_data = []
-    all_target_data = []
-    ids = []
-    n_episodes_ignored = 0
     
-    with mp.Pool(processes=n_workers, initializer=_init_worker, initargs=(max_ts_len,)) as pool:
+    # Collect results in a first pass to count surviving episodes
+    results = []
+    n_ignored = 0
+    
+    print("Pass 1: Processing episodes and filtering...")
+    sys.stdout.flush()
+    
+    with mp.Pool(
+        processes=n_workers,
+        initializer=_init_tensorized_worker,
+        initargs=(var_properties_path, reader.valued_feats, reader.event_feats,
+                  reader.text_feats, reader.static_feats, dims_dict)
+    ) as pool:
         for result in tqdm(
             pool.imap(process_fn, range(total_episodes), chunksize=10),
             total=total_episodes,
-            desc=f"Extracting {suffix} patient records from {reader.data_root_path}"
+            desc=f"Extracting {suffix}"
         ):
             if result is None:
-                n_episodes_ignored += 1
+                n_ignored += 1
             else:
-                i, val_data, event_data, static_data, targets = result
-                ids.append(i)
-                all_val_data.append(val_data)
-                all_event_data.append(event_data)
-                all_static_data.append(static_data)
-                all_target_data.append(targets)
-    print(f"Extracted records from {total_episodes-n_episodes_ignored} ICU stay episodes, ignored {n_episodes_ignored} "
-          f"episodes that didn't meet filtering criteria.")
-    sys.stdout.flush()
-
-    # Restrict the data to the patient-episode IDs that survived filtering
-    patient_episode_ids = np.array(reader.patient_episode_ids)[ids]
-    patient_episode_ids = patient_episode_ids.tolist()
+                results.append(result)
     
-    # Standardize the numeric value-associated data
-    # NOTE: Xu et al. standardized the training, validation, and test set data each with their own summary statistics,
-    # but instead I use the summary statistics from the training data for everything. This makes more sense because
-    # during inference with a deployed model we won't necessarily have summary statistics for new data, and we assume
-    # that the unseen data are sampled from the same distriubtion as the training data anyway. Even if we do have the
-    # summary statistics for the unseen data, the training set is larger and better approximates the true distribution.
-    summary_statistic_path = os.path.join(output_dir, 'summary_statistics_train.npz')
+    n_valid = len(results)
+    print(f"Extracted {n_valid} episodes, ignored {n_ignored} that didn't meet criteria.")
+    sys.stdout.flush()
+    
+    # Update dims with actual episode count
+    dims = TensorDimensions(
+        n_episodes=n_valid,
+        max_ts_len_val=dims.max_ts_len_val,
+        max_ts_len_event=dims.max_ts_len_event,
+        n_numeric_feats=dims.n_numeric_feats,
+        n_categorical_feats=dims.n_categorical_feats,
+        n_text_feats=dims.n_text_feats,
+        n_event_feats=dims.n_event_feats,
+        numeric_feat_dims=dims.numeric_feat_dims,
+        categorical_feat_dims=dims.categorical_feat_dims,
+        text_feat_dims=dims.text_feat_dims,
+        static_feat_dims=dims.static_feat_dims,
+        static_total_dim=dims.static_total_dim,
+        phenotype_dim=dims.phenotype_dim,
+    )
+    
+    # Allocate output arrays
+    print("Allocating output arrays...")
+    sys.stdout.flush()
+    arrays = _allocate_output_arrays(dims)
+    
+    # Insert results into arrays
+    print("Pass 2: Inserting data into arrays...")
+    sys.stdout.flush()
+    
+    valid_ids = []
+    for out_idx, ep in enumerate(tqdm(results, desc="Building arrays")):
+        valid_ids.append(reader.patient_episode_ids[ep.idx])
+        val_len = ep.val_len
+        event_len = ep.event_len
+        
+        if val_len > 0:
+            arrays['val_times'][out_idx, :val_len] = ep.val_times
+            arrays['val_masks'][out_idx, :val_len] = 1.0
+            arrays['val_numeric_indicators'][out_idx, :val_len, :] = ep.val_numeric_indicators
+            for f, vals in enumerate(ep.val_numeric_values):
+                arrays['val_numeric_values'][f][out_idx, :val_len, :] = vals
+            arrays['val_categorical_indicators'][out_idx, :val_len, :] = ep.val_categorical_indicators
+            for f, vals in enumerate(ep.val_categorical_values):
+                arrays['val_categorical_values'][f][out_idx, :val_len, :] = vals
+            arrays['val_text_indicators'][out_idx, :val_len, :] = ep.val_text_indicators
+            
+            # Sparse text
+            for f in range(dims.n_text_feats):
+                text_count = 0
+                for t in range(val_len):
+                    if ep.val_text_indicators[t, f] > 0:
+                        arrays['_text_values_lists'][f].append(ep.val_text_values[f][t])
+                        arrays['_text_masks_lists'][f].append(ep.val_text_masks[f][t])
+                        arrays['_text_timesteps_lists'][f].append(t)
+                        text_count += 1
+                arrays['_text_counts'][f].append(text_count)
+        else:
+            for f in range(dims.n_text_feats):
+                arrays['_text_counts'][f].append(0)
+        
+        if event_len > 0:
+            arrays['event_times'][out_idx, :event_len] = ep.event_times
+            arrays['event_masks'][out_idx, :event_len] = 1.0
+            arrays['event_indicators'][out_idx, :event_len, :] = ep.event_indicators
+        
+        arrays['static_data'][out_idx, :] = ep.static_data
+        arrays['mortality'][out_idx] = ep.mortality
+        arrays['length_of_stay'][out_idx] = ep.length_of_stay
+        arrays['phenotype'][out_idx, :] = ep.phenotype
+    
+    # Finalize sparse text storage
+    print("Finalizing sparse text storage...")
+    sys.stdout.flush()
+    (val_text_offsets, val_text_values, 
+     val_text_masks, val_text_timesteps) = _finalize_sparse_text(arrays, dims)
+    
+    # Free results memory
+    del results
+    gc.collect()
+    
+    # Standardize numeric features
+    summary_stats_path = os.path.join(output_dir, 'summary_statistics_train.npz')
     if suffix == 'train':
-        print(f"Calculating smmary statistics...", flush=True)
+        print("Computing and applying standardization...")
         sys.stdout.flush()
-        # Calculate summary statistics for the training set data and write to disk
-        all_val_data = standardize_feats(all_val_data, save_path=summary_statistic_path)
+        standardize_feats(arrays, dims, save_path=summary_stats_path)
     else:
-        if not os.path.exists(summary_statistic_path):
+        if not os.path.exists(summary_stats_path):
             raise FileNotFoundError(
-                'Validation and test set data are standardized with summary statistics calculated from the training '
-                'set data, but summary_statistics_train.npz was not found. Please run the training data extraction '
-                'first to generate the summary statistics.'
+                "summary_statistics_train.npz not found. Run training extraction first."
             )
-        print(f"Loading and applying summary statistics...", flush=True)
+        print("Loading and applying standardization...")
         sys.stdout.flush()
-        # Standardize the validation and test set data using the summary statistics calculated from the training set
-        all_val_data = standardize_feats(all_val_data, load_path=summary_statistic_path)
-
-    # Write to disk
-    file_out = os.path.join(output_dir, f'{suffix}.pkl')
-
-    with open(file_out, 'wb') as f_out:
-        patient_episodes = {
-            'id': patient_episode_ids,
-            'val_data': all_val_data,
-            'event_data': all_event_data,
-            'static_data': all_static_data,
-            'targets': all_target_data
-        }
-        pickle.dump(patient_episodes, f_out)
-    print(f"Extracted {suffix} data written to {file_out}\n")
+        standardize_feats(arrays, dims, load_path=summary_stats_path)
+    
+    # Create dataset and save
+    print("Saving dataset...")
+    sys.stdout.flush()
+    
+    # Create dataset with sparse text
+    dataset = MixedDataset(
+        val_numeric_indicators=arrays['val_numeric_indicators'],
+        val_numeric_values=arrays['val_numeric_values'],
+        val_categorical_indicators=arrays['val_categorical_indicators'],
+        val_categorical_values=arrays['val_categorical_values'],
+        val_text_indicators=arrays['val_text_indicators'],
+        val_times=arrays['val_times'],
+        val_masks=arrays['val_masks'],
+        # Sparse text
+        val_text_offsets=val_text_offsets,
+        val_text_values=val_text_values,
+        val_text_masks=val_text_masks,
+        val_text_timesteps=val_text_timesteps,
+        # Event data
+        event_indicators=arrays['event_indicators'],
+        event_times=arrays['event_times'],
+        event_masks=arrays['event_masks'],
+        # Static and targets
+        static_data=arrays['static_data'],
+        mortality=arrays['mortality'],
+        length_of_stay=arrays['length_of_stay'],
+        phenotype=arrays['phenotype'],
+        # Metadata
+        max_ts_len=dims.max_ts_len_val,
+        text_token_len=dims.text_feat_dims,
+    )
+    
+    output_path = os.path.join(output_dir, f'{suffix}')
+    save_dataset(dataset, output_path)
+    
+    # Also save IDs for reference
+    ids_path = os.path.join(output_dir, f'{suffix}_ids.pkl')
+    with open(ids_path, 'wb') as f:
+        pickle.dump(valid_ids, f)
+    
+    print(f"Tensorized {suffix} data saved to {output_path}")
+    print(f"Episode IDs saved to {ids_path}\n")
 
 
 def prepare_dataloaders(
     data_dir: str,
     batch_size: int,
-    pretrain_ratio: Optional[float] = None,
-    collate_fn: Optional[callable] = None
+    num_workers: int = 4,
+    pin_memory: bool = True,
+    prefetch_factor: int = 2,
+    balance_text: bool = False,
+    world_size: Optional[int] = None,
+    rank: Optional[int] = None
 ) -> List[DataLoader]:
-    """Prepare training, validation, and test dataloaders for the MIMIC dataset.
+    """Prepare training, (validation), and test DataLoaders for MixedDataset.
+
+    This function creates PyTorch DataLoader instances for `MixedDataset` objects prepared by 
+    `extract_mimic()`. The dataset uses memory-mapped numpy arrays for efficient multi-worker 
+    access with minimal memory overhead. Workers share read-only memory-mapped arrays rather 
+    than duplicating data in each worker process' memory space.
+
+    The function loads pre-extracted datasets from `{data_dir}/{partition}/` directories, where 
+    each directory contains:
+        - Dense arrays for feature indicators, times, and masks
+        - Per-feature .npy arrays for numeric and categorical feature values
+        - Sparse arrays in CSR-style format for text features
+        - metadata.pkl with dimension information
     
-    This function prepares training, validation, and test dataloaders for the MIMIC dataset. The function loads the
-    .pkl files containing the extracted data, constructs PyTorch Dataset instances from the data, and creates DataLoader
-    instances for each data partition. The function returns the training, validation, and test Dataloaders in a list.
+    Dataloaders are configured for efficient GPU training with configurable worker processes, 
+    memory pinning, and batch prefetching. The training loader shuffles data while validation 
+    and test loaders maintain sequential order.
+
+    For distributed training with text features, the optional `balance_text` parameter enables
+    text-balanced sampling across ranks for all partitions (train, val, test). This prevents 
+    memory imbalance where one GPU receives all text-heavy episodes and OOMs while others have 
+    light batches. Within each meta-batch (batch_size * world_size samples), episodes are sorted 
+    by text density and distributed via round-robin to ensure each rank gets a mix of text-heavy 
+    and text-light episodes. For training data, global shuffling is preserved - only 
+    within-meta-batch distribution is deterministic. For validation and test data, ordering is 
+    deterministic but balanced across ranks.
+
+    The function supports three modes:
+        1. Single-GPU: No sampler, standard shuffling for train
+        2. Multi-GPU without balancing: Use accelerator.prepare_data_loader() after calling this
+        3. Multi-GPU with balancing: Pass balance_text=True with world_size and rank
+
+    In multi-GPU setups, a good rule of thumb is to have at least num_workers * num_gpus CPUs, 
+    and double that if possible.
 
     Args:
-        data_dir (str): The directory containing the .pkl files extracted from the MIMIC dataset.
-        batch_size (int): The batch size for the DataLoader instances.
-        pretrain_ratio (float, optional): The ratio of the training data to use for pretraining. If `None`, no 
-            pretraining is performed.
-        collate_fn (callable, optional): A function to merge a list of samples to form a mini-batch. If `None`, the 
-            default PyTorch collate function is used.
-    
-    Returns:
-        List[DataLoader]: A list containing the training, validation, and test Dataloaders.
-    
-    """
-
-    datasets = {}
-
-    for partition in ['train', 'val', 'test']:
-        # If validation data is not available, set the validation dataset to None.
-        # In this case, there will be no validation dataloader in the dataloader_list output from this function.
-        # If training or test data are not available, raise an exception.
-        data_file = f'{data_dir}/{partition}.pkl'
-        if not os.path.exists(data_file):
-            if partition != 'val':
-                raise FileNotFoundError(f'{partition}.pkl not found in {data_dir}.')
-            else:
-                datasets['val'] = None
-                continue
-        
-        with open(data_file, 'rb') as f_in:
-            patient_episodes = pickle.load(f_in)
-
-        ds = MixedDataset(
-            id=patient_episodes['id'],
-            val_data=patient_episodes['val_data'],
-            event_data=patient_episodes['event_data'],
-            static_data=patient_episodes['static_data'],
-            targets=patient_episodes['targets']
-        )
-
-        datasets[partition] = ds
-
-    datasets_list = []
-
-    if pretrain_ratio is not None:
-        pretrain_size = int(pretrain_ratio * len(datasets_list['train']))  # Floor
-        pretrain_dataset, train_dataset = train_test_split(datasets['train'], train_size=pretrain_size, random_state=42)
-        datasets_list.append(pretrain_dataset)
-        datasets_list.append(train_dataset)
-    else:
-        datasets_list.append(datasets['train'])
-    
-    if datasets['val'] is not None:
-        datasets_list.append(datasets['val'])
-    
-    datasets_list.append(datasets['test'])
-
-    dataloader_list = []
-    for ds in datasets_list:
-        dataloader_list.append(
-            DataLoader(
-                ds, 
-                batch_size=batch_size,
-                shuffle=True,
-                collate_fn=collate_fn
-            )
-        )
-
-    return dataloader_list
-
-
-def prepare_dataloaders_hdf5(
-    data_dir: str,
-    batch_size: int,
-    preload: bool = True,
-    pretrain_ratio: Optional[float] = None,
-    collate_fn: Optional[callable] = None,
-    num_workers: int = 0,
-    pin_memory: bool = False,
-    prefetch_factor: int = 2
-) -> List:
-    """
-    Prepare training, validation, and test dataloaders using HDF5 datasets.
-    
-    This is a drop-in replacement for prepare_dataloaders that uses HDF5 files instead of pickle files, which is far more efficient for large datasets.
-    
-    Args:
-        data_dir (str): Directory containing .h5 files
-        batch_size (int): Batch size for DataLoader
-        preload (bool): If True (default), load all data into RAM at initialization. Much faster than pickle and 
-            eliminates per-batch I/O. Set to False only if RAM is limited.
-        pretrain_ratio (float): Ratio of training data for pretraining (not yet supported)
-        collate_fn (callable): Custom collate function
-        num_workers (int): Number of worker processes for data loading. With preload=True, workers share data via 
-            copy-on-write after fork.
-        pin_memory (bool): Whether to pin memory for faster GPU transfer
-        prefetch_factor (int): Number of batches to prefetch per worker
+        data_dir (str): Directory containing 'train/', 'val/', and 'test/' subdirectories. Each 
+            subdirectory should be the output of `extract_mimic()`.
+        batch_size (int): Number of samples per batch (per GPU in distributed settings).
+        num_workers (int, optional): Number of worker processes for data loading. Defaults to 4.
+        pin_memory (bool, optional): Whether to pin memory in DataLoader for faster GPU transfers. 
+            Defaults to True. Only effective if num_workers > 0.
+        prefetch_factor (int, optional): Number of batches to prefetch per worker. Defaults to 2. 
+            Higher values increase memory usage but can improve throughput if batch processing by 
+            the model is slower than data loading. Only effective if num_workers > 0.
+        balance_text (bool, optional): If True and running distributed (world_size > 1), use 
+            TextBalancedDistributedSampler to balance text density across ranks for all partitions.
+            This prevents memory imbalance in distributed training with sparse text data. 
+            Defaults to False. When False, no distributed sampler is added - use 
+            accelerator.prepare_data_loader() to add standard distributed sampling.
+        world_size (int, optional): Number of distributed processes. Required if balance_text=True.
+            Can be obtained from accelerator.num_processes.
+        rank (int, optional): Current process rank. Required if balance_text=True. Can be obtained 
+            from accelerator.process_index.
         
     Returns:
-        List of DataLoader instances
+        List[DataLoader]: List of DataLoaders in order: [train_loader, val_loader (if available), 
+            test_loader]. If validation data are not found, only [train_loader, test_loader] is 
+            returned.
+    
+    Raises:
+        FileNotFoundError: If 'train/' or 'test/' directories are not found in `data_dir`.
+        ValueError: If balance_text=True but world_size or rank is not provided.
+    
+    Note:
+        When using balance_text=True:
+        - Do NOT wrap the returned dataloaders with accelerator.prepare_data_loader() as the 
+          custom sampler already handles distributed sampling.
+        - Call train_loader.sampler.set_epoch(epoch) at the start of each training epoch to 
+          ensure proper shuffling.
+        
+        When using balance_text=False for distributed training:
+        - Wrap dataloaders with accelerator.prepare_data_loader() to add distributed sampling.
     """
+    if balance_text and (world_size is None or rank is None):
+        raise ValueError("world_size and rank are required when balance_text=True")
     
-    if pretrain_ratio is not None:
-        raise NotImplementedError(
-            "pretrain_ratio is not yet supported with HDF5 datasets. "
-            "Consider creating separate pretrain/train HDF5 files."
-        )
-    
-    datasets = {}
+    dataloaders = []
     
     for partition in ['train', 'val', 'test']:
-        h5_path = os.path.join(data_dir, f'{partition}.h5')
+        dataset_path = os.path.join(data_dir, partition)
         
-        if not os.path.exists(h5_path):
+        if not os.path.exists(dataset_path):
             if partition == 'val':
-                datasets['val'] = None
                 continue
             else:
-                raise FileNotFoundError(f'{partition}.h5 not found in {data_dir}')
+                raise FileNotFoundError(f'{partition}/ not found in {data_dir}')
         
-        datasets[partition] = HDF5Dataset(h5_path, preload=preload)
-    
-    datasets_list = [datasets['train']]
-    
-    if datasets['val'] is not None:
-        datasets_list.append(datasets['val'])
-    
-    datasets_list.append(datasets['test'])
-    
-    dataloader_list = []
-    for ds in datasets_list:
-        dataloader_list.append(
-            DataLoader(
-                ds,
+        dataset = load_dataset(dataset_path)
+        
+        # Determine sampler and shuffle behavior
+        sampler = None
+        shuffle = (partition == 'train')
+        
+        # Only add balanced sampler if explicitly requested AND distributed
+        if balance_text and world_size is not None and world_size > 1:
+            text_counts = get_text_counts_from_dataset_vectorized(dataset)
+            sampler = TextBalancedDistributedSampler(
+                dataset=dataset,
+                text_counts=text_counts,
                 batch_size=batch_size,
-                shuffle=True,
-                collate_fn=collate_fn,
-                num_workers=num_workers,
-                pin_memory=pin_memory,
-                prefetch_factor=prefetch_factor if num_workers > 0 else None,
-                persistent_workers=num_workers > 0
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=shuffle,  # True for train, False for val/test
+                drop_last=False
             )
-        )
-    
-    return dataloader_list
-
-
-def _cast_input_tensors(res_dict: dict) -> dict:
-    """
-    Cast tensors to appropriate types (float, long, etc.) based on their semantic meaning.
-    
-    Args:
-        res_dict: Dictionary containing nested tensors
+            shuffle = False  # Sampler handles shuffling
         
-    Returns:
-        Dictionary with tensors cast to appropriate types
-    """
-    for key, value in res_dict.items():
-        if isinstance(value, dict):
-            for subkey, subvalue in value.items():
-                if isinstance(subvalue, dict):
-                    # Handle 3rd level nesting (val_data -> numeric/categorical/text -> indicators/values/masks)
-                    for subsubkey, subsubvalue in subvalue.items():
-                        if isinstance(subsubvalue, torch.Tensor):
-                            # Special handling for text data - keep token IDs and masks as integers
-                            if subkey == 'text' and subsubkey in ['values', 'masks']:
-                                res_dict[key][subkey][subsubkey] = subsubvalue.long()
-                            # Special handling for categorical data - keep values as integers
-                            elif subkey == 'categorical' and subsubkey == 'values':
-                                res_dict[key][subkey][subsubkey] = subsubvalue.long()
-                            else:
-                                res_dict[key][subkey][subsubkey] = subsubvalue.float()
-                        elif isinstance(subsubvalue, list):
-                            # Handle lists of tensors
-                            if subkey == 'text' and subsubkey in ['values', 'masks']:
-                                res_dict[key][subkey][subsubkey] = [t.long() for t in subsubvalue if isinstance(t, torch.Tensor)]
-                            elif subkey == 'categorical' and subsubkey == 'values':
-                                res_dict[key][subkey][subsubkey] = [t.long() for t in subsubvalue if isinstance(t, torch.Tensor)]
-                            else:
-                                res_dict[key][subkey][subsubkey] = [t.float() for t in subsubvalue if isinstance(t, torch.Tensor)]
-                elif isinstance(subvalue, torch.Tensor):
-                    # Handle targets - mortality and phenotype should remain float, length_of_stay can be float
-                    res_dict[key][subkey] = subvalue.float()
-                elif isinstance(subvalue, list):
-                    res_dict[key][subkey] = [t.float() for t in subvalue if isinstance(t, torch.Tensor)]
-        elif isinstance(value, torch.Tensor):
-            res_dict[key] = value.float()
-    
-    return res_dict
-
-
-def _input_tensors_to_device(res_dict: dict, device: Union[torch.device, str]) -> dict:
-    """
-    Move all tensors in the nested dictionary to the specified device.
-    
-    Args:
-        res_dict: Dictionary containing nested tensors
-        device: Target device for tensors
-        
-    Returns:
-        Dictionary with all tensors moved to the specified device
-    """
-    for key, value in res_dict.items():
-        if isinstance(value, dict):
-            for subkey, subvalue in value.items():
-                if isinstance(subvalue, dict):
-                    # Handle 3rd level nesting (val_data -> numeric/categorical/text -> indicators/values/masks)
-                    for subsubkey, subsubvalue in subvalue.items():
-                        if isinstance(subsubvalue, torch.Tensor):
-                            res_dict[key][subkey][subsubkey] = subsubvalue.to(device)
-                        elif isinstance(subsubvalue, list):
-                            # Handle lists of tensors
-                            res_dict[key][subkey][subsubkey] = [t.to(device) for t in subsubvalue if isinstance(t, torch.Tensor)]
-                elif isinstance(subvalue, torch.Tensor):
-                    res_dict[key][subkey] = subvalue.to(device)
-                elif isinstance(subvalue, list):
-                    res_dict[key][subkey] = [t.to(device) for t in subvalue if isinstance(t, torch.Tensor)]
-        elif isinstance(value, torch.Tensor):
-            res_dict[key] = value.to(device)
-    
-    return res_dict
-
-
-def prepare_input_tensors(batch: MixedDataset, device) -> MixedTensorDataset:
-
-    # Final shapes are stated in comments
-    res_dict = {
-        'val_data': {
-            'numeric': {
-                'indicators': [],  # (batch_size, max_ts_len, n_numeric_features) tensor
-                'values': []  # List of (batch_size, max_ts_len, feature_dim) tensors x n_numeric_features
-            },
-            'categorical': {
-                'indicators': [],  # (batch_size, max_ts_len, n_categorical_features) tensor
-                'values': []  # List of (batch_size, max_ts_len, feature_dim) tensors x n_categorical_features
-            },
-            'text': {
-                'indicators': [],  # (batch_size, max_ts_len, n_text_features) tensor
-                'values': [],  # List of (batch_size, max_ts_len, feature_dim) tensors x n_text_features
-                'masks': []  # List of (batch_size, max_ts_len, feature_dim) tensors x n_text_features
-            },
-            'times': [],  # (batch_size, max_ts_len) tensor
-            'masks': []  # (batch_size, max_ts_len) tensor
-        },
-        'event_data': {
-            'indicators': [],  # (batch_size, max_ts_len, n_event_features) tensor
-            'times': [],  # (batch_size, max_ts_len) tensor
-            'masks': []  # (batch_size, max_ts_len) tensor
-        },
-        'static_data': [], # (batch_size, total_static_feature_dim) tensor
-        'targets': {
-            'mortality': [],  # (batch_size, 1) tensor
-            'length_of_stay': [],  # (batch_size, 1) tensor
-            'phenotype': []  # (batch_size, n_phenotypes) tensor
-        }
-    }
-
-    # Prepare the value-associated data
-    max_ts_len = len(batch['val_data']['times'])  # Max timeseries length for value-associated data
-    for key in res_dict['val_data'].keys():
-        data = batch['val_data'][key]
-        if key in ['numeric', 'categorical', 'text']:
-            n_feats = len(data['indicators'][0])  # Number of features in the value-associated data
-            ind_data = data['indicators']
-            val_data = data['values']
-            msk_data = data.get('masks', None)  # Masks are only present for text features
-            for f in range(n_feats):
-                # Stack the feature tensors across timesteps
-                # ind_tnsr shape: (batch_size, max_ts_len, 1)
-                # val_tnsr shape: (batch_size, max_ts_len, feature_dim)
-                ind_tnsr = torch.stack([ind_data[t][f] for t in range(max_ts_len)], dim=1)
-                val_tnsr = torch.stack([val_data[t][f] for t in range(max_ts_len)], dim=1)
-                res_dict['val_data'][key]['indicators'].append(ind_tnsr)  # Still needs to be concatenated
-                res_dict['val_data'][key]['values'].append(val_tnsr)
-                if msk_data is not None:
-                    msk_tnsr = torch.stack([msk_data[t][f] for t in range(max_ts_len)], dim=1)
-                    res_dict['val_data'][key]['masks'].append(msk_tnsr)
-            # Concatenate the feature indicator tensors across features
-            # resulting shape: (batch_size, max_ts_len, n_features)
-            if res_dict['val_data'][key]['indicators']:
-                res_dict['val_data'][key]['indicators'] = torch.cat(res_dict['val_data'][key]['indicators'], dim=2)
-            else:
-                batch_size = batch['val_data']['times'][0].shape[0]
-                # Create a dummy empty tensor if there are no features of this type
-                res_dict['val_data'][key]['indicators'] = torch.empty((batch_size, max_ts_len, 0))
-        elif key in ['times', 'masks']:
-            res_dict['val_data'][key] = torch.cat(data, dim=1)  # Shape: (batch_size, max_ts_len)
-
-    # Prepare the event-associated data
-    max_ts_len = len(batch['event_data']['times'])  # Max timeseries length for event-associated data
-    n_feats = len(batch['event_data']['indicators'][0])  # Number of event-associated features
-    for f in range(n_feats):
-        # Stack the feature tensors across timesteps
-        # ind_tnsr shape: (batch_size, max_ts_len, 1)
-        ind_data = batch['event_data']['indicators']
-        ind_tnsr = torch.stack([ind_data[t][f] for t in range(max_ts_len)], dim=1)
-        res_dict['event_data']['indicators'].append(ind_tnsr)
-    # Concatenate the feature indicator tensors across features
-    # resulting shape: (batch_size, max_ts_len, n_event_features)
-    if res_dict['event_data']['indicators']:
-        res_dict['event_data']['indicators'] = torch.cat(res_dict['event_data']['indicators'], dim=2)
-    else:
-        batch_size = batch['event_data']['times'][0].shape[0]
-        # Create a dummy empty tensor if there are no event-associated features
-        res_dict['event_data']['indicators'] = torch.empty((batch_size, max_ts_len, 0))
-    res_dict['event_data']['times'] = torch.cat(batch['event_data']['times'], dim=1)  # Shape: (batch_size, max_ts_len)
-    res_dict['event_data']['masks'] = torch.cat(batch['event_data']['masks'], dim=1)  # Shape: (batch_size, max_ts_len)
-
-    # Prepare the static data
-    res_dict['static_data'] = torch.cat(batch['static_data'], dim=1)  # Shape: (batch_size, total_feature_dim)
-
-    # Prepare the target data
-    trgt_data = batch['targets']
-    res_dict['targets']['mortality'] = trgt_data['mortality'].reshape(-1, 1)  # Shape: (batch_size, 1)
-    res_dict['targets']['length_of_stay'] = trgt_data['length_of_stay'].reshape(-1, 1)  # Shape: (batch_size, 1)
-    res_dict['targets']['phenotype'] = trgt_data['phenotype']  # Shape: (batch_size, n_phenotypes)
-
-    # Cast tensors to appropriate types and move to the specified device
-    res_dict = _cast_input_tensors(res_dict)
-    if device is not None:
-        res_dict = _input_tensors_to_device(res_dict, device)
-            
-    return res_dict
-
-
-def collate_as_tensors(
-    batch: List[tuple],
-    device: Optional[Union[torch.device, str]] = None
-) -> MixedTensorDataset:
-    
-    """Device-aware collation of a batch of instances from a MixedDataset.
-    
-    This function collates a batch of instances from a `MixedDataset` into a `MixedTensorDataset` and moves it to the specified device.
-
-    Args:
-        batch (List[tuple]): A list of instances from `MixedDataset.__getitem__()`, where each tuple contains
-            `(val_data, event_data, static_data, targets)`.
-        device: Target device for the collated batch. If `None`, the batch is kept on CPU.
-    
-    """
-
-    batch = default_collate(batch)
-    prepared_batch = prepare_input_tensors(batch, device)
-
-    return prepared_batch
-
-
-
-
-def _get_feature_dims_from_config(
-    var_properties_path: str,
-    valued_feats: List[str],
-    event_feats: List[str],
-    text_feats: List[str],
-    static_feats: List[str],
-    max_ts_len_val: int,
-    max_ts_len_event: int,
-    max_token_length: int,
-    phenotype_dim: int
-) -> Dict:
-    """
-    Derive feature dimensions from configuration files.
-    
-    Args:
-        var_properties_path: Path to variable_properties.yaml
-        valued_feats: List of value-associated feature names
-        event_feats: List of event-associated feature names  
-        text_feats: List of text feature names
-        static_feats: List of static feature names
-        max_ts_len_val: Maximum timeseries length for value-associated data
-        max_ts_len_event: Maximum timeseries length for event-associated data
-        max_token_length: Maximum token sequence length for text features
-        phenotype_dim: Number of phenotype labels
-        
-    Returns:
-        Dictionary with all dimension information for HDF5 pre-allocation
-    """
-    with open(var_properties_path, 'r') as f:
-        var_properties = yaml.safe_load(f)
-    
-    # Separate valued_feats into numeric, categorical, text based on their types
-    numeric_feats = []
-    categorical_feats = []
-    for feat in valued_feats:
-        feat_type = var_properties[feat]['type']
-        if feat_type == 'numeric':
-            numeric_feats.append(feat)
-        elif feat_type == 'categorical':
-            categorical_feats.append(feat)
-    
-    # Get dimensions for numeric features
-    n_numeric_feats = len(numeric_feats)
-    numeric_feat_dims = [var_properties[f]['size'] for f in numeric_feats]
-    
-    # Get dimensions for categorical features
-    n_categorical_feats = len(categorical_feats)
-    categorical_feat_dims = [var_properties[f]['size'] for f in categorical_feats]
-    
-    # Get dimensions for text features (token sequences)
-    n_text_feats = len(text_feats)
-    text_feat_dims = [max_token_length for _ in text_feats]
-    
-    # Get dimensions for event features (indicators only, size is always 1)
-    n_event_feats = len(event_feats)
-    
-    # Get dimensions for static features
-    static_feat_dims = []
-    for feat in static_feats:
-        feat_type = var_properties[feat]['type']
-        if feat_type == 'text':
-            static_feat_dims.append(max_token_length)
-        else:
-            static_feat_dims.append(var_properties[feat]['size'])
-    static_total_dim = sum(static_feat_dims)
-    
-    return {
-        'max_ts_len_val': max_ts_len_val,
-        'max_ts_len_event': max_ts_len_event,
-        'n_numeric_feats': n_numeric_feats,
-        'n_categorical_feats': n_categorical_feats,
-        'n_text_feats': n_text_feats,
-        'n_event_feats': n_event_feats,
-        'numeric_feat_dims': numeric_feat_dims,
-        'categorical_feat_dims': categorical_feat_dims,
-        'text_feat_dims': text_feat_dims,
-        'static_total_dim': static_total_dim,
-        'static_feat_dims': static_feat_dims,
-        'phenotype_dim': phenotype_dim,
-    }
-
-
-def _get_phenotype_dim_from_listfile(phenotypes_listfile: str) -> int:
-    """
-    Get the number of phenotype labels from the phenotype listfile header.
-    
-    Args:
-        phenotypes_listfile: Path to phenotyping_<partition>_listfile.csv
-        
-    Returns:
-        Number of phenotype columns (excludes 'stay' and 'period_length' columns)
-    """
-    with open(phenotypes_listfile, 'r') as f:
-        header = f.readline().strip()
-    columns = header.split(',')
-    # Header format: "stay,period_length,<phenotype1>,<phenotype2>,..."
-    # Subtract 2 for 'stay' and 'period_length' columns
-    return len(columns) - 2
-
-
-def _write_to_hdf5(
-    h5_path: str,
-    patient_episode_ids: List,
-    all_val_data: List[Dict],
-    all_event_data: List[Dict],
-    all_static_data: List[List],
-    all_target_data: List[Dict],
-    dims: Dict,
-    compression: str = 'gzip',
-    compression_opts: int = 4
-) -> None:
-    """
-    Write extracted episode data to HDF5 format using hybrid sparse storage.
-    
-    Numeric, categorical, and event features are stored without right-padding.
-    Text features are stored sparsely (only timesteps with actual text).
-    This dramatically reduces storage requirements while maintaining fast loading.
-    
-    Args:
-        h5_path: Output path for the HDF5 file
-        patient_episode_ids: List of episode IDs
-        all_val_data: List of value-associated data dicts
-        all_event_data: List of event-associated data dicts
-        all_static_data: List of static data lists
-        all_target_data: List of target dicts
-        dims: Dictionary with pre-computed dimension information
-        compression: Compression algorithm ('gzip', 'lzf', or None)
-        compression_opts: Compression level (1-9 for gzip)
-    """
-    
-    n_episodes = len(patient_episode_ids)
-    
-    print(f"Preparing sparse storage for {n_episodes} episodes...")
-    sys.stdout.flush()
-    
-    # First pass: count real timesteps and text occurrences to pre-allocate arrays
-    val_episode_lengths = []
-    event_episode_lengths = []
-    text_counts = [[] for _ in range(dims['n_text_feats'])]  # Per-feature counts per episode
-    
-    for i in range(n_episodes):
-        val_data = all_val_data[i]
-        event_data = all_event_data[i]
-        
-        # Count real (non-padded) timesteps for val_data by checking masks
-        val_real_len = sum(1 for t in range(len(val_data['masks'])) if val_data['masks'][t][0] == 1)
-        val_episode_lengths.append(val_real_len)
-        
-        # Count real timesteps for event_data
-        event_real_len = sum(1 for t in range(len(event_data['masks'])) if event_data['masks'][t][0] == 1)
-        event_episode_lengths.append(event_real_len)
-        
-        # Count text occurrences per feature (within real timesteps only)
-        for f in range(dims['n_text_feats']):
-            text_count = 0
-            for t in range(val_real_len):
-                if val_data['text']['indicators'][t][f][0] == 1:
-                    text_count += 1
-            text_counts[f].append(text_count)
-    
-    # Compute offsets
-    val_offsets = np.zeros(n_episodes + 1, dtype=np.int64)
-    val_offsets[1:] = np.cumsum(val_episode_lengths)
-    total_val_timesteps = val_offsets[-1]
-    
-    event_offsets = np.zeros(n_episodes + 1, dtype=np.int64)
-    event_offsets[1:] = np.cumsum(event_episode_lengths)
-    total_event_timesteps = event_offsets[-1]
-    
-    text_offsets = []
-    total_text_occurrences = []
-    for f in range(dims['n_text_feats']):
-        offsets = np.zeros(n_episodes + 1, dtype=np.int64)
-        offsets[1:] = np.cumsum(text_counts[f])
-        text_offsets.append(offsets)
-        total_text_occurrences.append(offsets[-1])
-    
-    print(f"  Total val timesteps (unpadded): {total_val_timesteps} "
-          f"(vs {n_episodes * dims['max_ts_len_val']} if dense)")
-    print(f"  Total event timesteps (unpadded): {total_event_timesteps} "
-          f"(vs {n_episodes * dims['max_ts_len_event']} if dense)")
-    for f in range(dims['n_text_feats']):
-        print(f"  Total text occurrences (feature {f}): {total_text_occurrences[f]} "
-              f"(vs {total_val_timesteps} if dense within unpadded)")
-    sys.stdout.flush()
-    
-    # Compression settings
-    comp_kwargs = {}
-    if compression:
-        comp_kwargs = {'compression': compression, 'compression_opts': compression_opts}
-    
-    print(f"Writing to {h5_path}...")
-    sys.stdout.flush()
-    
-    with h5py.File(h5_path, 'w') as h5f:
-        # Store metadata
-        meta = h5f.create_group('metadata')
-        meta.attrs['n_episodes'] = n_episodes
-        meta.attrs['total_val_timesteps'] = total_val_timesteps
-        meta.attrs['total_event_timesteps'] = total_event_timesteps
-        for key, value in dims.items():
-            if isinstance(value, list):
-                meta.create_dataset(key, data=np.array(value, dtype=np.int32))
-            else:
-                meta.attrs[key] = value
-        
-        # Store IDs
-        if len(patient_episode_ids) > 0 and isinstance(patient_episode_ids[0], str):
-            dt = h5py.special_dtype(vlen=str)
-            h5f.create_dataset('ids', data=patient_episode_ids, dtype=dt)
-        else:
-            h5f.create_dataset('ids', data=np.array(patient_episode_ids))
-        
-        # Create val_data group
-        val_grp = h5f.create_group('val_data')
-        val_grp.create_dataset('episode_offsets', data=val_offsets)
-        val_grp.create_dataset('times', shape=(total_val_timesteps,), dtype=np.float32, **comp_kwargs)
-        
-        # Numeric
-        if dims['n_numeric_feats'] > 0:
-            numeric_grp = val_grp.create_group('numeric')
-            numeric_grp.create_dataset(
-                'indicators', 
-                shape=(total_val_timesteps, dims['n_numeric_feats']), 
-                dtype=np.uint8, 
-                **comp_kwargs
-            )
-            for f, feat_dim in enumerate(dims['numeric_feat_dims']):
-                numeric_grp.create_dataset(
-                    f'values_{f}',
-                    shape=(total_val_timesteps, feat_dim),
-                    dtype=np.float32,
-                    **comp_kwargs
-                )
-        
-        # Categorical
-        if dims['n_categorical_feats'] > 0:
-            categorical_grp = val_grp.create_group('categorical')
-            categorical_grp.create_dataset(
-                'indicators',
-                shape=(total_val_timesteps, dims['n_categorical_feats']),
-                dtype=np.uint8,
-                **comp_kwargs
-            )
-            for f, feat_dim in enumerate(dims['categorical_feat_dims']):
-                categorical_grp.create_dataset(
-                    f'values_{f}',
-                    shape=(total_val_timesteps, feat_dim),
-                    dtype=np.int32,
-                    **comp_kwargs
-                )
-        
-        # Text (sparse within unpadded timesteps)
-        if dims['n_text_feats'] > 0:
-            text_grp = val_grp.create_group('text')
-            text_grp.create_dataset(
-                'indicators',
-                shape=(total_val_timesteps, dims['n_text_feats']),
-                dtype=np.uint8,
-                **comp_kwargs
-            )
-            for f, feat_dim in enumerate(dims['text_feat_dims']):
-                feat_grp = text_grp.create_group(f'feat_{f}')
-                feat_grp.create_dataset('episode_offsets', data=text_offsets[f])
-                feat_grp.create_dataset(
-                    'values',
-                    shape=(total_text_occurrences[f], feat_dim),
-                    dtype=np.int32,
-                    **comp_kwargs
-                )
-                feat_grp.create_dataset(
-                    'masks',
-                    shape=(total_text_occurrences[f], feat_dim),
-                    dtype=np.uint8,
-                    **comp_kwargs
-                )
-                # Store which timestep (relative to episode start) each text occurrence belongs to
-                feat_grp.create_dataset(
-                    'timestep_indices',
-                    shape=(total_text_occurrences[f],),
-                    dtype=np.int32,
-                    **comp_kwargs
-                )
-        
-        # Event data group
-        event_grp = h5f.create_group('event_data')
-        event_grp.create_dataset('episode_offsets', data=event_offsets)
-        event_grp.create_dataset('times', shape=(total_event_timesteps,), dtype=np.float32, **comp_kwargs)
-        if dims['n_event_feats'] > 0:
-            event_grp.create_dataset(
-                'indicators',
-                shape=(total_event_timesteps, dims['n_event_feats']),
-                dtype=np.uint8,
-                **comp_kwargs
-            )
-        
-        # Static data (dense, one per episode)
-        h5f.create_dataset(
-            'static_data',
-            shape=(n_episodes, dims['static_total_dim']),
-            dtype=np.float32,
-            **comp_kwargs
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle if sampler is None else False,
+            sampler=sampler,
+            collate_fn=collate_tensorized,
+            num_workers=num_workers,
+            pin_memory=pin_memory if num_workers > 0 else False,
+            prefetch_factor=prefetch_factor if num_workers > 0 else None,
+            persistent_workers=num_workers > 0,
+            multiprocessing_context='spawn' if num_workers > 0 else None
         )
         
-        # Targets (dense, one per episode)
-        targets_grp = h5f.create_group('targets')
-        targets_grp.create_dataset('mortality', shape=(n_episodes,), dtype=np.float32, **comp_kwargs)
-        targets_grp.create_dataset('length_of_stay', shape=(n_episodes,), dtype=np.float32, **comp_kwargs)
-        targets_grp.create_dataset(
-            'phenotype',
-            shape=(n_episodes, dims['phenotype_dim']),
-            dtype=np.float32,
-            **comp_kwargs
-        )
-        
-        # Second pass: write data
-        # Track current write positions for text features
-        text_write_pos = [0 for _ in range(dims['n_text_feats'])]
-        
-        for i in tqdm(range(n_episodes), desc="Writing episodes"):
-            val_data = all_val_data[i]
-            event_data = all_event_data[i]
-            static_data = all_static_data[i]
-            targets = all_target_data[i]
-            
-            val_start = val_offsets[i]
-            val_end = val_offsets[i + 1]
-            val_len = val_end - val_start
-            
-            event_start = event_offsets[i]
-            event_end = event_offsets[i + 1]
-            event_len = event_end - event_start
-            
-            # Write val_data times (only real timesteps)
-            times_array = np.array([val_data['times'][t][0] for t in range(val_len)], dtype=np.float32)
-            h5f['val_data/times'][val_start:val_end] = times_array
-            
-            # Write numeric data
-            if dims['n_numeric_feats'] > 0:
-                ind_array = np.zeros((val_len, dims['n_numeric_feats']), dtype=np.uint8)
-                for t in range(val_len):
-                    for f in range(dims['n_numeric_feats']):
-                        ind_array[t, f] = val_data['numeric']['indicators'][t][f][0]
-                h5f['val_data/numeric/indicators'][val_start:val_end] = ind_array
-                
-                for f, feat_dim in enumerate(dims['numeric_feat_dims']):
-                    val_array = np.zeros((val_len, feat_dim), dtype=np.float32)
-                    for t in range(val_len):
-                        arr = val_data['numeric']['values'][t][f]
-                        val_array[t, :len(arr)] = arr
-                    h5f[f'val_data/numeric/values_{f}'][val_start:val_end] = val_array
-            
-            # Write categorical data
-            if dims['n_categorical_feats'] > 0:
-                ind_array = np.zeros((val_len, dims['n_categorical_feats']), dtype=np.uint8)
-                for t in range(val_len):
-                    for f in range(dims['n_categorical_feats']):
-                        ind_array[t, f] = val_data['categorical']['indicators'][t][f][0]
-                h5f['val_data/categorical/indicators'][val_start:val_end] = ind_array
-                
-                for f, feat_dim in enumerate(dims['categorical_feat_dims']):
-                    val_array = np.zeros((val_len, feat_dim), dtype=np.int32)
-                    for t in range(val_len):
-                        arr = val_data['categorical']['values'][t][f]
-                        val_array[t, :len(arr)] = arr
-                    h5f[f'val_data/categorical/values_{f}'][val_start:val_end] = val_array
-            
-            # Write text data (sparse)
-            if dims['n_text_feats'] > 0:
-                ind_array = np.zeros((val_len, dims['n_text_feats']), dtype=np.uint8)
-                for t in range(val_len):
-                    for f in range(dims['n_text_feats']):
-                        ind_array[t, f] = val_data['text']['indicators'][t][f][0]
-                h5f['val_data/text/indicators'][val_start:val_end] = ind_array
-                
-                for f, feat_dim in enumerate(dims['text_feat_dims']):
-                    # Collect text occurrences for this episode
-                    text_timesteps = []
-                    text_values = []
-                    text_masks = []
-                    for t in range(val_len):
-                        if val_data['text']['indicators'][t][f][0] == 1:
-                            text_timesteps.append(t)
-                            text_values.append(val_data['text']['values'][t][f])
-                            text_masks.append(val_data['text']['masks'][t][f])
-                    
-                    n_texts = len(text_timesteps)
-                    if n_texts > 0:
-                        write_start = text_write_pos[f]
-                        write_end = write_start + n_texts
-                        
-                        h5f[f'val_data/text/feat_{f}/timestep_indices'][write_start:write_end] = \
-                            np.array(text_timesteps, dtype=np.int32)
-                        
-                        values_array = np.zeros((n_texts, feat_dim), dtype=np.int32)
-                        masks_array = np.zeros((n_texts, feat_dim), dtype=np.uint8)
-                        for j, (v, m) in enumerate(zip(text_values, text_masks)):
-                            values_array[j, :len(v)] = v
-                            masks_array[j, :len(m)] = m
-                        h5f[f'val_data/text/feat_{f}/values'][write_start:write_end] = values_array
-                        h5f[f'val_data/text/feat_{f}/masks'][write_start:write_end] = masks_array
-                        
-                        text_write_pos[f] = write_end
-            
-            # Write event data
-            event_times = np.array([event_data['times'][t][0] for t in range(event_len)], dtype=np.float32)
-            h5f['event_data/times'][event_start:event_end] = event_times
-            
-            if dims['n_event_feats'] > 0:
-                ind_array = np.zeros((event_len, dims['n_event_feats']), dtype=np.uint8)
-                for t in range(event_len):
-                    for f in range(dims['n_event_feats']):
-                        ind_array[t, f] = event_data['indicators'][t][f][0]
-                h5f['event_data/indicators'][event_start:event_end] = ind_array
-            
-            # Write static data
-            static_array = np.zeros(dims['static_total_dim'], dtype=np.float32)
-            offset = 0
-            for arr in static_data:
-                static_array[offset:offset + len(arr)] = arr
-                offset += len(arr)
-            h5f['static_data'][i] = static_array
-            
-            # Write targets
-            h5f['targets/mortality'][i] = targets['mortality']
-            h5f['targets/length_of_stay'][i] = targets['length_of_stay']
-            h5f['targets/phenotype'][i] = targets['phenotype']
+        dataloaders.append(loader)
     
-    print(f"HDF5 file written: {h5_path}")
-
-
-def extract_mimic_hdf5(
-        reader: MIMICDataReader, 
-        suffix: str,
-        output_dir: str,
-        var_properties_path: str,
-        max_episode_len_steps: int, 
-        max_history_len_steps: int = 0,
-        min_episode_len_steps: Optional[int] = 10,
-        min_episode_len_hours: Optional[int] = 48,
-        max_episode_len_hours: Optional[int] = 48,
-        n_workers: Optional[int] = None,
-        compression: str = 'gzip',
-        compression_opts: int = 4
-) -> None:
-    """
-    Extract MIMIC data and write directly to HDF5 format.
+    return dataloaders
     
-    This is a drop-in replacement for extract_mimic that writes HDF5 files
-    instead of pickle files. HDF5 files load much faster because they store
-    contiguous arrays that can be read directly into memory without the
-    overhead of Python object reconstruction.
-    
-    Args:
-        reader: MIMICDataReader instance
-        suffix: Data partition ('train', 'val', or 'test')
-        output_dir: Directory for output files
-        var_properties_path: Path to variable_properties.yaml for dimension info
-        max_episode_len_steps: Maximum timesteps to include from ICU episode
-        max_history_len_steps: Maximum historic timesteps before ICU admission
-        min_episode_len_steps: Minimum required timesteps (episodes with fewer are skipped)
-        min_episode_len_hours: Minimum ICU stay duration in hours
-        max_episode_len_hours: Maximum hours of data to include
-        n_workers: Number of parallel workers for processing
-        compression: HDF5 compression ('gzip', 'lzf', or None)
-        compression_opts: Compression level (1-9 for gzip)
-    """
-    
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-
-    if reader.prediction_task != 'all':
-        raise ValueError(f'reader.prediction_task: Expected "all", got {reader.prediction_task}')
-
-    total_episodes = len(reader.patient_episode_ids)
-    max_ts_len = max_history_len_steps + max_episode_len_steps
-
-    if n_workers is None:
-        n_workers = 1
-    
-    print(f"Processing {total_episodes} episodes using {n_workers} workers...")
-
-    # Get phenotype dimension from listfile header
-    phenotype_dim = _get_phenotype_dim_from_listfile(reader.phenotypes_listfile)
-    
-    # Get feature dimensions from config
-    dims = _get_feature_dims_from_config(
-        var_properties_path=var_properties_path,
-        valued_feats=reader.valued_feats,
-        event_feats=reader.event_feats,
-        text_feats=reader.text_feats if reader.text_feats else [],
-        static_feats=reader.static_feats,
-        max_ts_len_val=max_ts_len,
-        max_ts_len_event=max_ts_len,
-        max_token_length=MAX_TOKEN_LENGTH,
-        phenotype_dim=phenotype_dim
-    )
-
-    # Create partial function with fixed arguments
-    process_fn = partial(
-        _process_single_episode,
-        reader=reader,
-        max_history_len_steps=max_history_len_steps,
-        max_episode_len_steps=max_episode_len_steps,
-        max_episode_len_hours=max_episode_len_hours,
-        min_episode_len_steps=min_episode_len_steps,
-        min_episode_len_hours=min_episode_len_hours
-    )
-
-    # Process episodes in parallel
-    all_val_data = []
-    all_event_data = []
-    all_static_data = []
-    all_target_data = []
-    ids = []
-    n_episodes_ignored = 0
-    
-    with mp.Pool(processes=n_workers, initializer=_init_worker, initargs=(max_ts_len,)) as pool:
-        for result in tqdm(
-            pool.imap(process_fn, range(total_episodes), chunksize=10),
-            total=total_episodes,
-            desc=f"Extracting {suffix} patient records from {reader.data_root_path}"
-        ):
-            if result is None:
-                n_episodes_ignored += 1
-            else:
-                i, val_data, event_data, static_data, targets = result
-                ids.append(i)
-                all_val_data.append(val_data)
-                all_event_data.append(event_data)
-                all_static_data.append(static_data)
-                all_target_data.append(targets)
-    
-    print(f"Extracted records from {total_episodes-n_episodes_ignored} ICU stay episodes, "
-          f"ignored {n_episodes_ignored} episodes that didn't meet filtering criteria.")
-    sys.stdout.flush()
-
-    # Restrict to patient-episode IDs that survived filtering
-    patient_episode_ids = np.array(reader.patient_episode_ids)[ids]
-    patient_episode_ids = patient_episode_ids.tolist()
-    
-    # Standardize the numeric value-associated data
-    summary_statistic_path = os.path.join(output_dir, 'summary_statistics_train.npz')
-    if suffix == 'train':
-        print(f"Calculating summary statistics...", flush=True)
-        sys.stdout.flush()
-        all_val_data = standardize_feats(all_val_data, save_path=summary_statistic_path)
-    else:
-        if not os.path.exists(summary_statistic_path):
-            raise FileNotFoundError(
-                'Validation and test set data are standardized with summary statistics calculated from the training '
-                'set data, but summary_statistics_train.npz was not found. Please run the training data extraction '
-                'first to generate the summary statistics.'
-            )
-        print(f"Loading and applying summary statistics...", flush=True)
-        sys.stdout.flush()
-        all_val_data = standardize_feats(all_val_data, load_path=summary_statistic_path)
-
-    # Write to HDF5 instead of pickle
-    h5_path = os.path.join(output_dir, f'{suffix}.h5')
-    _write_to_hdf5(
-        h5_path=h5_path,
-        patient_episode_ids=patient_episode_ids,
-        all_val_data=all_val_data,
-        all_event_data=all_event_data,
-        all_static_data=all_static_data,
-        all_target_data=all_target_data,
-        dims=dims,
-        compression=compression,
-        compression_opts=compression_opts
-    )
-    
-    print(f"Extracted {suffix} data written to {h5_path}\n")

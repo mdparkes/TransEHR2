@@ -1,6 +1,5 @@
 import torch
 
-from copy import deepcopy
 from torch import Tensor
 from typing import Dict, List, Optional, Tuple, Union
 

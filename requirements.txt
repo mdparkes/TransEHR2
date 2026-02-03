@@ -1,5 +1,7 @@
+--extra-index-url https://pypi.nvidia.com
+
 # Core deep learning
-torch>=2.0.0
+torch>=2.3.0
 transformers>=4.30.0
 
 # Scientific computing
@@ -16,4 +18,4 @@ dotenv>=0.9.9
 pyyaml>=6.0
 tqdm>=4.65.0
 accelerate>=1.11.0
-h5py>=3.15.0
+triton>=3.0.0

@@ -15,12 +15,11 @@ import yaml
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import broadcast, broadcast_object_list
 from accelerate.utils import DistributedType
-from functools import partial
 from torch.utils.tensorboard import SummaryWriter
 from typing import List, Union
 
 from TransEHR2.constants import TEXT_EMBED_DIM
-from TransEHR2.data.preprocessing import collate_as_tensors, prepare_dataloaders_hdf5
+from TransEHR2.data.preprocessing import prepare_dataloaders
 from TransEHR2.models import ELECTRA, MixedClassifier
 from TransEHR2.modules import MaskedTokenDiscriminator, MaskedTokenGenerator, TransformerHawkesProcess
 from TransEHR2.modules import EventDataEncoder, ValueDataEncoder
@@ -45,21 +44,16 @@ def initialize_accelerator(use_text: bool) -> Accelerator:
         ValueError: If the accelerator's distributed type does not match the expected type based on use_text.
     """
 
-    if use_text:
-        accelerator = Accelerator()
-    else:
-        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-        accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
     
-    if use_text and accelerator.distributed_type != DistributedType.FSDP:
+    if use_text and accelerator.distributed_type not in (DistributedType.FSDP, DistributedType.MULTI_GPU):
         raise ValueError(
-            f"USE_TEXT=True requires FSDP but accelerator is configured for {accelerator.distributed_type}. "
-            f"Please update your accelerate config to use FSDP."
+            f"USE_TEXT=True requires FSDP or MULTI_GPU but accelerator is configured for {accelerator.distributed_type}."
         )
     elif not use_text and accelerator.distributed_type != DistributedType.MULTI_GPU:
         raise ValueError(
-            f"USE_TEXT=False expects MULTI_GPU (DDP) but accelerator is configured for {accelerator.distributed_type}. "
-            f"Please update your accelerate config to use MULTI_GPU."
+            f"USE_TEXT=False expects MULTI_GPU (DDP) but accelerator is configured for {accelerator.distributed_type}."
         )
     
     return accelerator
@@ -188,6 +182,7 @@ if __name__ == "__main__":
     GENERATOR_ENCODER_DROPOUT = experiment_config['GENERATOR_ENCODER_DROPOUT']
     GENERATOR_ENCODER_ACTIVATION = experiment_config['GENERATOR_ENCODER_ACTIVATION']
     GENERATOR_ENCODER_NORM = experiment_config['GENERATOR_ENCODER_NORM']
+    GENERATOR_ENCODER_NORM_FIRST = experiment_config.get('GENERATOR_ENCODER_NORM_FIRST', False)
     DISCRIMINATOR_ENCODER_D_MODEL = experiment_config['DISCRIMINATOR_ENCODER_D_MODEL']
     DISCRIMINATOR_ENCODER_N_HEADS = experiment_config['DISCRIMINATOR_ENCODER_N_HEADS']
     DISCRIMINATOR_ENCODER_N_ENCODER_BLOCKS = experiment_config['DISCRIMINATOR_ENCODER_N_ENCODER_BLOCKS']
@@ -195,6 +190,7 @@ if __name__ == "__main__":
     DISCRIMINATOR_ENCODER_DROPOUT = experiment_config['DISCRIMINATOR_ENCODER_DROPOUT']
     DISCRIMINATOR_ENCODER_ACTIVATION = experiment_config['DISCRIMINATOR_ENCODER_ACTIVATION']
     DISCRIMINATOR_ENCODER_NORM = experiment_config['DISCRIMINATOR_ENCODER_NORM']
+    DISCRIMINATOR_ENCODER_NORM_FIRST = experiment_config.get('DISCRIMINATOR_ENCODER_NORM_FIRST', False)
     THP_ENCODER_D_MODEL = experiment_config['THP_ENCODER_D_MODEL']
     THP_ENCODER_D_INNER = experiment_config['THP_ENCODER_D_INNER']
     THP_ENCODER_N_LAYERS = experiment_config['THP_ENCODER_N_LAYERS']
@@ -202,6 +198,7 @@ if __name__ == "__main__":
     THP_ENCODER_D_K = experiment_config['THP_ENCODER_D_K']
     THP_ENCODER_D_V = experiment_config['THP_ENCODER_D_V']
     THP_ENCODER_DROPOUT = experiment_config['THP_ENCODER_DROPOUT']
+    THP_ENCODER_NORM_FIRST = experiment_config.get('THP_ENCODER_NORM_FIRST', False)
     GENERATOR_D_MODEL = experiment_config['GENERATOR_D_MODEL']
     GENERATOR_DIM_FEEDFORWARD = experiment_config['GENERATOR_DIM_FEEDFORWARD']
     DISCRIMINATOR_DIM_FEEDFORWARD = experiment_config['DISCRIMINATOR_DIM_FEEDFORWARD']
@@ -276,15 +273,15 @@ if __name__ == "__main__":
 
         fold_dir = os.path.join(DATA_DIR, fold_name)
         # Create the list of dataloaders for the training, validation (optional), and test sets
-        # Dataloaders serve batched MixedDataset objects
-        collate_fn = partial(collate_as_tensors, device=None)  # Accelerate will handle device placement
-        dataloader_list = prepare_dataloaders_hdf5(
+        dataloader_list = prepare_dataloaders(
             fold_dir, 
             BATCH_SIZE, 
-            preload=True,
-            collate_fn=collate_fn,
             num_workers=num_workers,
-            pin_memory=torch.cuda.is_available()
+            pin_memory=torch.cuda.is_available(),
+            prefetch_factor=2 if num_workers > 0 else 1,
+            balance_text=USE_TEXT,
+            world_size=accelerator.num_processes,
+            rank=accelerator.process_index
         )
         if len(dataloader_list) == 3:
             train_loader, val_loader, test_loader = dataloader_list
@@ -308,7 +305,8 @@ if __name__ == "__main__":
             dim_feedforward=GENERATOR_ENCODER_DIM_FEEDFORWARD,
             dropout=GENERATOR_ENCODER_DROPOUT,
             activation=GENERATOR_ENCODER_ACTIVATION,
-            norm=GENERATOR_ENCODER_NORM
+            norm=GENERATOR_ENCODER_NORM,
+            normalize_before=GENERATOR_ENCODER_NORM_FIRST
         )
         discriminator_encoder = ValueDataEncoder(
             n_features=n_val_feats,
@@ -319,7 +317,8 @@ if __name__ == "__main__":
             dim_feedforward=DISCRIMINATOR_ENCODER_DIM_FEEDFORWARD,
             dropout=DISCRIMINATOR_ENCODER_DROPOUT,
             activation=DISCRIMINATOR_ENCODER_ACTIVATION,
-            norm=DISCRIMINATOR_ENCODER_NORM
+            norm=DISCRIMINATOR_ENCODER_NORM,
+            normalize_before=DISCRIMINATOR_ENCODER_NORM_FIRST
         )
         thp_encoder = EventDataEncoder(
             num_types=n_event_types,
@@ -329,7 +328,8 @@ if __name__ == "__main__":
             n_head=THP_ENCODER_N_HEADS,
             d_k=THP_ENCODER_D_K,
             d_v=THP_ENCODER_D_V,
-            dropout=THP_ENCODER_DROPOUT
+            dropout=THP_ENCODER_DROPOUT,
+            normalize_before=THP_ENCODER_NORM_FIRST
         )
         generator = MaskedTokenGenerator(
             encoder=generator_encoder,
@@ -504,7 +504,8 @@ if __name__ == "__main__":
                 dim_feedforward=DISCRIMINATOR_ENCODER_DIM_FEEDFORWARD,
                 dropout=DISCRIMINATOR_ENCODER_DROPOUT,
                 activation=DISCRIMINATOR_ENCODER_ACTIVATION,
-                norm=DISCRIMINATOR_ENCODER_NORM
+                norm=DISCRIMINATOR_ENCODER_NORM,
+                normalize_before=DISCRIMINATOR_ENCODER_NORM_FIRST
             )
             predictor_event_encoder = EventDataEncoder(
                 num_types=n_event_types,
@@ -514,7 +515,8 @@ if __name__ == "__main__":
                 n_head=THP_ENCODER_N_HEADS,
                 d_k=THP_ENCODER_D_K,
                 d_v=THP_ENCODER_D_V,
-                dropout=THP_ENCODER_DROPOUT
+                dropout=THP_ENCODER_DROPOUT,
+                normalize_before=THP_ENCODER_NORM_FIRST
             )
             downstream_predictor = MixedClassifier(
                 event_encoder=predictor_event_encoder,
@@ -620,7 +622,8 @@ if __name__ == "__main__":
                 dim_feedforward=DISCRIMINATOR_ENCODER_DIM_FEEDFORWARD,
                 dropout=DISCRIMINATOR_ENCODER_DROPOUT,
                 activation=DISCRIMINATOR_ENCODER_ACTIVATION,
-                norm=DISCRIMINATOR_ENCODER_NORM
+                norm=DISCRIMINATOR_ENCODER_NORM,
+                normalize_before=DISCRIMINATOR_ENCODER_NORM_FIRST
             )
             predictor_event_encoder = EventDataEncoder(
                 num_types=n_event_types,
@@ -630,7 +633,8 @@ if __name__ == "__main__":
                 n_head=THP_ENCODER_N_HEADS,
                 d_k=THP_ENCODER_D_K,
                 d_v=THP_ENCODER_D_V,
-                dropout=THP_ENCODER_DROPOUT
+                dropout=THP_ENCODER_DROPOUT,
+                normalize_before=THP_ENCODER_NORM_FIRST
             )
             downstream_predictor = MixedClassifier(
                 event_encoder=predictor_event_encoder,
@@ -664,10 +668,9 @@ if __name__ == "__main__":
             # Prepare the model and dataloader with Accelerator and evaluate on test set
             downstream_predictor = accelerator.prepare(downstream_predictor)
             accelerator.wait_for_everyone()
-            wrapped_test_loader = accelerator.prepare(test_loader)  # Original test_loader stays unwrapped
             best_test_scores = evaluate_finetuned_model(
                 model=downstream_predictor,
-                loader=wrapped_test_loader,
+                loader=test_loader,
                 task=task,
                 accelerator=accelerator,
                 mem_test_mode=mem_test_mode
