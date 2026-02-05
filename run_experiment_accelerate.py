@@ -182,7 +182,7 @@ if __name__ == "__main__":
     GENERATOR_ENCODER_DROPOUT = experiment_config['GENERATOR_ENCODER_DROPOUT']
     GENERATOR_ENCODER_ACTIVATION = experiment_config['GENERATOR_ENCODER_ACTIVATION']
     GENERATOR_ENCODER_NORM = experiment_config['GENERATOR_ENCODER_NORM']
-    GENERATOR_ENCODER_NORM_FIRST = experiment_config.get('GENERATOR_ENCODER_NORM_FIRST', False)
+    GENERATOR_ENCODER_NORM_FIRST = experiment_config.get('GENERATOR_ENCODER_NORM_FIRST', True)
     DISCRIMINATOR_ENCODER_D_MODEL = experiment_config['DISCRIMINATOR_ENCODER_D_MODEL']
     DISCRIMINATOR_ENCODER_N_HEADS = experiment_config['DISCRIMINATOR_ENCODER_N_HEADS']
     DISCRIMINATOR_ENCODER_N_ENCODER_BLOCKS = experiment_config['DISCRIMINATOR_ENCODER_N_ENCODER_BLOCKS']
@@ -190,7 +190,7 @@ if __name__ == "__main__":
     DISCRIMINATOR_ENCODER_DROPOUT = experiment_config['DISCRIMINATOR_ENCODER_DROPOUT']
     DISCRIMINATOR_ENCODER_ACTIVATION = experiment_config['DISCRIMINATOR_ENCODER_ACTIVATION']
     DISCRIMINATOR_ENCODER_NORM = experiment_config['DISCRIMINATOR_ENCODER_NORM']
-    DISCRIMINATOR_ENCODER_NORM_FIRST = experiment_config.get('DISCRIMINATOR_ENCODER_NORM_FIRST', False)
+    DISCRIMINATOR_ENCODER_NORM_FIRST = experiment_config.get('DISCRIMINATOR_ENCODER_NORM_FIRST', True)
     THP_ENCODER_D_MODEL = experiment_config['THP_ENCODER_D_MODEL']
     THP_ENCODER_D_INNER = experiment_config['THP_ENCODER_D_INNER']
     THP_ENCODER_N_LAYERS = experiment_config['THP_ENCODER_N_LAYERS']
@@ -198,27 +198,27 @@ if __name__ == "__main__":
     THP_ENCODER_D_K = experiment_config['THP_ENCODER_D_K']
     THP_ENCODER_D_V = experiment_config['THP_ENCODER_D_V']
     THP_ENCODER_DROPOUT = experiment_config['THP_ENCODER_DROPOUT']
-    THP_ENCODER_NORM_FIRST = experiment_config.get('THP_ENCODER_NORM_FIRST', False)
+    THP_ENCODER_NORM_FIRST = experiment_config.get('THP_ENCODER_NORM_FIRST', True)
     GENERATOR_D_MODEL = experiment_config['GENERATOR_D_MODEL']
     GENERATOR_DIM_FEEDFORWARD = experiment_config['GENERATOR_DIM_FEEDFORWARD']
     DISCRIMINATOR_DIM_FEEDFORWARD = experiment_config['DISCRIMINATOR_DIM_FEEDFORWARD']
     PREDICTOR_AGGREGATION_METHOD = experiment_config['PREDICTOR_AGGREGATION_METHOD']
     MODEL_DIR = experiment_config['MODEL_DIR']
     PRETRAIN_LEARNING_RATE = experiment_config.get('PRETRAIN_LEARNING_RATE', 2e-3)
-    PRETRAIN_LEARNING_RATE_DECAY = experiment_config.get('PRETRAIN_LEARNING_RATE_DECAY', 0.5)
-    PRETRAIN_TOTAL_EPOCH = experiment_config.get('PRETRAIN_TOTAL_EPOCH', 2000)
-    DISC_LOSS_WEIGHT = experiment_config.get('DISC_LOSS_WEIGHT', 0.5)
-    THP_LOSS_NLL_WEIGHT = experiment_config.get('THP_LOSS_NLL_WEIGHT', 1e-3)
+    PRETRAIN_LEARNING_RATE_DECAY = experiment_config.get('PRETRAIN_LEARNING_RATE_DECAY', 0.9)
+    PRETRAIN_TOTAL_EPOCH = experiment_config.get('PRETRAIN_TOTAL_EPOCH', 1000)
+    DISC_LOSS_WEIGHT = experiment_config.get('DISC_LOSS_WEIGHT', 1.0)
+    THP_LOSS_NLL_WEIGHT = experiment_config.get('THP_LOSS_NLL_WEIGHT', 1e-2)
     THP_LOSS_MC_SAMPLES = experiment_config.get('THP_LOSS_MC_SAMPLES', 100)
     USE_THP_PRED_LOSS = experiment_config.get('USE_THP_PRED_LOSS', True)
     THP_PRED_LOSS_TYPE_WT = experiment_config.get('THP_PRED_LOSS_TYPE_WT', 1.0)
-    THP_PRED_LOSS_TIME_WT = experiment_config.get('THP_PRED_LOSS_TIME_WT', 0.01)
-    RECORD_MASK_RATIO = experiment_config.get('RECORD_MASK_RATIO', 0.25)
-    OBS_UNOBS_SAMPLE_RATIO = experiment_config.get('OBS_UNOBS_SAMPLE_RATIO', 4)
-    CMPNT_MASK_RATIO = experiment_config.get('CMPNT_MASK_RATIO', 0.5)
+    THP_PRED_LOSS_TIME_WT = experiment_config.get('THP_PRED_LOSS_TIME_WT', 1e-6)
+    RECORD_MASK_RATIO = experiment_config.get('RECORD_MASK_RATIO', 0.15)
+    OBS_UNOBS_SAMPLE_RATIO = experiment_config.get('OBS_UNOBS_SAMPLE_RATIO', 5.0)
+    CMPNT_MASK_RATIO = experiment_config.get('CMPNT_MASK_RATIO', 0.25)
     FINETUNE_LEARNING_RATE = experiment_config.get('FINETUNE_LEARNING_RATE', 2e-4)
     FINETUNE_TOTAL_EPOCH = experiment_config.get('FINETUNE_TOTAL_EPOCH', 500)
-    FINETUNE_LEARNING_RATE_DECAY = experiment_config.get('FINETUNE_LEARNING_RATE_DECAY', 0.8)
+    FINETUNE_LEARNING_RATE_DECAY = experiment_config.get('FINETUNE_LEARNING_RATE_DECAY', 0.9)
 
     # Create a Timer object for tracking the time it takes to train and evaluate the models
     timer = create_timer(

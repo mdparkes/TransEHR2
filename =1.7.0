@@ -1,0 +1,6 @@
+Looking in links: /cvmfs/soft.computecanada.ca/custom/python/wheelhouse/gentoo2023/x86-64-v4, /cvmfs/soft.computecanada.ca/custom/python/wheelhouse/gentoo2023/x86-64-v3, /cvmfs/soft.computecanada.ca/custom/python/wheelhouse/gentoo2023/generic, /cvmfs/soft.computecanada.ca/custom/python/wheelhouse/generic
+Requirement already satisfied: transformer-engine[pytorch] in ./venv/TransEHR2/lib/python3.11/site-packages (2.11.0)
+Collecting transformer_engine_torch==2.11.0 (from transformer-engine[pytorch])
+  Using cached transformer_engine_torch-2.11.0.tar.gz (242 kB)
+  Preparing metadata (pyproject.toml): started
+  Preparing metadata (pyproject.toml): finished with status 'error'
