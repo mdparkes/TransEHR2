@@ -23,6 +23,8 @@ import re
 import torch
 import yaml
 
+from collections import OrderedDict
+from torch import Tensor
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from typing import Dict, List, Optional, Tuple
@@ -31,8 +33,76 @@ from TransEHR2.constants import TEXT_EMBED_DIM
 from TransEHR2.data.preprocessing import load_dataset, collate_tensorized
 from TransEHR2.models import MixedClassifier
 from TransEHR2.modules import EventDataEncoder, ValueDataEncoder, GradientTraceableLLM
-from TransEHR2.routines_accelerate import reshape_flattened_state_dict
 from TransEHR2.utils import get_param_shapes, move_batch_to_device
+
+
+# ---------------------------------------------------------------------------
+# Inlined from TransEHR2.routines_accelerate to avoid pulling in the
+# tensorboard dependency that module carries at import time.
+# ---------------------------------------------------------------------------
+
+StateDict = OrderedDict[str, Tensor]
+
+
+def reshape_flattened_state_dict(
+    state_dict: StateDict,
+    param_shapes: OrderedDict[str, tuple]
+) -> StateDict:
+    """Reshape flattened FSDP state dict to match expected parameter shapes.
+
+    LLM parameters are intentionally excluded from state dicts since the LLM
+    is frozen and always initialised from HuggingFace weights.  This function
+    is primarily needed for FSDP, which may flatten parameters.  For DDP,
+    parameters retain their original shapes.
+    """
+
+    def strip_fsdp_prefix(key: str) -> str:
+        for prefix in [
+            '_fsdp_wrapped_module.', '_forward_module.', 'module.'
+        ]:
+            if prefix in key:
+                key = key.replace(prefix, '')
+        if key.startswith('llm_model.'):
+            key = key.replace('llm_model.', 'llm_module.model.')
+        return key
+
+    reshaped: StateDict = OrderedDict()
+
+    for key, tensor in state_dict.items():
+        clean_key = strip_fsdp_prefix(key)
+
+        if tensor.device != torch.device('cpu'):
+            tensor = tensor.cpu()
+
+        if clean_key in param_shapes:
+            expected_shape = param_shapes[clean_key]
+            if tensor.shape != expected_shape:
+                expected_numel = int(
+                    torch.prod(torch.tensor(expected_shape)).item()
+                )
+                if tensor.numel() != expected_numel:
+                    print(
+                        f"ERROR: Cannot reshape {clean_key}: "
+                        f"{tensor.numel()} elements vs expected "
+                        f"{expected_numel}"
+                    )
+                    reshaped[clean_key] = tensor.clone()
+                else:
+                    reshaped[clean_key] = tensor.reshape(
+                        expected_shape
+                    ).clone()
+            else:
+                reshaped[clean_key] = tensor.clone()
+        else:
+            if not (clean_key.startswith('llm_module.')
+                    or clean_key.startswith('llm_model.')):
+                print(
+                    f"Warning: No expected shape for {clean_key}, "
+                    f"keeping original shape {tensor.shape}"
+                )
+            reshaped[clean_key] = tensor.clone()
+
+    return reshaped
 
 
 def get_fold_names(data_dir: str, exclude: Optional[List[str]] = None) -> List[str]:
@@ -196,7 +266,8 @@ def build_classifier(
 
 def load_finetuned_weights(
     model: MixedClassifier,
-    weights_path: str
+    weights_path: str,
+    use_text: bool = False
 ) -> bool:
     """Load finetuned state dict into a MixedClassifier.
 
@@ -206,6 +277,9 @@ def load_finetuned_weights(
     Args:
         model: The MixedClassifier to load weights into.
         weights_path: Path to the saved .pt state dict file.
+        use_text: Whether the model uses text/LLM features. When False,
+            strict loading is used so any key mismatch raises an error
+            immediately.
 
     Returns:
         True if weights were loaded successfully, False if the file was
@@ -214,13 +288,86 @@ def load_finetuned_weights(
     if not os.path.exists(weights_path):
         return False
 
-    state_dict = torch.load(weights_path, map_location='cpu', weights_only=False)
+    state_dict = torch.load(
+        weights_path, map_location='cpu', weights_only=False
+    )
     param_shapes = get_param_shapes(model)
     state_dict = reshape_flattened_state_dict(state_dict, param_shapes)
-    # strict=False because frozen LLM params are not saved in state dicts
-    model.load_state_dict(state_dict, strict=False)
+
+    # When USE_TEXT is False every parameter must be present in the
+    # state dict, so use strict=True to surface mismatches immediately.
+    # When USE_TEXT is True the frozen LLM params are intentionally
+    # absent from the saved state dict.
+    strict = not use_text
+    result = model.load_state_dict(state_dict, strict=strict)
+
+    if not strict:
+        if result.missing_keys:
+            llm_missing = [k for k in result.missing_keys
+                           if k.startswith('llm_module.')]
+            other_missing = [k for k in result.missing_keys
+                             if not k.startswith('llm_module.')]
+            if other_missing:
+                print(f"    WARNING: {len(other_missing)} non-LLM keys "
+                      f"missing from state dict: {other_missing}")
+        if result.unexpected_keys:
+            print(f"    WARNING: {len(result.unexpected_keys)} "
+                  f"unexpected keys in state dict: "
+                  f"{result.unexpected_keys}")
+
+    # Verify no NaN values in loaded parameters
+    nan_params = [name for name, p in model.named_parameters()
+                  if torch.isnan(p).any()]
+    if nan_params:
+        print(f"    WARNING: NaN values found in parameters: "
+              f"{nan_params}")
+
     del state_dict
     return True
+
+
+def install_nan_hooks(model: MixedClassifier) -> List:
+    """Install forward hooks that replace NaN encoder output with zeros.
+
+    The ValueDataEncoder uses ``batch_first=True`` with a manually permuted
+    input so that each timestep becomes a "batch" processed by PyTorch's
+    ``TransformerEncoder``.  When **every** episode in the real batch has
+    padding at a given timestep, all key positions for that "batch item"
+    are masked, producing ``softmax(-inf, …, -inf) = NaN``.  Those NaN
+    values survive the subsequent ``val_enc * mask`` operation because
+    ``NaN * 0 = NaN`` in IEEE 754, and then ``torch.sum`` propagates the
+    NaN to every prediction in the batch.
+
+    This hook replaces NaN values in each encoder's output with zeros so
+    that they are harmlessly absorbed by the padding mask and aggregation.
+
+    Args:
+        model: A MixedClassifier whose encoders may produce NaN at
+            fully-padded timesteps.
+
+    Returns:
+        List of hook handles (call ``.remove()`` on each to uninstall).
+    """
+    nan_counts: Dict[str, int] = {'val_encoder': 0, 'event_encoder': 0}
+
+    def _make_hook(name: str):
+        def hook(module, inp, output):
+            if isinstance(output, torch.Tensor):
+                n = torch.isnan(output).sum().item()
+                if n > 0:
+                    nan_counts[name] += n
+                    return torch.nan_to_num(output, nan=0.0)
+            return output
+        return hook
+
+    handles = [
+        model.val_encoder.register_forward_hook(_make_hook('val_encoder')),
+        model.event_encoder.register_forward_hook(_make_hook('event_encoder')),
+    ]
+    # Expose the counter dict so callers can inspect it later.
+    for h in handles:
+        h.nan_counts = nan_counts  # type: ignore[attr-defined]
+    return handles
 
 
 def run_inference(
@@ -248,9 +395,12 @@ def run_inference(
     model.eval()
     all_preds = []
     all_targs = []
+    nan_batches = 0
 
     with torch.no_grad():
-        for batch in tqdm(loader, desc=f'    Inference', leave=False):
+        for i, batch in enumerate(
+            tqdm(loader, desc=f'    Inference', leave=False)
+        ):
             batch = move_batch_to_device(batch, device=device)
             logits = model(batch)
             targets = batch['targets'][task]
@@ -260,6 +410,21 @@ def run_inference(
             else:
                 preds = logits
 
+            n_nan = torch.isnan(logits).sum().item()
+            if n_nan > 0:
+                nan_batches += 1
+
+            # Diagnostics on the first batch
+            if i == 0:
+                if n_nan > 0:
+                    print(f"    WARNING: {n_nan} NaN values in logits "
+                          f"(batch 0, shape {tuple(logits.shape)})")
+                    print(f"    logits sample: {logits[0].cpu().tolist()}")
+                else:
+                    print(f"    logits OK (batch 0): "
+                          f"min={logits.min().item():.4f}, "
+                          f"max={logits.max().item():.4f}")
+
             all_preds.append(preds.cpu().numpy())
             all_targs.append(targets.cpu().numpy())
 
@@ -267,7 +432,23 @@ def run_inference(
             if device.type == 'cuda':
                 torch.cuda.empty_cache()
 
-    return np.concatenate(all_preds, axis=0), np.concatenate(all_targs, axis=0)
+    predictions = np.concatenate(all_preds, axis=0)
+    targets = np.concatenate(all_targs, axis=0)
+
+    # Summary diagnostics
+    n_total = predictions.size
+    n_pred_nan = int(np.isnan(predictions).sum())
+    if nan_batches > 0:
+        print(f"    WARNING: {nan_batches}/{i + 1} batches had NaN logits")
+    if n_pred_nan > 0:
+        print(f"    WARNING: {n_pred_nan}/{n_total} NaN values in "
+              f"final predictions array")
+    else:
+        print(f"    predictions: min={predictions.min():.4f}, "
+              f"max={predictions.max():.4f}, "
+              f"mean={predictions.mean():.4f}")
+
+    return predictions, targets
 
 
 def save_predictions_csv(
@@ -441,7 +622,7 @@ if __name__ == '__main__':
                 MODEL_DIR, EXPERIMENT_NAME, fold_name,
                 'pretrained', f'finetuned_{task}.pt'
             )
-            if not load_finetuned_weights(model, weights_path):
+            if not load_finetuned_weights(model, weights_path, USE_TEXT):
                 print(f"    WARNING: Weights not found at {weights_path}, "
                       f"skipping.")
                 del model
@@ -450,6 +631,13 @@ if __name__ == '__main__':
 
             model = model.to(device)
             print(f"    Loaded weights from {weights_path}")
+
+            # Install forward hooks that replace NaN encoder output with
+            # zeros.  This prevents NaN from propagating through the
+            # padding-mask multiplication and aggregation sum when all
+            # episodes in a batch have padding at a given timestep.
+            hooks = install_nan_hooks(model)
+            nan_counts = hooks[0].nan_counts  # shared counter dict
 
             # Run inference on each data split
             for split, loader in loaders.items():
@@ -469,6 +657,13 @@ if __name__ == '__main__':
                     task, phenotype_names
                 )
                 print(f"    -> {output_path}")
+
+            # Report hook activity and clean up
+            for enc_name, cnt in nan_counts.items():
+                if cnt > 0:
+                    print(f"    NaN→0 replacements in {enc_name}: {cnt}")
+            for h in hooks:
+                h.remove()
 
             # Free model memory before next task
             del model

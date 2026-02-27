@@ -2,7 +2,7 @@
 
 EXPERIMENT_NAME: "experiment1_baseline"
 
-BATCH_SIZE: 750
+BATCH_SIZE: 200
 
 # Whether to use text data as features
 USE_TEXT: False
