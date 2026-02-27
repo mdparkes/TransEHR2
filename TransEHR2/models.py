@@ -534,10 +534,17 @@ class MixedClassifier(torch.nn.Module):
             # Pass the event data through the encoder
             #     Shape: (batch_size, max_ts_length, d_event_enc)
             event_enc = self.event_encoder(event_indicators, event_times, event_masks)
-            
+
             # Aggregate event encodings across the time dimension (dim=1)
             #     event_enc final shape: (batch_size, d_event_enc)
-            event_enc = event_enc * event_masks[..., None].float()  # Zero out padding embeddings   
+            # NOTE nan_to_num: when every episode in a batch has padding at a
+            # given timestep, the attention softmax receives all -inf and
+            # produces NaN.  Replacing with 0 before masking is safe because
+            # those positions are padding for all episodes and would be zeroed
+            # out regardless.  Without this, NaN * 0 = NaN (IEEE 754)
+            # propagates through the sum/max aggregation.
+            event_enc = torch.nan_to_num(event_enc, nan=0.0)
+            event_enc = event_enc * event_masks[..., None].float()  # Zero out padding embeddings
             n_obs_records = event_masks.sum(dim=-1, keepdim=True).clamp(min=1)  # Clamp to avoid errors
 
             if self.aggr == 'max':
@@ -614,6 +621,7 @@ class MixedClassifier(torch.nn.Module):
                 
                 # Aggregate time series encodings across the time dimension (dim=1)
                 #     val_enc final shape: (batch_size, d_val_enc)
+                val_enc = torch.nan_to_num(val_enc, nan=0.0)
                 val_enc = val_enc * val_masks[..., None].float() # Zero out padding embeddings
                 n_obs_records = val_masks.sum(dim=-1, keepdim=True).clamp(min=1)  # Clamp to avoid errors
 
