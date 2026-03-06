@@ -18,12 +18,12 @@ from accelerate.utils import DistributedType
 from torch.utils.tensorboard import SummaryWriter
 from typing import List, Union
 
-from TransEHR2.constants import TEXT_EMBED_DIM
+import pickle
+
 from TransEHR2.data.preprocessing import prepare_dataloaders
 from TransEHR2.models import ELECTRA, MixedClassifier
 from TransEHR2.modules import MaskedTokenDiscriminator, MaskedTokenGenerator, TransformerHawkesProcess
 from TransEHR2.modules import EventDataEncoder, ValueDataEncoder
-from TransEHR2.modules import GradientTraceableLLM
 from TransEHR2.routines_accelerate import pretrain_model, finetune_model, evaluate_finetuned_model
 from TransEHR2.routines_accelerate import reshape_flattened_state_dict
 from TransEHR2.utils import create_timer, convert_to_python_types, format_finetuning_performance_table, get_param_shapes
@@ -32,30 +32,26 @@ from TransEHR2.utils import create_timer, convert_to_python_types, format_finetu
 def initialize_accelerator(use_text: bool) -> Accelerator:
     """Initialize an Accelerate Accelerator instance with appropriate settings.
     
-    If use_text is True (derived from experiment config) the model requires an LLM, which has a large memory footprint. To reduce the LLM memory usage per GPU, an accelerator is created with fully sharded data parallel (FSDP) settings. If use_text is False, the model does not require an LLM, so standard distributed data parallel (DDP, i.e. MULTI_GPU) settings suffice. Note that the accelerator config must specify the correct distrbuted computing type (FSDP or MULTI_GPU). If the configuration file does not specify the correct type, this function will raise an error.
+    The accelerator config must specify FSDP or MULTI_GPU distributed type.
 
     Args:
-        use_text (bool): Whether the experiment uses text data and an LLM module.
+        use_text (bool): Whether the experiment uses text data.
 
     Returns:
         Accelerator: Configured Accelerator instance.
-    
+
     Raises:
-        ValueError: If the accelerator's distributed type does not match the expected type based on use_text.
+        ValueError: If the accelerator's distributed type is unsupported.
     """
 
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
-    
-    if use_text and accelerator.distributed_type not in (DistributedType.FSDP, DistributedType.MULTI_GPU):
+
+    if accelerator.distributed_type not in (DistributedType.FSDP, DistributedType.MULTI_GPU):
         raise ValueError(
-            f"USE_TEXT=True requires FSDP or MULTI_GPU but accelerator is configured for {accelerator.distributed_type}."
+            f"Expected FSDP or MULTI_GPU but accelerator is configured for {accelerator.distributed_type}."
         )
-    elif not use_text and accelerator.distributed_type != DistributedType.MULTI_GPU:
-        raise ValueError(
-            f"USE_TEXT=False expects MULTI_GPU (DDP) but accelerator is configured for {accelerator.distributed_type}."
-        )
-    
+
     return accelerator
     
 
@@ -245,15 +241,26 @@ if __name__ == "__main__":
             categorical_class_cnts.append(len(variable_properties[feature]['category_map']))
     if USE_TEXT:
         n_val_feats = len(VALUED_FEATS) + len(TEXT_FEATS)
-        tot_val_feat_dim += len(TEXT_FEATS) * TEXT_EMBED_DIM
+        # Read text_embed_dim from the first fold's dataset metadata
+        fold_name_list = get_fold_names(DATA_DIR, exclude='fold0')
+        first_fold_meta_path = os.path.join(
+            DATA_DIR, fold_name_list[0], 'train', 'metadata.pkl'
+        )
+        with open(first_fold_meta_path, 'rb') as f:
+            _meta = pickle.load(f)
+        text_embed_dim = _meta['text_embed_dim']
+        if text_embed_dim == 0:
+            raise RuntimeError(
+                "text_embed_dim is 0 in dataset metadata. "
+                "Run embed_text.py to pre-compute text embeddings before training."
+            )
+        tot_val_feat_dim += len(TEXT_FEATS) * text_embed_dim
     else:
         n_val_feats = len(VALUED_FEATS)
+        text_embed_dim = 0
+        fold_name_list = get_fold_names(DATA_DIR, exclude='fold0')
     # Get number of event types
     n_event_types = len(EVENT_FEATS)
-
-
-    # Get cross validation fold subdirectories' names and iterate over folds
-    fold_name_list = get_fold_names(DATA_DIR, exclude='fold0')  # Fold0 is reserved for hyperparameter tuning
 
     for fold_name in fold_name_list:
         # Create a fresh accelerator because it solves problems
@@ -292,10 +299,6 @@ if __name__ == "__main__":
 
 
         # Initialize models
-        if USE_TEXT:
-            pretrain_llm_module = GradientTraceableLLM()
-        else:
-            pretrain_llm_module = None
         generator_encoder = ValueDataEncoder(
             n_features=n_val_feats,
             feat_dim=tot_val_feat_dim,
@@ -337,6 +340,7 @@ if __name__ == "__main__":
             numeric_dims=numeric_feat_dims,
             categorical_classes=categorical_class_cnts,
             n_text_features=len(TEXT_FEATS) if USE_TEXT else 0,
+            text_embed_dim=text_embed_dim,
             predict_indicators=PREDICT_INDICATORS,
             dim_feedforward=GENERATOR_DIM_FEEDFORWARD
         )
@@ -358,7 +362,6 @@ if __name__ == "__main__":
             discriminator=discriminator,
             hawkes=transformer_hawkes_process,
             use_text=USE_TEXT,
-            llm_module=pretrain_llm_module  # Will be None when USE_TEXT is False
         )
 
 
@@ -443,7 +446,6 @@ if __name__ == "__main__":
         del generator_encoder
         del discriminator_encoder
         del thp_encoder
-        del pretrain_llm_module
         gc.collect()
         torch.cuda.empty_cache()
         accelerator.wait_for_everyone()
@@ -519,11 +521,6 @@ if __name__ == "__main__":
 
 
             if not skip_finetuning:
-                # Create a new LLM module for this task
-                if USE_TEXT:
-                    finetune_llm_module = GradientTraceableLLM()
-                else:
-                    finetune_llm_module = None
                 # Initialize the downstream predictor. The encoders are reinitialized with pretraining parameters.
                 predictor_value_encoder = ValueDataEncoder(
                     n_features=n_val_feats,
@@ -557,7 +554,6 @@ if __name__ == "__main__":
                     num_classes=prediction_output_shape,
                     aggr=PREDICTOR_AGGREGATION_METHOD,
                     use_text=USE_TEXT,
-                    llm_module=finetune_llm_module  # Will be None when USE_TEXT is False
                 )
 
                 # Load pretrained encoder weights into downstream predictor
@@ -629,7 +625,6 @@ if __name__ == "__main__":
                 del downstream_predictor
                 del predictor_value_encoder
                 del predictor_event_encoder
-                del finetune_llm_module
                 del accelerator
                 gc.collect()
                 torch.cuda.empty_cache()
@@ -648,10 +643,6 @@ if __name__ == "__main__":
             accelerator = initialize_accelerator(USE_TEXT)
 
             # Reinitialize the model for evaluation
-            if USE_TEXT:
-                finetune_llm_module = GradientTraceableLLM()
-            else:
-                finetune_llm_module = None
             predictor_value_encoder = ValueDataEncoder(
                 n_features=n_val_feats,
                 feat_dim=tot_val_feat_dim,
@@ -684,7 +675,6 @@ if __name__ == "__main__":
                 num_classes=prediction_output_shape,
                 aggr=PREDICTOR_AGGREGATION_METHOD,
                 use_text=USE_TEXT,
-                llm_module=finetune_llm_module
             )
 
             # Get parameter shapes from the unwrapped model for reshaping finetuned state dict
@@ -727,7 +717,6 @@ if __name__ == "__main__":
             del downstream_predictor
             del predictor_value_encoder
             del predictor_event_encoder
-            del finetune_llm_module
             gc.collect()
             torch.cuda.empty_cache()
             accelerator.wait_for_everyone()

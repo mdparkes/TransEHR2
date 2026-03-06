@@ -10,7 +10,6 @@ from datetime import timedelta
 from torch import Tensor
 from typing import Any, Dict, List, OrderedDict, Tuple, Union
 
-from TransEHR2.constants import TEXT_EMBED_DIM
 from TransEHR2.data.datasets import MixedDataset
 from TransEHR2.data.custom_types import MixedTensorDataset
 
@@ -417,8 +416,9 @@ def generate_record_masks(
             # Initialize indicator mask tensor
             indicator_mask = torch.zeros_like(feature_data['indicators'], device=batch_device)
             if feature_type == 'text':
-                # Text features get embedded to TEXT_EMBED_DIM
-                value_mask_shape = (batch_size, max_ts_len, TEXT_EMBED_DIM)
+                # Text features use pre-computed embeddings; get dim from batch
+                text_embed_dim = feature_data['embedded_values'].shape[-1]
+                value_mask_shape = (batch_size, max_ts_len, text_embed_dim)
                 val_masks[feature_type] = {
                     'indicators': indicator_mask,
                     'embedded_values': [torch.zeros(value_mask_shape, device=batch_device) for _ in range(n_features)]
@@ -515,7 +515,10 @@ def _gen_val_assoc_feat_mask(
 
     # Process value masks per feature (vectorized within each feature)
     for f in range(n_features):
-        feat_dim = TEXT_EMBED_DIM if feature_type == 'text' else values_data[f].shape[-1]
+        if feature_type == 'text':
+            feat_dim = data['val_data']['text']['embedded_values'].shape[-1]
+        else:
+            feat_dim = values_data[f].shape[-1]
         n_components_to_mask = max(1, int(subsample_rate * feat_dim))
 
         # Filter to positions for this feature

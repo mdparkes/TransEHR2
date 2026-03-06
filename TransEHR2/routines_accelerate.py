@@ -48,27 +48,16 @@ def reshape_flattened_state_dict(
     param_shapes: OrderedDict[str, tuple]
 ) -> StateDict:
     """Reshape flattened FSDP state dict to match expected parameter shapes.
-    
-    NOTE: LLM parameters are intentionally excluded from state dicts since
-    the LLM is frozen and always initialized from HuggingFace weights.
-    
+
     This function is primarily needed for FSDP, which may flatten parameters.
     For DDP, parameters retain their original shapes.
     """
-    
+
     def strip_fsdp_prefix(key: str) -> str:
         """Remove FSDP wrapper prefixes from parameter names."""
-        # Remove standard FSDP wrapper prefixes
         for prefix in ['_fsdp_wrapped_module.', '_forward_module.', 'module.']:
             if prefix in key:
                 key = key.replace(prefix, '')
-        
-        # Fix FSDP's flattening of llm_module.model -> llm_model
-        # FSDP sometimes flattens the hierarchy: llm_module (GradientTraceableLLM) -> model (AutoModel)
-        # becomes just llm_model instead of llm_module.model
-        if key.startswith('llm_model.'):
-            key = key.replace('llm_model.', 'llm_module.model.')
-        
         return key
     
     reshaped_state_dict = OrderedDict()
@@ -97,11 +86,9 @@ def reshape_flattened_state_dict(
             else:
                 reshaped_state_dict[clean_key] = tensor.clone()
         else:
-            # Only warn if it's not an LLM parameter
-            if not (clean_key.startswith('llm_module.') or clean_key.startswith('llm_model.')):
-                print(f"Warning: No expected shape for {clean_key}, keeping original shape {tensor.shape}")
+            print(f"Warning: No expected shape for {clean_key}, keeping original shape {tensor.shape}")
             reshaped_state_dict[clean_key] = tensor.clone()
-    
+
     return reshaped_state_dict
 
 
@@ -121,10 +108,10 @@ def extract_state_dict(
         param_shapes: Expected parameter shapes for reshaping (FSDP only).
     
     Returns:
-        State dict on main process (with LLM params filtered out), None on other ranks.
+        State dict on main process, None on other ranks.
     """
     unwrapped_model = accelerator.unwrap_model(model)
-    
+
     if is_fsdp_enabled(accelerator):
         # FSDP: use state_dict_type context manager for proper gathering
         cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
@@ -132,22 +119,17 @@ def extract_state_dict(
             # All ranks call this (all-gather op), but only rank 0 receives result
             state_dict = unwrapped_model.state_dict()
             if accelerator.is_main_process:
-                state_dict_no_llm = OrderedDict()
-                for key, value in state_dict.items():
-                    if not key.startswith('llm_module.'):
-                        state_dict_no_llm[key] = value
-                return reshape_flattened_state_dict(state_dict_no_llm, param_shapes)
+                return reshape_flattened_state_dict(state_dict, param_shapes)
             else:
                 return None
     else:
         # DDP: state dict is already complete on each rank, just grab it on main
         if accelerator.is_main_process:
             state_dict = unwrapped_model.state_dict()
-            state_dict_no_llm = OrderedDict()
+            cpu_state_dict = OrderedDict()
             for key, value in state_dict.items():
-                if not key.startswith('llm_module.'):
-                    state_dict_no_llm[key] = value.cpu().clone()
-            return state_dict_no_llm  # No reshape needed for DDP
+                cpu_state_dict[key] = value.cpu().clone()
+            return cpu_state_dict  # No reshape needed for DDP
         else:
             return None
 
@@ -1016,12 +998,7 @@ def pretrain_model(
     )
 
     if accelerator.is_main_process:
-        all_param_shapes = get_param_shapes(model)
-        # Filter out LLM parameters
-        param_shapes = OrderedDict()
-        for key, shape in all_param_shapes.items():
-            if not key.startswith('llm_module.'):
-                param_shapes[key] = shape
+        param_shapes = get_param_shapes(model)
     else:
         param_shapes = None
     param_shapes = broadcast_object_list([param_shapes], from_process=0)[0]
@@ -1292,12 +1269,7 @@ def finetune_model(
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=learning_rate_decay)
 
     if accelerator.is_main_process:
-        all_param_shapes = get_param_shapes(model)
-        # Filter out LLM parameters
-        param_shapes = OrderedDict()
-        for key, shape in all_param_shapes.items():
-            if not key.startswith('llm_module.'):
-                param_shapes[key] = shape
+        param_shapes = get_param_shapes(model)
     else:
         param_shapes = None
     param_shapes = broadcast_object_list([param_shapes], from_process=0)[0]
@@ -1613,12 +1585,7 @@ def pretrain_with_hyperparameter(
 
     # Get the parameter shapes for unflattening later
     if accelerator.is_main_process:
-        all_param_shapes = get_param_shapes(model)
-        # Filter out LLM parameters
-        param_shapes = OrderedDict()
-        for key, shape in all_param_shapes.items():
-            if not key.startswith('llm_module.'):
-                param_shapes[key] = shape
+        param_shapes = get_param_shapes(model)
     else:
         param_shapes = None
     param_shapes = broadcast_object_list([param_shapes], from_process=0)[0]    

@@ -959,28 +959,31 @@ def filter_timeseries_records(
 
 def collate_tensorized(batch: MixedDataset) -> MixedTensorDataset:
     """Collate function for MixedDataset.
-    
+
     Takes a list of episode dicts and stacks them into the MixedTensorDataset format expected by the model.
+    Pre-computed text embeddings are stacked into a single tensor at
+    batch['val_data']['text']['embedded_values'] with shape
+    [batch_size, max_ts_len, n_text_feats, embed_dim].
     """
-    
+
     # Stack simple tensors directly
     val_times = torch.stack([b['val_times'] for b in batch], dim=0)
     val_masks = torch.stack([b['val_masks'] for b in batch], dim=0)
     event_times = torch.stack([b['event_times'] for b in batch], dim=0)
     event_masks = torch.stack([b['event_masks'] for b in batch], dim=0)
     static_data = torch.stack([b['static_data'] for b in batch], dim=0)
-    
+
     # Stack indicator tensors
     val_numeric_ind = torch.stack([b['val_numeric_indicators'] for b in batch], dim=0)
     val_categorical_ind = torch.stack([b['val_categorical_indicators'] for b in batch], dim=0)
     val_text_ind = torch.stack([b['val_text_indicators'] for b in batch], dim=0)
     event_ind = torch.stack([b['event_indicators'] for b in batch], dim=0)
-    
+
     # Stack per-feature value tensors
     n_numeric_feats = len(batch[0]['val_numeric_values'])
     n_categorical_feats = len(batch[0]['val_categorical_values'])
-    n_text_feats = len(batch[0]['val_text_values'])
-    
+    n_text_feats = len(batch[0]['val_text_embeddings'])
+
     val_numeric_values = [
         torch.stack([b['val_numeric_values'][f] for b in batch], dim=0)
         for f in range(n_numeric_feats)
@@ -989,22 +992,26 @@ def collate_tensorized(batch: MixedDataset) -> MixedTensorDataset:
         torch.stack([b['val_categorical_values'][f] for b in batch], dim=0)
         for f in range(n_categorical_feats)
     ]
-    val_text_values = [
-        torch.stack([b['val_text_values'][f] for b in batch], dim=0)
-        for f in range(n_text_feats)
-    ]
-    val_text_masks = [
-        torch.stack([b['val_text_masks'][f] for b in batch], dim=0)
-        for f in range(n_text_feats)
-    ]
-    
+
+    # Stack pre-computed text embeddings into [batch, max_ts, n_text_feats, embed_dim]
+    # Each b['val_text_embeddings'][f] has shape [max_ts_len, embed_dim]
+    # First stack features: [max_ts_len, n_text_feats, embed_dim] per episode
+    # Then stack episodes: [batch_size, max_ts_len, n_text_feats, embed_dim]
+    if n_text_feats > 0:
+        val_text_embeddings = torch.stack([
+            torch.stack(b['val_text_embeddings'], dim=1)  # [max_ts, n_feats, embed_dim]
+            for b in batch
+        ], dim=0)  # [batch, max_ts, n_feats, embed_dim]
+    else:
+        val_text_embeddings = None
+
     # Stack targets
     mortality = torch.stack([b['mortality'] for b in batch], dim=0).unsqueeze(-1)
     length_of_stay = torch.stack([b['length_of_stay'] for b in batch], dim=0).unsqueeze(-1)
     phenotype = torch.stack([b['phenotype'] for b in batch], dim=0)
-    
+
     # Build the MixedTensorDataset structure expected by the model
-    return {
+    result = {
         'val_data': {
             'numeric': {
                 'indicators': val_numeric_ind,
@@ -1013,11 +1020,6 @@ def collate_tensorized(batch: MixedDataset) -> MixedTensorDataset:
             'categorical': {
                 'indicators': val_categorical_ind,
                 'values': val_categorical_values,
-            },
-            'text': {
-                'indicators': val_text_ind,
-                'values': val_text_values,
-                'masks': val_text_masks,
             },
             'times': val_times,
             'masks': val_masks,
@@ -1035,16 +1037,24 @@ def collate_tensorized(batch: MixedDataset) -> MixedTensorDataset:
         },
     }
 
+    if val_text_embeddings is not None:
+        result['val_data']['text'] = {
+            'indicators': val_text_ind,
+            'embedded_values': val_text_embeddings,
+        }
+
+    return result
+
 
 def save_dataset(dataset: MixedDataset, base_path: str) -> None:
     """
     Save tensorized dataset as directory of .npy files (memory-mappable).
     """
     os.makedirs(base_path, exist_ok=True)
-    
+
     def save_array(name: str, arr: np.ndarray):
         np.save(os.path.join(base_path, f'{name}.npy'), arr)
-    
+
     # Dense arrays
     save_array('val_numeric_indicators', dataset.val_numeric_indicators)
     save_array('val_categorical_indicators', dataset.val_categorical_indicators)
@@ -1058,7 +1068,7 @@ def save_dataset(dataset: MixedDataset, base_path: str) -> None:
     save_array('mortality', dataset.mortality)
     save_array('length_of_stay', dataset.length_of_stay)
     save_array('phenotype', dataset.phenotype)
-    
+
     # Per-feature arrays
     for i, arr in enumerate(dataset.val_numeric_values):
         save_array(f'val_numeric_values_{i}', arr)
@@ -1072,35 +1082,55 @@ def save_dataset(dataset: MixedDataset, base_path: str) -> None:
         save_array(f'val_text_masks_{i}', arr)
     for i, arr in enumerate(dataset.val_text_timesteps):
         save_array(f'val_text_timesteps_{i}', arr)
-    
+    for i, arr in enumerate(dataset.val_text_embeddings):
+        save_array(f'val_text_embeddings_{i}', arr)
+
     # Metadata
     metadata = {
         'max_ts_len': dataset.max_ts_len,
         'text_token_len': dataset.text_token_len,
+        'text_embed_dim': dataset.text_embed_dim,
         'n_numeric_feats': len(dataset.val_numeric_values),
         'n_categorical_feats': len(dataset.val_categorical_values),
         'n_text_feats': dataset.n_text_feats,
     }
     with open(os.path.join(base_path, 'metadata.pkl'), 'wb') as f:
         pickle.dump(metadata, f)
-    
+
     print(f"Saved tensorized dataset to {base_path}/")
 
 
 def load_dataset(base_path: str) -> MixedDataset:
     """
     Load tensorized dataset with memory-mapped arrays.
+
+    Backward-compatible: if pre-computed embedding files are not present
+    (old datasets created before the pre-embedding overhaul), empty lists
+    are used for val_text_embeddings and text_embed_dim defaults to 0.
+    The training script will fail fast if it expects embeddings and they
+    are missing.
     """
     def load_mmap(name: str) -> np.ndarray:
         return np.load(os.path.join(base_path, f'{name}.npy'), mmap_mode='r')
-    
+
     with open(os.path.join(base_path, 'metadata.pkl'), 'rb') as f:
         metadata = pickle.load(f)
-    
+
     n_num = metadata['n_numeric_feats']
     n_cat = metadata['n_categorical_feats']
     n_txt = metadata['n_text_feats']
-    
+    text_embed_dim = metadata.get('text_embed_dim', 0)
+
+    # Load pre-computed embeddings if available (backward-compatible)
+    val_text_embeddings = []
+    if text_embed_dim > 0:
+        for i in range(n_txt):
+            embed_path = os.path.join(base_path, f'val_text_embeddings_{i}.npy')
+            if os.path.exists(embed_path):
+                val_text_embeddings.append(
+                    np.load(embed_path, mmap_mode='r')
+                )
+
     return MixedDataset(
         val_numeric_indicators=load_mmap('val_numeric_indicators'),
         val_numeric_values=[load_mmap(f'val_numeric_values_{i}') for i in range(n_num)],
@@ -1113,6 +1143,8 @@ def load_dataset(base_path: str) -> MixedDataset:
         val_text_values=[load_mmap(f'val_text_values_{i}') for i in range(n_txt)],
         val_text_masks=[load_mmap(f'val_text_masks_{i}') for i in range(n_txt)],
         val_text_timesteps=[load_mmap(f'val_text_timesteps_{i}') for i in range(n_txt)],
+        val_text_embeddings=val_text_embeddings,
+        text_embed_dim=text_embed_dim,
         event_indicators=load_mmap('event_indicators'),
         event_times=load_mmap('event_times'),
         event_masks=load_mmap('event_masks'),
@@ -1497,7 +1529,7 @@ def extract_mimic(
     print("Saving dataset...")
     sys.stdout.flush()
     
-    # Create dataset with sparse text
+    # Create dataset with sparse text (embeddings will be added later by embed_text.py)
     dataset = MixedDataset(
         val_numeric_indicators=arrays['val_numeric_indicators'],
         val_numeric_values=arrays['val_numeric_values'],
@@ -1506,11 +1538,13 @@ def extract_mimic(
         val_text_indicators=arrays['val_text_indicators'],
         val_times=arrays['val_times'],
         val_masks=arrays['val_masks'],
-        # Sparse text
+        # Sparse text (tokens for XAI, embeddings added by embed_text.py)
         val_text_offsets=val_text_offsets,
         val_text_values=val_text_values,
         val_text_masks=val_text_masks,
         val_text_timesteps=val_text_timesteps,
+        val_text_embeddings=[],  # Populated by embed_text.py
+        text_embed_dim=0,  # Set by embed_text.py
         # Event data
         event_indicators=arrays['event_indicators'],
         event_times=arrays['event_times'],

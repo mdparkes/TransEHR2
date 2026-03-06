@@ -16,12 +16,13 @@ from accelerate.utils import DistributedType
 from torch.utils.tensorboard import SummaryWriter
 from typing import Any, Dict, Tuple
 
-from TransEHR2.constants import TEXT_EMBED_DIM
+import pickle
+import re
+
 from TransEHR2.data.preprocessing import prepare_dataloaders
 from TransEHR2.models import ELECTRA
 from TransEHR2.modules import MaskedTokenDiscriminator, MaskedTokenGenerator, TransformerHawkesProcess
 from TransEHR2.modules import EventDataEncoder, ValueDataEncoder
-from TransEHR2.modules import GradientTraceableLLM
 from TransEHR2.routines_accelerate import pretrain_with_hyperparameter
 from TransEHR2.utils import create_timer, convert_to_python_types
 
@@ -38,13 +39,9 @@ def initialize_accelerator(use_text: bool) -> Accelerator:
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
     
-    if use_text and accelerator.distributed_type not in (DistributedType.FSDP, DistributedType.MULTI_GPU):
+    if accelerator.distributed_type not in (DistributedType.FSDP, DistributedType.MULTI_GPU):
         raise ValueError(
-            f"USE_TEXT=True requires FSDP or MULTI_GPU but accelerator is configured for {accelerator.distributed_type}."
-        )
-    elif not use_text and accelerator.distributed_type != DistributedType.MULTI_GPU:
-        raise ValueError(
-            f"USE_TEXT=False expects MULTI_GPU (DDP) but accelerator is configured for {accelerator.distributed_type}."
+            f"Expected FSDP or MULTI_GPU but accelerator is configured for {accelerator.distributed_type}."
         )
     
     return accelerator
@@ -282,17 +279,27 @@ if __name__ == "__main__":
             numeric_feat_dims.append(variable_properties[feature]['size'])
         elif variable_properties[feature]['type'] == 'categorical':
             categorical_class_cnts.append(len(variable_properties[feature]['category_map']))
-    if USE_TEXT:
-        n_val_feats = len(VALUED_FEATS) + len(TEXT_FEATS)
-        tot_val_feat_dim += len(TEXT_FEATS) * TEXT_EMBED_DIM
-    else:
-        n_val_feats = len(VALUED_FEATS)
-    n_event_types = len(EVENT_FEATS)
-
-
     # Get fold directory
     fold_name = 'fold0'
     fold_dir = os.path.join(DATA_DIR, fold_name)
+
+    if USE_TEXT:
+        n_val_feats = len(VALUED_FEATS) + len(TEXT_FEATS)
+        # Read text_embed_dim from fold0's dataset metadata
+        meta_path = os.path.join(fold_dir, 'train', 'metadata.pkl')
+        with open(meta_path, 'rb') as f:
+            _meta = pickle.load(f)
+        text_embed_dim = _meta['text_embed_dim']
+        if text_embed_dim == 0:
+            raise RuntimeError(
+                "text_embed_dim is 0 in dataset metadata. "
+                "Run embed_text.py to pre-compute text embeddings before tuning."
+            )
+        tot_val_feat_dim += len(TEXT_FEATS) * text_embed_dim
+    else:
+        n_val_feats = len(VALUED_FEATS)
+        text_embed_dim = 0
+    n_event_types = len(EVENT_FEATS)
 
 
     # Setup directories
@@ -372,7 +379,6 @@ if __name__ == "__main__":
 
 
                 # Initialize models
-                pretrain_llm_module = GradientTraceableLLM() if USE_TEXT else None
                 generator_encoder = ValueDataEncoder(
                     n_features=n_val_feats, feat_dim=tot_val_feat_dim,
                     d_model=GENERATOR_ENCODER_D_MODEL, n_heads=GENERATOR_ENCODER_N_HEADS,
@@ -403,7 +409,8 @@ if __name__ == "__main__":
                     categorical_classes=categorical_class_cnts,
                     n_text_features=len(TEXT_FEATS) if USE_TEXT else 0,
                     predict_indicators=PREDICT_INDICATORS,
-                    dim_feedforward=GENERATOR_DIM_FEEDFORWARD
+                    dim_feedforward=GENERATOR_DIM_FEEDFORWARD,
+                    text_embed_dim=text_embed_dim,
                 )
                 discriminator = MaskedTokenDiscriminator(
                     encoder=discriminator_encoder,
@@ -419,11 +426,10 @@ if __name__ == "__main__":
                     num_types=n_event_types
                 )
                 electra = ELECTRA(
-                    generator=generator, 
+                    generator=generator,
                     discriminator=discriminator,
-                    hawkes=transformer_hawkes_process, 
+                    hawkes=transformer_hawkes_process,
                     use_text=USE_TEXT,
-                    llm_module=pretrain_llm_module  # Will be None when USE_TEXT is False
                 )
 
                 # Create TensorBoard writer
@@ -487,7 +493,6 @@ if __name__ == "__main__":
                 del generator_encoder
                 del discriminator_encoder
                 del thp_encoder
-                del pretrain_llm_module
                 gc.collect()
                 torch.cuda.empty_cache()
                 accelerator.wait_for_everyone()

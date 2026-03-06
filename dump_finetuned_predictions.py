@@ -19,6 +19,7 @@ import gc
 import numpy as np
 import os
 import pandas as pd
+import pickle
 import re
 import torch
 import yaml
@@ -29,10 +30,9 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from typing import Dict, List, Optional, Tuple
 
-from TransEHR2.constants import TEXT_EMBED_DIM
 from TransEHR2.data.preprocessing import load_dataset, collate_tensorized
 from TransEHR2.models import MixedClassifier
-from TransEHR2.modules import EventDataEncoder, ValueDataEncoder, GradientTraceableLLM
+from TransEHR2.modules import EventDataEncoder, ValueDataEncoder
 from TransEHR2.utils import get_param_shapes, move_batch_to_device
 
 
@@ -50,10 +50,8 @@ def reshape_flattened_state_dict(
 ) -> StateDict:
     """Reshape flattened FSDP state dict to match expected parameter shapes.
 
-    LLM parameters are intentionally excluded from state dicts since the LLM
-    is frozen and always initialised from HuggingFace weights.  This function
-    is primarily needed for FSDP, which may flatten parameters.  For DDP,
-    parameters retain their original shapes.
+    This function is primarily needed for FSDP, which may flatten parameters.
+    For DDP, parameters retain their original shapes.
     """
 
     def strip_fsdp_prefix(key: str) -> str:
@@ -62,8 +60,6 @@ def reshape_flattened_state_dict(
         ]:
             if prefix in key:
                 key = key.replace(prefix, '')
-        if key.startswith('llm_model.'):
-            key = key.replace('llm_model.', 'llm_module.model.')
         return key
 
     reshaped: StateDict = OrderedDict()
@@ -94,12 +90,10 @@ def reshape_flattened_state_dict(
             else:
                 reshaped[clean_key] = tensor.clone()
         else:
-            if not (clean_key.startswith('llm_module.')
-                    or clean_key.startswith('llm_model.')):
-                print(
-                    f"Warning: No expected shape for {clean_key}, "
-                    f"keeping original shape {tensor.shape}"
-                )
+            print(
+                f"Warning: No expected shape for {clean_key}, "
+                f"keeping original shape {tensor.shape}"
+            )
             reshaped[clean_key] = tensor.clone()
 
     return reshaped
@@ -221,13 +215,11 @@ def build_classifier(
         n_event_types: Number of event feature types.
         n_static_feats: Number of static features.
         num_classes: Number of prediction output classes.
-        use_text: Whether to initialise the model with an LLM module.
+        use_text: Whether the model uses text features.
 
     Returns:
         An uninitialised (randomly weighted) MixedClassifier instance.
     """
-    llm_module = GradientTraceableLLM() if use_text else None
-
     val_encoder = ValueDataEncoder(
         n_features=n_val_feats,
         feat_dim=tot_val_feat_dim,
@@ -259,15 +251,13 @@ def build_classifier(
         d_statics=n_static_feats,
         num_classes=num_classes,
         aggr=experiment_config['PREDICTOR_AGGREGATION_METHOD'],
-        use_text=use_text,
-        llm_module=llm_module
+        use_text=use_text
     )
 
 
 def load_finetuned_weights(
     model: MixedClassifier,
-    weights_path: str,
-    use_text: bool = False
+    weights_path: str
 ) -> bool:
     """Load finetuned state dict into a MixedClassifier.
 
@@ -277,9 +267,6 @@ def load_finetuned_weights(
     Args:
         model: The MixedClassifier to load weights into.
         weights_path: Path to the saved .pt state dict file.
-        use_text: Whether the model uses text/LLM features. When False,
-            strict loading is used so any key mismatch raises an error
-            immediately.
 
     Returns:
         True if weights were loaded successfully, False if the file was
@@ -294,26 +281,20 @@ def load_finetuned_weights(
     param_shapes = get_param_shapes(model)
     state_dict = reshape_flattened_state_dict(state_dict, param_shapes)
 
-    # When USE_TEXT is False every parameter must be present in the
-    # state dict, so use strict=True to surface mismatches immediately.
-    # When USE_TEXT is True the frozen LLM params are intentionally
-    # absent from the saved state dict.
-    strict = not use_text
-    result = model.load_state_dict(state_dict, strict=strict)
+    # LLM params are no longer in the model, so strict loading should work
+    result = model.load_state_dict(state_dict, strict=False)
 
-    if not strict:
-        if result.missing_keys:
-            llm_missing = [k for k in result.missing_keys
-                           if k.startswith('llm_module.')]
-            other_missing = [k for k in result.missing_keys
-                             if not k.startswith('llm_module.')]
-            if other_missing:
-                print(f"    WARNING: {len(other_missing)} non-LLM keys "
-                      f"missing from state dict: {other_missing}")
-        if result.unexpected_keys:
-            print(f"    WARNING: {len(result.unexpected_keys)} "
+    if result.missing_keys:
+        print(f"    WARNING: {len(result.missing_keys)} keys "
+              f"missing from state dict: {result.missing_keys}")
+    if result.unexpected_keys:
+        # Filter out old llm_module keys from pre-existing state dicts
+        non_llm_unexpected = [k for k in result.unexpected_keys
+                              if not k.startswith('llm_module.')]
+        if non_llm_unexpected:
+            print(f"    WARNING: {len(non_llm_unexpected)} "
                   f"unexpected keys in state dict: "
-                  f"{result.unexpected_keys}")
+                  f"{non_llm_unexpected}")
 
     # Verify no NaN values in loaded parameters
     nan_params = [name for name, p in model.named_parameters()
@@ -555,7 +536,20 @@ if __name__ == '__main__':
         tot_val_feat_dim += variable_properties[feature]['size']
     if USE_TEXT:
         n_val_feats = len(VALUED_FEATS) + len(TEXT_FEATS)
-        tot_val_feat_dim += len(TEXT_FEATS) * TEXT_EMBED_DIM
+        # Read text_embed_dim from the first fold's dataset metadata
+        fold_names_all = get_fold_names(DATA_DIR, exclude=['fold0'])
+        first_fold_meta_path = os.path.join(
+            DATA_DIR, fold_names_all[0], 'train', 'metadata.pkl'
+        )
+        with open(first_fold_meta_path, 'rb') as f:
+            _meta = pickle.load(f)
+        text_embed_dim = _meta['text_embed_dim']
+        if text_embed_dim == 0:
+            raise RuntimeError(
+                "text_embed_dim is 0 in dataset metadata. "
+                "Run embed_text.py to pre-compute text embeddings before inference."
+            )
+        tot_val_feat_dim += len(TEXT_FEATS) * text_embed_dim
     else:
         n_val_feats = len(VALUED_FEATS)
     n_event_types = len(EVENT_FEATS)
@@ -622,7 +616,7 @@ if __name__ == '__main__':
                 MODEL_DIR, EXPERIMENT_NAME, fold_name,
                 'pretrained', f'finetuned_{task}.pt'
             )
-            if not load_finetuned_weights(model, weights_path, USE_TEXT):
+            if not load_finetuned_weights(model, weights_path):
                 print(f"    WARNING: Weights not found at {weights_path}, "
                       f"skipping.")
                 del model
