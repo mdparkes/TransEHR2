@@ -462,6 +462,35 @@ if __name__ == "__main__":
                 torch.cuda.empty_cache()
             accelerator = initialize_accelerator(USE_TEXT)
 
+            # Check if this task is already fully completed or if finetuning can be skipped
+            finetuned_model_path = f'{model_save_dir}/finetuned_{task}.pt'
+            evaluation_file = (
+                f'{MODEL_DIR}/{EXPERIMENT_NAME}/{fold_name}/{task}'
+                f'/evaluation/evaluation_{task}.yaml'
+            )
+            if accelerator.is_main_process:
+                _model_exists = os.path.exists(finetuned_model_path)
+                _eval_exists = os.path.exists(evaluation_file)
+            else:
+                _model_exists = False
+                _eval_exists = False
+            _flags = broadcast_object_list([_model_exists, _eval_exists], from_process=0)
+            _model_exists, _eval_exists = _flags
+
+            # Skip entire task if evaluation already completed
+            if _eval_exists:
+                if accelerator.is_main_process:
+                    print(f"\nEvaluation for {task} already completed, skipping.\n")
+                accelerator.free_memory()
+                del accelerator
+                gc.collect()
+                torch.cuda.empty_cache()
+                continue
+
+            skip_finetuning = _model_exists
+            if skip_finetuning and accelerator.is_main_process:
+                print(f"\nFinetuned {task} model found, skipping finetuning.\n")
+
             checkpoint_dir = f'./checkpoints/{EXPERIMENT_NAME}/{fold_name}/finetuned'
             log_dir = f'./log/{EXPERIMENT_NAME}/{fold_name}/finetuned_{task}'
             if accelerator.is_main_process:
@@ -489,120 +518,130 @@ if __name__ == "__main__":
                 prediction_output_shape = 1
 
 
-            # Create a new LLM module for this task
-            if USE_TEXT:
-                finetune_llm_module = GradientTraceableLLM()
-            else:
-                finetune_llm_module = None
-            # Initialize the downstream predictor. The encoders are reinitialized with pretraining parameters.
-            predictor_value_encoder = ValueDataEncoder(
-                n_features=n_val_feats,
-                feat_dim=tot_val_feat_dim,
-                d_model=DISCRIMINATOR_ENCODER_D_MODEL,
-                n_heads=DISCRIMINATOR_ENCODER_N_HEADS,
-                n_encoder_blocks=DISCRIMINATOR_ENCODER_N_ENCODER_BLOCKS,
-                dim_feedforward=DISCRIMINATOR_ENCODER_DIM_FEEDFORWARD,
-                dropout=DISCRIMINATOR_ENCODER_DROPOUT,
-                activation=DISCRIMINATOR_ENCODER_ACTIVATION,
-                norm=DISCRIMINATOR_ENCODER_NORM,
-                normalize_before=DISCRIMINATOR_ENCODER_NORM_FIRST
-            )
-            predictor_event_encoder = EventDataEncoder(
-                num_types=n_event_types,
-                d_model=THP_ENCODER_D_MODEL,
-                d_inner=THP_ENCODER_D_INNER,
-                n_layers=THP_ENCODER_N_LAYERS,
-                n_head=THP_ENCODER_N_HEADS,
-                d_k=THP_ENCODER_D_K,
-                d_v=THP_ENCODER_D_V,
-                dropout=THP_ENCODER_DROPOUT,
-                normalize_before=THP_ENCODER_NORM_FIRST
-            )
-            downstream_predictor = MixedClassifier(
-                event_encoder=predictor_event_encoder,
-                val_encoder=predictor_value_encoder,
-                d_event_enc=THP_ENCODER_D_MODEL,
-                d_val_enc=DISCRIMINATOR_ENCODER_D_MODEL,
-                d_statics=len(STATIC_FEATS),
-                num_classes=prediction_output_shape,
-                aggr=PREDICTOR_AGGREGATION_METHOD,
-                use_text=USE_TEXT,
-                llm_module=finetune_llm_module  # Will be None when USE_TEXT is False
-            )
-
-            # Load pretrained encoder weights into downstream predictor
-            pretrained_dir = f'{MODEL_DIR}/{EXPERIMENT_NAME}/{fold_name}/pretrained'
-            value_encoder_path = os.path.join(pretrained_dir, 'value_encoder.pt')
-            event_encoder_path = os.path.join(pretrained_dir, 'event_encoder.pt')
-            if accelerator.is_main_process:
-                encoders_exist = os.path.exists(value_encoder_path) and os.path.exists(event_encoder_path)
-                if not encoders_exist:
-                    raise FileNotFoundError(
-                        f"Encoder weights not found in {pretrained_dir}. "
-                        f"Expected files: value_encoder.pt and event_encoder.pt. "
-                        f"Make sure pretraining completed successfully."
-                    )
+            if not skip_finetuning:
+                # Create a new LLM module for this task
+                if USE_TEXT:
+                    finetune_llm_module = GradientTraceableLLM()
                 else:
-                    print(f"\nLoading encoder weights from {pretrained_dir}\n")
-                    value_encoder_state = torch.load(value_encoder_path, map_location='cpu', weights_only=False)
-                    event_encoder_state = torch.load(event_encoder_path, map_location='cpu', weights_only=False)
-            else:
-                value_encoder_state = None
-                event_encoder_state = None
-            value_encoder_state = broadcast_object_list([value_encoder_state], from_process=0)[0]
-            event_encoder_state = broadcast_object_list([event_encoder_state], from_process=0)[0]
-            downstream_predictor.val_encoder.load_state_dict(value_encoder_state)
-            downstream_predictor.event_encoder.load_state_dict(event_encoder_state)
-            del value_encoder_state
-            del event_encoder_state
-            if accelerator.is_main_process:
-                    print("Successfully loaded encoder weights\n")
-            accelerator.wait_for_everyone()
-
-
-            # Get parameter shapes before wrapping with Accelerator
-            if accelerator.is_main_process:
-                finetune_param_shapes = get_param_shapes(downstream_predictor)
-            else:
-                finetune_param_shapes = None
-            finetune_param_shapes = broadcast_object_list([finetune_param_shapes], from_process=0)[0]
-
-
-            # Supervised task-specific finetuning
-            # Returns the scores from the best-performing epoch as determined by validation set performance
-            timer.start_phase('finetune', is_main_process=accelerator.is_main_process)
-            try:
-                best_train_scores, best_validation_scores = finetune_model(
-                    model=downstream_predictor,
-                    save_path=f'{model_save_dir}/finetuned_{task}.pt',
-                    loaders=[train_loader, val_loader],
-                    task=task,
-                    writer=writer,
-                    learning_rate=FINETUNE_LEARNING_RATE,
-                    learning_rate_decay=FINETUNE_LEARNING_RATE_DECAY,
-                    total_epoch=FINETUNE_TOTAL_EPOCH,
-                    checkpoint_dir=checkpoint_dir,
-                    accelerator=accelerator,
-                    mem_test_mode=mem_test_mode
+                    finetune_llm_module = None
+                # Initialize the downstream predictor. The encoders are reinitialized with pretraining parameters.
+                predictor_value_encoder = ValueDataEncoder(
+                    n_features=n_val_feats,
+                    feat_dim=tot_val_feat_dim,
+                    d_model=DISCRIMINATOR_ENCODER_D_MODEL,
+                    n_heads=DISCRIMINATOR_ENCODER_N_HEADS,
+                    n_encoder_blocks=DISCRIMINATOR_ENCODER_N_ENCODER_BLOCKS,
+                    dim_feedforward=DISCRIMINATOR_ENCODER_DIM_FEEDFORWARD,
+                    dropout=DISCRIMINATOR_ENCODER_DROPOUT,
+                    activation=DISCRIMINATOR_ENCODER_ACTIVATION,
+                    norm=DISCRIMINATOR_ENCODER_NORM,
+                    normalize_before=DISCRIMINATOR_ENCODER_NORM_FIRST
                 )
-            except Exception as e:
+                predictor_event_encoder = EventDataEncoder(
+                    num_types=n_event_types,
+                    d_model=THP_ENCODER_D_MODEL,
+                    d_inner=THP_ENCODER_D_INNER,
+                    n_layers=THP_ENCODER_N_LAYERS,
+                    n_head=THP_ENCODER_N_HEADS,
+                    d_k=THP_ENCODER_D_K,
+                    d_v=THP_ENCODER_D_V,
+                    dropout=THP_ENCODER_DROPOUT,
+                    normalize_before=THP_ENCODER_NORM_FIRST
+                )
+                downstream_predictor = MixedClassifier(
+                    event_encoder=predictor_event_encoder,
+                    val_encoder=predictor_value_encoder,
+                    d_event_enc=THP_ENCODER_D_MODEL,
+                    d_val_enc=DISCRIMINATOR_ENCODER_D_MODEL,
+                    d_statics=len(STATIC_FEATS),
+                    num_classes=prediction_output_shape,
+                    aggr=PREDICTOR_AGGREGATION_METHOD,
+                    use_text=USE_TEXT,
+                    llm_module=finetune_llm_module  # Will be None when USE_TEXT is False
+                )
+
+                # Load pretrained encoder weights into downstream predictor
+                pretrained_dir = f'{MODEL_DIR}/{EXPERIMENT_NAME}/{fold_name}/pretrained'
+                value_encoder_path = os.path.join(pretrained_dir, 'value_encoder.pt')
+                event_encoder_path = os.path.join(pretrained_dir, 'event_encoder.pt')
                 if accelerator.is_main_process:
-                    print(f'Error during finetuning for task {task}: {e}')
-                raise
-            timer.end_phase('finetune', is_main_process=accelerator.is_main_process)
+                    encoders_exist = os.path.exists(value_encoder_path) and os.path.exists(event_encoder_path)
+                    if not encoders_exist:
+                        raise FileNotFoundError(
+                            f"Encoder weights not found in {pretrained_dir}. "
+                            f"Expected files: value_encoder.pt and event_encoder.pt. "
+                            f"Make sure pretraining completed successfully."
+                        )
+                    else:
+                        print(f"\nLoading encoder weights from {pretrained_dir}\n")
+                        value_encoder_state = torch.load(value_encoder_path, map_location='cpu', weights_only=False)
+                        event_encoder_state = torch.load(event_encoder_path, map_location='cpu', weights_only=False)
+                else:
+                    value_encoder_state = None
+                    event_encoder_state = None
+                value_encoder_state = broadcast_object_list([value_encoder_state], from_process=0)[0]
+                event_encoder_state = broadcast_object_list([event_encoder_state], from_process=0)[0]
+                downstream_predictor.val_encoder.load_state_dict(value_encoder_state)
+                downstream_predictor.event_encoder.load_state_dict(event_encoder_state)
+                del value_encoder_state
+                del event_encoder_state
+                if accelerator.is_main_process:
+                        print("Successfully loaded encoder weights\n")
+                accelerator.wait_for_everyone()
 
 
-            # Clean up
-            if writer is not None:
-                writer.close()
-                del writer
-            del downstream_predictor
-            del predictor_value_encoder
-            del predictor_event_encoder
-            del finetune_llm_module
-            del accelerator
-            gc.collect()
-            torch.cuda.empty_cache()
+                # Get parameter shapes before wrapping with Accelerator
+                if accelerator.is_main_process:
+                    finetune_param_shapes = get_param_shapes(downstream_predictor)
+                else:
+                    finetune_param_shapes = None
+                finetune_param_shapes = broadcast_object_list([finetune_param_shapes], from_process=0)[0]
+
+
+                # Supervised task-specific finetuning
+                # Returns the scores from the best-performing epoch as determined by validation set performance
+                timer.start_phase('finetune', is_main_process=accelerator.is_main_process)
+                try:
+                    best_train_scores, best_validation_scores = finetune_model(
+                        model=downstream_predictor,
+                        save_path=f'{model_save_dir}/finetuned_{task}.pt',
+                        loaders=[train_loader, val_loader],
+                        task=task,
+                        writer=writer,
+                        learning_rate=FINETUNE_LEARNING_RATE,
+                        learning_rate_decay=FINETUNE_LEARNING_RATE_DECAY,
+                        total_epoch=FINETUNE_TOTAL_EPOCH,
+                        checkpoint_dir=checkpoint_dir,
+                        accelerator=accelerator,
+                        mem_test_mode=mem_test_mode
+                    )
+                except Exception as e:
+                    if accelerator.is_main_process:
+                        print(f'Error during finetuning for task {task}: {e}')
+                    raise
+                timer.end_phase('finetune', is_main_process=accelerator.is_main_process)
+
+
+                # Clean up
+                if writer is not None:
+                    writer.close()
+                    del writer
+                del downstream_predictor
+                del predictor_value_encoder
+                del predictor_event_encoder
+                del finetune_llm_module
+                del accelerator
+                gc.collect()
+                torch.cuda.empty_cache()
+            else:
+                # Close unused TensorBoard writer and clean up accelerator
+                if writer is not None:
+                    writer.close()
+                    del writer
+                accelerator.free_memory()
+                del accelerator
+                gc.collect()
+                torch.cuda.empty_cache()
 
 
             # Create a fresh accelerator because it solves problems
@@ -648,6 +687,13 @@ if __name__ == "__main__":
                 llm_module=finetune_llm_module
             )
 
+            # Get parameter shapes from the unwrapped model for reshaping finetuned state dict
+            if accelerator.is_main_process:
+                finetune_param_shapes = get_param_shapes(downstream_predictor)
+            else:
+                finetune_param_shapes = None
+            finetune_param_shapes = broadcast_object_list([finetune_param_shapes], from_process=0)[0]
+
             # Load the finetuned state dict from file on the main process
             finetuned_state_dict_path = f'{model_save_dir}/finetuned_{task}.pt'
             if accelerator.is_main_process:
@@ -689,8 +735,10 @@ if __name__ == "__main__":
 
             # Save and print results from this task
             if accelerator.is_main_process:
-                best_train_scores = convert_to_python_types(best_train_scores)
-                best_validation_scores = convert_to_python_types(best_validation_scores)
+                if best_train_scores is not None:
+                    best_train_scores = convert_to_python_types(best_train_scores)
+                if best_validation_scores is not None:
+                    best_validation_scores = convert_to_python_types(best_validation_scores)
                 best_test_scores = convert_to_python_types(best_test_scores)
                 # Save performance metrics from the best models to YAML files
                 evaluation_dir = f'{MODEL_DIR}/{EXPERIMENT_NAME}/{fold_name}/{task}/evaluation'
