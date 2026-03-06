@@ -773,9 +773,16 @@ if __name__ == "__main__":
         gc.collect()
         torch.cuda.empty_cache()
 
+        # Ensure accelerator exists (it may have been deleted if all tasks were skipped)
+        if 'accelerator' not in locals():
+            accelerator = initialize_accelerator(USE_TEXT)
 
         timer.end_fold(is_main_process=accelerator.is_main_process)
 
+
+    # Ensure accelerator exists for final summary
+    if 'accelerator' not in locals():
+        accelerator = initialize_accelerator(USE_TEXT)
 
     if accelerator.is_main_process:
         timer.print_final_summary(is_main_process=accelerator.is_main_process)
