@@ -801,20 +801,34 @@ def convert_to_python_types(data: Dict[str, Any]) -> Dict[str, Any]:
 
 def calc_time_diff(event_times: Tensor, non_pad_mask: Tensor, device: str) -> Tensor:
         """Calculate time differences between consecutive events.
-        
-        Temporal differences are calculated between the current timestamp and the previous one.
+
+        Temporal differences are calculated between the current
+        timestamp and the previous one. A delta is valid only when
+        *both* the current and previous timesteps are non-padding;
+        otherwise the delta is zeroed out. This prevents spurious
+        deltas at the boundary between left-padded zeros and the
+        first real historical timestep.
 
         Args:
-            event_times (Tensor): Event timestamps of shape (batch_size, max_ts_len)
-            non_pad_mask (Tensor): Non-padding mask of shape (batch_size, max_ts_len)
-        
+            event_times (Tensor): Event timestamps of shape
+                (batch_size, max_ts_len)
+            non_pad_mask (Tensor): Non-padding mask of shape
+                (batch_size, max_ts_len)
+
         Returns:
-            Tensor: Time differences of shape (batch_size, max_ts_len). The first timestep has a time difference of zero.
-        
+            Tensor: Time differences of shape
+                (batch_size, max_ts_len). The first timestep has
+                a time difference of zero.
+
         """
-        
+
         time_diff = torch.zeros_like(event_times, device=device)
-        time_diff[:, 1:] = (event_times[:, 1:] - event_times[:, :-1]) * non_pad_mask[:, 1:]
+        # A delta at position i is valid only when both position i
+        # and position i-1 are non-padding.
+        both_valid = non_pad_mask[:, 1:] * non_pad_mask[:, :-1]
+        time_diff[:, 1:] = (
+            (event_times[:, 1:] - event_times[:, :-1]) * both_valid
+        )
 
         return time_diff
 

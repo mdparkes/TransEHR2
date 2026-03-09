@@ -669,9 +669,12 @@ def _process_single_episode(
         val_data = val_data.dropna(axis=0, how='all')
         
         # Filter timeseries
-        val_data, event_data, text_data = filter_timeseries_records(
+        (val_data, event_data, text_data,
+         val_history_len, event_history_len,
+         _max_history_len) = filter_timeseries_records(
             val_data, event_data, text_data,
-            max_history_len_steps, max_episode_len_steps, max_episode_len_hours
+            max_history_len_steps, max_episode_len_steps,
+            max_episode_len_hours
         )
         
         # Merge text with value data
@@ -701,7 +704,9 @@ def _process_single_episode(
         return EpisodeData(
             idx=i,
             val_len=len(val_times),
+            val_history_len=val_history_len,
             event_len=len(event_times),
+            event_history_len=event_history_len,
             val_times=val_times,
             val_numeric_indicators=num_ind,
             val_numeric_values=num_vals,
@@ -910,60 +915,117 @@ def filter_timeseries_records(
         max_history_len: int = 0,
         max_episode_len: int = 100,
         max_episode_len_hours: Optional[int] = None
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, int, int, int]:
+    """Filter timeseries records by history and episode length constraints.
+
+    Returns:
+        Tuple of (numeric_data, event_data, text_data,
+                  val_history_len, event_history_len, max_history_len)
+        where val_history_len and event_history_len are the actual
+        number of pre-admission timesteps retained for value-associated
+        and event-associated data respectively, and max_history_len is
+        the configured maximum history length (for computing left-pad
+        offsets during array insertion).
+    """
+
     def filter(df):
-       
+
         df = df.sort_index()
-            
-        # Exclude records collected more than x hours into the current ICU stay episode
+
+        # Exclude records collected more than x hours into the
+        # current ICU stay episode
         if max_episode_len_hours is not None:
-            selected_records = df.index < np.timedelta64(max_episode_len_hours, 'h')
+            selected_records = (
+                df.index < np.timedelta64(max_episode_len_hours, 'h')
+            )
             df = df.loc[selected_records, :]
 
-        # Get indices of up to x records from the current ICU stay episode, starting from the earliest record
-        episode_record_indices = np.where(df.index >= np.timedelta64(0, 'h'))[0]
-        episode_len = min(len(episode_record_indices), max_episode_len)
-        episode_record_indices = episode_record_indices[:episode_len]  # Indices of the stay's earliest records
-        
-        # Get indices of up to x most recent records that were collected before the current ICU stay episode
-        historic_record_indices = np.where(df.index < np.timedelta64(0, 'h'))[0]
-        history_len = min(len(historic_record_indices), max_history_len)
-        historic_record_indices = historic_record_indices[-history_len:]  # Indices of most recent historic records
-        
-        # Combine to give the indices of records to keep
-        keep = np.concatenate((historic_record_indices, episode_record_indices))  # Indices of records to keep
-        
-        return df.iloc[keep, :]
+        # Get indices of up to x records from the current ICU stay
+        # episode, starting from the earliest record
+        episode_record_indices = np.where(
+            df.index >= np.timedelta64(0, 'h')
+        )[0]
+        episode_len = min(
+            len(episode_record_indices), max_episode_len
+        )
+        episode_record_indices = episode_record_indices[:episode_len]
 
-    event_data = filter(event_data)
-    
-    # Text data will eventually be embedded and merged with numeric feature data, so they must be filtered together
-    # to ensure that the length of the merged timeseries does not exceed the maximum allowed timeseries length.
+        # Get indices of up to x most recent records that were
+        # collected before the current ICU stay episode
+        historic_record_indices = np.where(
+            df.index < np.timedelta64(0, 'h')
+        )[0]
+        history_len = min(
+            len(historic_record_indices), max_history_len
+        )
+        historic_record_indices = (
+            historic_record_indices[-history_len:]
+        )
+
+        # Combine to give the indices of records to keep
+        keep = np.concatenate(
+            (historic_record_indices, episode_record_indices)
+        )
+
+        return df.iloc[keep, :], history_len
+
+    event_data, event_history_len = filter(event_data)
+
+    # Text data will eventually be embedded and merged with numeric
+    # feature data, so they must be filtered together to ensure that
+    # the length of the merged timeseries does not exceed the maximum
+    # allowed timeseries length.
     if text_data is not None:
-        # Merge text and numeric data on timestamps; used for filtering the numeric and text data
-        merged = numeric_data.merge(text_data, how='outer', left_index=True, right_index=True, indicator=True)
-        # Get the names of the numeric and text features so that they can be recovered after filtering
+        # Merge text and numeric data on timestamps; used for
+        # filtering the numeric and text data
+        merged = numeric_data.merge(
+            text_data, how='outer',
+            left_index=True, right_index=True, indicator=True
+        )
+        # Get the names of the numeric and text features so that
+        # they can be recovered after filtering
         numeric_feats = numeric_data.columns
         text_feats = text_data.columns
-        filtered = filter(merged)
-        # Split the filtered numeric and text data back into separate DataFrames
-        numeric_data = filtered.loc[filtered['_merge'].isin(['both', 'left_only']), numeric_feats]
-        text_data = filtered.loc[filtered['_merge'].isin(['both', 'right_only']), text_feats]
+        filtered, val_history_len = filter(merged)
+        # Split the filtered numeric and text data back into
+        # separate DataFrames
+        numeric_data = filtered.loc[
+            filtered['_merge'].isin(['both', 'left_only']),
+            numeric_feats
+        ]
+        text_data = filtered.loc[
+            filtered['_merge'].isin(['both', 'right_only']),
+            text_feats
+        ]
     else:
         # No text data, so there's no need to merge timesteps
-        numeric_data = filter(numeric_data)
+        numeric_data, val_history_len = filter(numeric_data)
 
-    return numeric_data, event_data, text_data
+    return (numeric_data, event_data, text_data,
+            val_history_len, event_history_len, max_history_len)
 
 
-def collate_tensorized(batch: MixedDataset) -> MixedTensorDataset:
+def collate_tensorized(
+    batch: MixedDataset,
+    use_historical_records: bool = True,
+    max_history_len_steps: int = 0
+) -> MixedTensorDataset:
     """Collate function for MixedDataset.
 
-    Takes a list of episode dicts and stacks them into the MixedTensorDataset format expected by the model.
-    Pre-computed text embeddings are stacked into a single tensor at
+    Takes a list of episode dicts and stacks them into the
+    MixedTensorDataset format expected by the model. Pre-computed text
+    embeddings are stacked into a single tensor at
     batch['val_data']['text']['embedded_values'] with shape
     [batch_size, max_ts_len, n_text_feats, embed_dim].
+
+    Args:
+        batch: List of episode dicts from MixedDataset.__getitem__.
+        use_historical_records: If False, zero out masks for the
+            history region [0, max_history_len_steps) so the model
+            ignores pre-admission data. Defaults to True.
+        max_history_len_steps: Number of timestep indices reserved
+            for historical records. Only used when
+            use_historical_records is False.
     """
 
     # Stack simple tensors directly
@@ -971,6 +1033,11 @@ def collate_tensorized(batch: MixedDataset) -> MixedTensorDataset:
     val_masks = torch.stack([b['val_masks'] for b in batch], dim=0)
     event_times = torch.stack([b['event_times'] for b in batch], dim=0)
     event_masks = torch.stack([b['event_masks'] for b in batch], dim=0)
+
+    # Mask out history region when historical records are disabled
+    if not use_historical_records and max_history_len_steps > 0:
+        val_masks[:, :max_history_len_steps] = 0.0
+        event_masks[:, :max_history_len_steps] = 0.0
     static_data = torch.stack([b['static_data'] for b in batch], dim=0)
 
     # Stack indicator tensors
@@ -1463,38 +1530,125 @@ def extract_mimic(
     for out_idx, ep in enumerate(tqdm(results, desc="Building arrays")):
         valid_ids.append(reader.patient_episode_ids[ep.idx])
         val_len = ep.val_len
+        val_hist = ep.val_history_len
+        val_ep = val_len - val_hist
         event_len = ep.event_len
-        
+        event_hist = ep.event_history_len
+        event_ep = event_len - event_hist
+
+        # Left-pad history: actual history data is right-justified
+        # within [0, max_history_len_steps). Episode data starts at
+        # index max_history_len_steps.
+        vh_start = max_history_len_steps - val_hist
+        ve_start = max_history_len_steps
+        eh_start = max_history_len_steps - event_hist
+        ee_start = max_history_len_steps
+
         if val_len > 0:
-            arrays['val_times'][out_idx, :val_len] = ep.val_times
-            arrays['val_masks'][out_idx, :val_len] = 1.0
-            arrays['val_numeric_indicators'][out_idx, :val_len, :] = ep.val_numeric_indicators
-            for f, vals in enumerate(ep.val_numeric_values):
-                arrays['val_numeric_values'][f][out_idx, :val_len, :] = vals
-            arrays['val_categorical_indicators'][out_idx, :val_len, :] = ep.val_categorical_indicators
-            for f, vals in enumerate(ep.val_categorical_values):
-                arrays['val_categorical_values'][f][out_idx, :val_len, :] = vals
-            arrays['val_text_indicators'][out_idx, :val_len, :] = ep.val_text_indicators
-            
-            # Sparse text
+            # History portion (right-justified in history region)
+            if val_hist > 0:
+                arrays['val_times'][
+                    out_idx, vh_start:max_history_len_steps
+                ] = ep.val_times[:val_hist]
+                arrays['val_masks'][
+                    out_idx, vh_start:max_history_len_steps
+                ] = 1.0
+                arrays['val_numeric_indicators'][
+                    out_idx, vh_start:max_history_len_steps, :
+                ] = ep.val_numeric_indicators[:val_hist]
+                for f, vals in enumerate(ep.val_numeric_values):
+                    arrays['val_numeric_values'][f][
+                        out_idx, vh_start:max_history_len_steps, :
+                    ] = vals[:val_hist]
+                arrays['val_categorical_indicators'][
+                    out_idx, vh_start:max_history_len_steps, :
+                ] = ep.val_categorical_indicators[:val_hist]
+                for f, vals in enumerate(ep.val_categorical_values):
+                    arrays['val_categorical_values'][f][
+                        out_idx, vh_start:max_history_len_steps, :
+                    ] = vals[:val_hist]
+                arrays['val_text_indicators'][
+                    out_idx, vh_start:max_history_len_steps, :
+                ] = ep.val_text_indicators[:val_hist]
+
+            # Episode portion (starts at max_history_len_steps)
+            if val_ep > 0:
+                arrays['val_times'][
+                    out_idx, ve_start:ve_start + val_ep
+                ] = ep.val_times[val_hist:]
+                arrays['val_masks'][
+                    out_idx, ve_start:ve_start + val_ep
+                ] = 1.0
+                arrays['val_numeric_indicators'][
+                    out_idx, ve_start:ve_start + val_ep, :
+                ] = ep.val_numeric_indicators[val_hist:]
+                for f, vals in enumerate(ep.val_numeric_values):
+                    arrays['val_numeric_values'][f][
+                        out_idx, ve_start:ve_start + val_ep, :
+                    ] = vals[val_hist:]
+                arrays['val_categorical_indicators'][
+                    out_idx, ve_start:ve_start + val_ep, :
+                ] = ep.val_categorical_indicators[val_hist:]
+                for f, vals in enumerate(ep.val_categorical_values):
+                    arrays['val_categorical_values'][f][
+                        out_idx, ve_start:ve_start + val_ep, :
+                    ] = vals[val_hist:]
+                arrays['val_text_indicators'][
+                    out_idx, ve_start:ve_start + val_ep, :
+                ] = ep.val_text_indicators[val_hist:]
+
+            # Sparse text — remap timestep indices to left-padded
+            # layout
             for f in range(dims.n_text_feats):
                 text_count = 0
                 for t in range(val_len):
                     if ep.val_text_indicators[t, f] > 0:
-                        arrays['_text_values_lists'][f].append(ep.val_text_values[f][t])
-                        arrays['_text_masks_lists'][f].append(ep.val_text_masks[f][t])
-                        arrays['_text_timesteps_lists'][f].append(t)
+                        arrays['_text_values_lists'][f].append(
+                            ep.val_text_values[f][t]
+                        )
+                        arrays['_text_masks_lists'][f].append(
+                            ep.val_text_masks[f][t]
+                        )
+                        # Remap sequential index to left-padded
+                        # position
+                        if t < val_hist:
+                            mapped_t = vh_start + t
+                        else:
+                            mapped_t = ve_start + (t - val_hist)
+                        arrays['_text_timesteps_lists'][f].append(
+                            mapped_t
+                        )
                         text_count += 1
                 arrays['_text_counts'][f].append(text_count)
         else:
             for f in range(dims.n_text_feats):
                 arrays['_text_counts'][f].append(0)
-        
+
         if event_len > 0:
-            arrays['event_times'][out_idx, :event_len] = ep.event_times
-            arrays['event_masks'][out_idx, :event_len] = 1.0
-            arrays['event_indicators'][out_idx, :event_len, :] = ep.event_indicators
-        
+            # History portion (right-justified in history region)
+            if event_hist > 0:
+                arrays['event_times'][
+                    out_idx, eh_start:max_history_len_steps
+                ] = ep.event_times[:event_hist]
+                arrays['event_masks'][
+                    out_idx, eh_start:max_history_len_steps
+                ] = 1.0
+                arrays['event_indicators'][
+                    out_idx, eh_start:max_history_len_steps, :
+                ] = ep.event_indicators[:event_hist]
+
+            # Episode portion (starts at max_history_len_steps)
+            if event_ep > 0:
+                arrays['event_times'][
+                    out_idx, ee_start:ee_start + event_ep
+                ] = ep.event_times[event_hist:]
+                arrays['event_masks'][
+                    out_idx, ee_start:ee_start + event_ep
+                ] = 1.0
+                arrays['event_indicators'][
+                    out_idx, ee_start:ee_start + event_ep, :
+                ] = ep.event_indicators[event_hist:]
+
         arrays['static_data'][out_idx, :] = ep.static_data
         arrays['mortality'][out_idx] = ep.mortality
         arrays['length_of_stay'][out_idx] = ep.length_of_stay
@@ -1579,7 +1733,9 @@ def prepare_dataloaders(
     prefetch_factor: int = 2,
     balance_text: bool = False,
     world_size: Optional[int] = None,
-    rank: Optional[int] = None
+    rank: Optional[int] = None,
+    use_historical_records: bool = True,
+    max_history_len_steps: int = 0
 ) -> List[DataLoader]:
     """Prepare training, (validation), and test DataLoaders for MixedDataset.
 
@@ -1633,9 +1789,14 @@ def prepare_dataloaders(
             accelerator.prepare_data_loader() to add standard distributed sampling.
         world_size (int, optional): Number of distributed processes. Required if balance_text=True.
             Can be obtained from accelerator.num_processes.
-        rank (int, optional): Current process rank. Required if balance_text=True. Can be obtained 
+        rank (int, optional): Current process rank. Required if balance_text=True. Can be obtained
             from accelerator.process_index.
-        
+        use_historical_records (bool, optional): If False, zero out masks for the history region
+            [0, max_history_len_steps) so the model ignores pre-admission data. Defaults to True.
+        max_history_len_steps (int, optional): Number of timestep indices reserved for historical
+            records in the extracted arrays. Only used when use_historical_records is False.
+            Defaults to 0.
+
     Returns:
         List[DataLoader]: List of DataLoaders in order: [train_loader, val_loader (if available), 
             test_loader]. If validation data are not found, only [train_loader, test_loader] is 
@@ -1689,12 +1850,18 @@ def prepare_dataloaders(
             )
             shuffle = False  # Sampler handles shuffling
         
+        collate_fn = partial(
+            collate_tensorized,
+            use_historical_records=use_historical_records,
+            max_history_len_steps=max_history_len_steps,
+        )
+
         loader = DataLoader(
             dataset,
             batch_size=batch_size,
             shuffle=shuffle if sampler is None else False,
             sampler=sampler,
-            collate_fn=collate_tensorized,
+            collate_fn=collate_fn,
             num_workers=num_workers,
             pin_memory=pin_memory if num_workers > 0 else False,
             prefetch_factor=prefetch_factor if num_workers > 0 else None,

@@ -30,6 +30,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from typing import Dict, List, Optional, Tuple
 
+from functools import partial
 from TransEHR2.data.preprocessing import load_dataset, collate_tensorized
 from TransEHR2.models import MixedClassifier
 from TransEHR2.modules import EventDataEncoder, ValueDataEncoder
@@ -154,7 +155,9 @@ def create_dataloader(
     split: str,
     batch_size: int,
     num_workers: int,
-    pin_memory: bool
+    pin_memory: bool,
+    use_historical_records: bool = True,
+    max_history_len_steps: int = 0
 ) -> Optional[DataLoader]:
     """Create a DataLoader for one data split within a fold.
 
@@ -162,19 +165,24 @@ def create_dataloader(
     predictions can be deterministically aligned with targets.
 
     Args:
-        fold_dir: Path to the fold directory containing split subdirectories.
+        fold_dir: Path to the fold directory containing split
+            subdirectories.
         split: One of 'train', 'val', or 'test'.
         batch_size: Number of samples per batch.
         num_workers: Number of DataLoader worker processes.
         pin_memory: Whether to use pinned memory for CUDA transfers.
+        use_historical_records: If False, zero out masks for the
+            history region so the model ignores pre-admission data.
+        max_history_len_steps: Number of timestep indices reserved
+            for historical records.
 
     Returns:
-        A DataLoader, or None if the split directory does not exist (only
-        allowed for 'val').
+        A DataLoader, or None if the split directory does not exist
+        (only allowed for 'val').
 
     Raises:
-        FileNotFoundError: If a required split directory ('train' or 'test')
-            is not found.
+        FileNotFoundError: If a required split directory ('train' or
+            'test') is not found.
     """
     dataset_path = os.path.join(fold_dir, split)
     if not os.path.exists(dataset_path):
@@ -183,11 +191,16 @@ def create_dataloader(
         raise FileNotFoundError(f"'{split}/' not found in {fold_dir}")
 
     dataset = load_dataset(dataset_path)
+    collate_fn = partial(
+        collate_tensorized,
+        use_historical_records=use_historical_records,
+        max_history_len_steps=max_history_len_steps,
+    )
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=False,
-        collate_fn=collate_tensorized,
+        collate_fn=collate_fn,
         num_workers=num_workers,
         pin_memory=pin_memory and num_workers > 0,
         prefetch_factor=2 if num_workers > 0 else None,
@@ -521,8 +534,10 @@ if __name__ == '__main__':
     EVENT_FEATS = dataset_config['EVENT_FEATS']
     TEXT_FEATS = dataset_config['TEXT_FEATS']
     STATIC_FEATS = dataset_config['STATIC_FEATS']
+    MAX_HISTORY_LEN_STEPS = dataset_config.get('MAX_HISTORY_LEN_STEPS', 0)
 
     USE_TEXT = experiment_config['USE_TEXT']
+    USE_HISTORICAL_RECORDS = experiment_config.get('USE_HISTORICAL_RECORDS', True)
     BATCH_SIZE = args.batch_size or experiment_config['BATCH_SIZE']
     MODEL_DIR = args.model_dir
     EXPERIMENT_NAME = args.experiment_name
@@ -580,7 +595,9 @@ if __name__ == '__main__':
         for split in ['train', 'val', 'test']:
             loader = create_dataloader(
                 fold_dir, split, BATCH_SIZE,
-                args.num_workers, pin_memory
+                args.num_workers, pin_memory,
+                use_historical_records=USE_HISTORICAL_RECORDS,
+                max_history_len_steps=MAX_HISTORY_LEN_STEPS
             )
             if loader is not None:
                 loaders[split] = loader

@@ -31,6 +31,11 @@ BATCH_SIZE: 200
 # Whether to use text data as features
 USE_TEXT: True
 
+# Whether to use pre-admission historical records. If False, historical
+# timesteps are masked out at collation time so the model only sees
+# episode data. Requires data extracted with left-padded history layout.
+USE_HISTORICAL_RECORDS: True
+
 # Whether to let the generator and discriminator predict feature presence indicators as well as values
 PREDICT_INDICATORS: False
 

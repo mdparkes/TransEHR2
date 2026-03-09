@@ -207,6 +207,7 @@ if __name__ == "__main__":
     EVENT_FEATS = dataset_config['EVENT_FEATS']
     TEXT_FEATS = dataset_config['TEXT_FEATS']
     STATIC_FEATS = dataset_config['STATIC_FEATS']
+    MAX_HISTORY_LEN_STEPS = dataset_config.get('MAX_HISTORY_LEN_STEPS', 0)
 
     # Get experiment config parameters
     with open(args['experiment_config'], 'r') as f_in:
@@ -257,6 +258,7 @@ if __name__ == "__main__":
     FINETUNE_LEARNING_RATE = experiment_config.get('FINETUNE_LEARNING_RATE', 2e-4)
     FINETUNE_TOTAL_EPOCH = experiment_config.get('FINETUNE_TOTAL_EPOCH', 500)
     FINETUNE_LEARNING_RATE_DECAY = experiment_config.get('FINETUNE_LEARNING_RATE_DECAY', 0.8)
+    USE_HISTORICAL_RECORDS = experiment_config.get('USE_HISTORICAL_RECORDS', True)
 
 
     # Create timer
@@ -313,11 +315,13 @@ if __name__ == "__main__":
 
     # Create dataloaders using the optimized tensorized format
     dataloader_list = prepare_dataloaders(
-        fold_dir, 
-        BATCH_SIZE, 
+        fold_dir,
+        BATCH_SIZE,
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
-        prefetch_factor=2 if num_workers > 0 else None
+        prefetch_factor=2 if num_workers > 0 else None,
+        use_historical_records=USE_HISTORICAL_RECORDS,
+        max_history_len_steps=MAX_HISTORY_LEN_STEPS
     )
     # For HP tuning, we use train and test loaders only (test is used for model selection)
     if len(dataloader_list) == 3:
