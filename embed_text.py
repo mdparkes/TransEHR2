@@ -7,13 +7,25 @@ writes the resulting embedding arrays alongside the existing sparse text
 storage. Episode IDs are used to deduplicate across folds so that each unique
 text entry is embedded at most once.
 
-After running this script, each partition directory will contain:
-    val_text_embeddings_{i}.npy  — (n_non_empty, embed_dim) float32
-    metadata.pkl                 — updated with 'text_embed_dim'
+Uses HuggingFace Accelerate for distributed inference across multiple GPUs.
+When running multi-GPU, folds are assigned round-robin to ranks so that each
+rank processes disjoint directories (no write conflicts).  Within-fold
+deduplication (train/val/test sharing episodes) is preserved because all
+partitions of the same fold are processed by the same rank.
 
-Usage:
+Also works on a single GPU without ``accelerate launch``.
+
+After running this script, each partition directory will contain:
+    val_text_embeddings_{i}.npy  -- (n_non_empty, embed_dim) float32
+    metadata.pkl                 -- updated with 'text_embed_dim'
+
+Usage (single GPU):
     python embed_text.py --data-dir /path/to/data [--llm-name meta-llama/Llama-3.2-1B] \
-        [--batch-size 64] [--device cuda]
+        [--batch-size 64]
+
+Usage (multi-GPU):
+    accelerate launch embed_text.py --data-dir /path/to/data \
+        [--llm-name meta-llama/Llama-3.2-1B] [--batch-size 64]
 """
 
 import argparse
@@ -24,9 +36,24 @@ import pickle
 import re
 import torch
 
+from accelerate import Accelerator, DistributedDataParallelKwargs
 from typing import Dict, List, Optional, Tuple
 
 from TransEHR2.modules import GradientTraceableLLM
+
+
+def initialize_inference_accelerator() -> Accelerator:
+    """Initialize an Accelerator for inference.
+
+    Unlike the training accelerator, this does not enforce a specific
+    distributed type, so the script works both via ``accelerate launch``
+    (multi-GPU) and plain ``python`` (single GPU).
+
+    Returns:
+        Accelerator: Configured Accelerator instance.
+    """
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    return Accelerator(kwargs_handlers=[ddp_kwargs])
 
 
 def get_fold_names(data_dir: str) -> List[str]:
@@ -39,14 +66,25 @@ def get_fold_names(data_dir: str) -> List[str]:
     return fold_names
 
 
-def get_partition_dirs(data_dir: str) -> List[str]:
-    """Get all partition directories (fold*/train/, fold*/val/, fold*/test/)."""
+def get_partition_dirs_for_folds(
+    data_dir: str,
+    fold_names: List[str]
+) -> List[str]:
+    """Get partition directories for the given folds.
+
+    Args:
+        data_dir: Root data directory containing fold subdirectories.
+        fold_names: List of fold names to include.
+
+    Returns:
+        List of partition directory paths (fold*/train/, fold*/val/,
+        fold*/test/) that contain a metadata.pkl file.
+    """
     partition_dirs = []
-    for fold in get_fold_names(data_dir):
+    for fold in fold_names:
         for split in ['train', 'val', 'test']:
             part_dir = os.path.join(data_dir, fold, split)
             if os.path.isdir(part_dir):
-                # Check that metadata.pkl exists (i.e., it's an extracted dataset)
                 if os.path.exists(os.path.join(part_dir, 'metadata.pkl')):
                     partition_dirs.append(part_dir)
     return partition_dirs
@@ -107,7 +145,8 @@ def embed_batch(
     """Embed a batch of token sequences through the LLM.
 
     Args:
-        llm: The GradientTraceableLLM instance.
+        llm: The GradientTraceableLLM instance (possibly wrapped by
+            Accelerate).
         token_ids_batch: (batch_size, token_len) int64 array of token IDs.
         mask_batch: (batch_size, token_len) int64 array of attention masks.
         device: Torch device to run on.
@@ -127,16 +166,18 @@ def process_partition(
     device: torch.device,
     batch_size: int,
     embedding_cache: Dict[str, Dict[int, np.ndarray]],
+    embed_dim: int,
 ) -> int:
     """Process one partition directory, embedding all text and writing results.
 
     Args:
         part_dir: Path to the partition directory.
-        llm: The loaded LLM module.
+        llm: The loaded LLM module (possibly wrapped by Accelerate).
         device: Torch device.
         batch_size: Batch size for LLM inference.
-        embedding_cache: Dict mapping episode_id -> {feat_idx -> {sparse_local_idx -> embedding}}.
-            Used for deduplication across folds.
+        embedding_cache: Dict mapping cache_key -> {local_idx -> embedding}.
+            Used for deduplication across partitions within the same fold.
+        embed_dim: Dimensionality of the LLM embeddings.
 
     Returns:
         Number of new embeddings computed (not from cache).
@@ -144,9 +185,6 @@ def process_partition(
     metadata, offsets, values, masks, timesteps, n_text_feats = load_partition_text(part_dir)
     episode_ids = load_episode_ids(part_dir)
     n_episodes = offsets[0].shape[0] - 1  # CSR format: n+1 offsets for n episodes
-
-    # Determine embed_dim from LLM config
-    embed_dim = llm.model.config.hidden_size
 
     new_embeddings_count = 0
 
@@ -208,7 +246,7 @@ def process_partition(
 
             new_embeddings_count += len(need_embed_indices)
 
-        # Populate cache for future folds
+        # Populate cache for future partitions within this fold
         for ep_idx in range(n_episodes):
             start = int(offsets[f][ep_idx])
             end = int(offsets[f][ep_idx + 1])
@@ -262,61 +300,86 @@ def main():
         '--batch-size', type=int, default=64,
         help='Batch size for LLM inference (default: 64)'
     )
-    parser.add_argument(
-        '--device', type=str, default=None,
-        help='Device for LLM inference (default: auto-detect)'
-    )
     args = parser.parse_args()
 
-    # Determine device
-    if args.device:
-        device = torch.device(args.device)
-    elif torch.cuda.is_available():
-        device = torch.device('cuda')
-    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-        device = torch.device('mps')
-    else:
-        device = torch.device('cpu')
-    print(f"Device: {device}")
+    # ---- Initialize Accelerator ----
+    accelerator = initialize_inference_accelerator()
+    device = accelerator.device
+    rank = accelerator.process_index
+    world_size = accelerator.num_processes
+    is_main = accelerator.is_main_process
 
-    # Discover partition directories
-    partition_dirs = get_partition_dirs(args.data_dir)
-    if not partition_dirs:
-        print(f"No partition directories found under {args.data_dir}")
+    if is_main:
+        print(f"Device: {device}")
+        print(f"Number of processes: {world_size}")
+
+    # Discover folds and assign to ranks round-robin
+    all_fold_names = get_fold_names(args.data_dir)
+    if not all_fold_names:
+        if is_main:
+            print(f"No fold directories found under {args.data_dir}")
         return
-    print(f"Found {len(partition_dirs)} partition directories:")
-    for pd in partition_dirs:
-        print(f"  {pd}")
+
+    my_folds = [
+        all_fold_names[i]
+        for i in range(rank, len(all_fold_names), world_size)
+    ]
+    my_partition_dirs = get_partition_dirs_for_folds(
+        args.data_dir, my_folds
+    )
+
+    print(f"[Rank {rank}] Assigned {len(my_folds)} folds: {my_folds}")
+    print(f"[Rank {rank}] {len(my_partition_dirs)} partition directories")
 
     # Load LLM
-    print("\nLoading LLM...")
+    if is_main:
+        print("\nLoading LLM...")
     kwargs = {}
     if args.llm_name:
         kwargs['model_name'] = args.llm_name
     llm = GradientTraceableLLM(**kwargs)
-    llm = llm.to(device)
     llm.eval()
     embed_dim = llm.model.config.hidden_size
-    print(f"LLM loaded: {llm.model.config._name_or_path}, embed_dim={embed_dim}")
 
-    # Process all partitions with deduplication cache
+    # Wrap with Accelerate for distributed placement
+    llm = accelerator.prepare(llm)
+
+    if is_main:
+        unwrapped = accelerator.unwrap_model(llm)
+        print(f"LLM loaded: "
+              f"{unwrapped.model.config._name_or_path}, "
+              f"embed_dim={embed_dim}")
+
+    accelerator.wait_for_everyone()
+
+    # Process partitions assigned to this rank
     embedding_cache: Dict[str, Dict[int, np.ndarray]] = {}
     total_new = 0
 
-    for part_dir in partition_dirs:
-        print(f"\nProcessing: {part_dir}")
+    for part_dir in my_partition_dirs:
+        print(f"[Rank {rank}] Processing: {part_dir}")
         new_count = process_partition(
-            part_dir, llm, device, args.batch_size, embedding_cache
+            part_dir, llm, device, args.batch_size,
+            embedding_cache, embed_dim
         )
         total_new += new_count
-        print(f"  {new_count} new embeddings computed")
+        print(f"[Rank {rank}]   {new_count} new embeddings computed")
 
         # Periodic GPU cache cleanup
         if device.type == 'cuda':
             torch.cuda.empty_cache()
 
-    print(f"\nDone. Total new embeddings computed: {total_new}")
-    print(f"Cache contains {len(embedding_cache)} unique episode-feature entries")
+    # Aggregate totals across ranks
+    accelerator.wait_for_everyone()
+    total_new_tensor = torch.tensor(
+        [total_new], device=device, dtype=torch.long
+    )
+    all_totals = accelerator.gather(total_new_tensor)
+
+    if is_main:
+        grand_total = all_totals.sum().item()
+        print(f"\nDone. Total new embeddings computed across "
+              f"all ranks: {grand_total}")
 
     # Clean up
     del llm

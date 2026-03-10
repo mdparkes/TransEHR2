@@ -6,16 +6,24 @@ phenotype), loads the finetuned model weights, performs a forward pass on
 training, validation (if available), and test data, and saves predictions
 and targets to CSV files.
 
+Uses HuggingFace Accelerate for distributed inference across multiple GPUs.
+Also works on a single GPU without ``accelerate launch``.
+
 Output files are written to:
     {model_dir}/{experiment_name}/{fold}/{task}/{task}_{split}_finetuned_output.csv
 
-Usage:
+Usage (single GPU):
     python dump_finetuned_predictions.py <dataset_config> <experiment_config> <experiment_name> \
         [--model_dir ./models] [--num_workers 0] [--batch_size 750]
+
+Usage (multi-GPU):
+    accelerate launch dump_finetuned_predictions.py <dataset_config> <experiment_config> \
+        <experiment_name> [--model_dir ./models] [--num_workers 0] [--batch_size 750]
 """
 
 import argparse
 import gc
+import math
 import numpy as np
 import os
 import pandas as pd
@@ -24,9 +32,10 @@ import re
 import torch
 import yaml
 
+from accelerate import Accelerator, DistributedDataParallelKwargs
 from collections import OrderedDict
 from torch import Tensor
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 from typing import Dict, List, Optional, Tuple
 
@@ -100,6 +109,20 @@ def reshape_flattened_state_dict(
     return reshaped
 
 
+def initialize_inference_accelerator() -> Accelerator:
+    """Initialize an Accelerator for inference.
+
+    Unlike the training accelerator, this does not enforce a specific
+    distributed type, so the script works both via ``accelerate launch``
+    (multi-GPU) and plain ``python`` (single GPU).
+
+    Returns:
+        Accelerator: Configured Accelerator instance.
+    """
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    return Accelerator(kwargs_handlers=[ddp_kwargs])
+
+
 def get_fold_names(data_dir: str, exclude: Optional[List[str]] = None) -> List[str]:
     """Get cross-validation fold names from directory structure.
 
@@ -141,32 +164,25 @@ def get_phenotype_names(fold_dir: str) -> Optional[List[str]]:
     return None
 
 
-def get_device() -> torch.device:
-    """Auto-detect best available compute device."""
-    if torch.cuda.is_available():
-        return torch.device('cuda')
-    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-        return torch.device('mps')
-    return torch.device('cpu')
-
-
-def create_dataloader(
+def create_inference_loader(
     fold_dir: str,
     split: str,
     batch_size: int,
     num_workers: int,
     pin_memory: bool,
     use_historical_records: bool = True,
-    max_history_len_steps: int = 0
-) -> Optional[DataLoader]:
-    """Create a DataLoader for one data split within a fold.
+    max_history_len_steps: int = 0,
+    world_size: int = 1,
+    rank: int = 0
+) -> Tuple[Optional[DataLoader], int]:
+    """Create a DataLoader for one data split, sharded across ranks.
 
-    All DataLoaders use sequential (non-shuffled) ordering so that
-    predictions can be deterministically aligned with targets.
+    Data is sharded sequentially so that rank 0 gets the first chunk,
+    rank 1 gets the second, etc.  After ``accelerator.gather()``, the
+    concatenated predictions are in original dataset order.
 
     Args:
-        fold_dir: Path to the fold directory containing split
-            subdirectories.
+        fold_dir: Path to the fold directory containing split subdirs.
         split: One of 'train', 'val', or 'test'.
         batch_size: Number of samples per batch.
         num_workers: Number of DataLoader worker processes.
@@ -175,10 +191,12 @@ def create_dataloader(
             history region so the model ignores pre-admission data.
         max_history_len_steps: Number of timestep indices reserved
             for historical records.
+        world_size: Total number of distributed processes.
+        rank: Index of the current process.
 
     Returns:
-        A DataLoader, or None if the split directory does not exist
-        (only allowed for 'val').
+        Tuple of (DataLoader or None, total_dataset_size).  The loader
+        is None only when split is 'val' and the directory is missing.
 
     Raises:
         FileNotFoundError: If a required split directory ('train' or
@@ -187,17 +205,27 @@ def create_dataloader(
     dataset_path = os.path.join(fold_dir, split)
     if not os.path.exists(dataset_path):
         if split == 'val':
-            return None
+            return None, 0
         raise FileNotFoundError(f"'{split}/' not found in {fold_dir}")
 
     dataset = load_dataset(dataset_path)
+    total = len(dataset)
+
+    # Shard sequentially across ranks
+    per_rank = math.ceil(total / world_size)
+    start_idx = rank * per_rank
+    end_idx = min(start_idx + per_rank, total)
+    indices = list(range(start_idx, end_idx))
+
+    subset = Subset(dataset, indices) if world_size > 1 else dataset
+
     collate_fn = partial(
         collate_tensorized,
         use_historical_records=use_historical_records,
         max_history_len_steps=max_history_len_steps,
     )
-    return DataLoader(
-        dataset,
+    loader = DataLoader(
+        subset,
         batch_size=batch_size,
         shuffle=False,
         collate_fn=collate_fn,
@@ -207,6 +235,7 @@ def create_dataloader(
         persistent_workers=num_workers > 0,
         multiprocessing_context='spawn' if num_workers > 0 else None
     )
+    return loader, total
 
 
 def build_classifier(
@@ -368,34 +397,46 @@ def run_inference(
     model: MixedClassifier,
     loader: DataLoader,
     task: str,
-    device: torch.device
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Run inference on a DataLoader and collect predictions and targets.
+    accelerator: Accelerator,
+    actual_n_samples: int
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """Run distributed inference and gather predictions across ranks.
 
     For binary classification tasks (mortality, phenotype), predictions are
     sigmoid-transformed probabilities. For regression (length_of_stay),
     predictions are raw model outputs.
 
+    Each rank processes its sequential shard of the dataset.  After the
+    loop, local predictions are padded and gathered so that the main
+    process receives all predictions in original dataset order.
+
     Args:
         model: The finetuned MixedClassifier in eval mode.
-        loader: DataLoader for the data split.
+        loader: DataLoader for this rank's shard of the data split.
         task: One of 'mortality', 'length_of_stay', or 'phenotype'.
-        device: Compute device.
+        accelerator: Accelerator instance for distributed inference.
+        actual_n_samples: Total number of samples across all ranks
+            (used for trimming gathered predictions).
 
     Returns:
-        Tuple of (predictions, targets) as numpy arrays with shape
-        (n_samples, n_outputs).
+        On the main process: tuple of (predictions, targets) as numpy
+        arrays with shape (n_samples, n_outputs).
+        On other processes: (None, None).
     """
     model.eval()
     all_preds = []
     all_targs = []
     nan_batches = 0
+    is_main = accelerator.is_main_process
 
     with torch.no_grad():
         for i, batch in enumerate(
-            tqdm(loader, desc=f'    Inference', leave=False)
+            tqdm(loader, desc='    Inference', leave=False,
+                 disable=not accelerator.is_local_main_process)
         ):
-            batch = move_batch_to_device(batch, device=device)
+            batch = move_batch_to_device(
+                batch, device=accelerator.device
+            )
             logits = model(batch)
             targets = batch['targets'][task]
 
@@ -408,41 +449,76 @@ def run_inference(
             if n_nan > 0:
                 nan_batches += 1
 
-            # Diagnostics on the first batch
-            if i == 0:
+            # Diagnostics on the first batch (main process only)
+            if i == 0 and is_main:
                 if n_nan > 0:
                     print(f"    WARNING: {n_nan} NaN values in logits "
                           f"(batch 0, shape {tuple(logits.shape)})")
-                    print(f"    logits sample: {logits[0].cpu().tolist()}")
+                    print(f"    logits sample: "
+                          f"{logits[0].cpu().tolist()}")
                 else:
                     print(f"    logits OK (batch 0): "
                           f"min={logits.min().item():.4f}, "
                           f"max={logits.max().item():.4f}")
 
-            all_preds.append(preds.cpu().numpy())
-            all_targs.append(targets.cpu().numpy())
+            all_preds.append(preds.detach())
+            all_targs.append(targets.detach())
 
             del logits, batch
-            if device.type == 'cuda':
-                torch.cuda.empty_cache()
+            torch.cuda.empty_cache()
 
-    predictions = np.concatenate(all_preds, axis=0)
-    targets = np.concatenate(all_targs, axis=0)
-
-    # Summary diagnostics
-    n_total = predictions.size
-    n_pred_nan = int(np.isnan(predictions).sum())
-    if nan_batches > 0:
-        print(f"    WARNING: {nan_batches}/{i + 1} batches had NaN logits")
-    if n_pred_nan > 0:
-        print(f"    WARNING: {n_pred_nan}/{n_total} NaN values in "
-              f"final predictions array")
+    # Concatenate local results
+    if all_preds:
+        local_preds = torch.cat(all_preds, dim=0)
+        local_targs = torch.cat(all_targs, dim=0)
     else:
-        print(f"    predictions: min={predictions.min():.4f}, "
-              f"max={predictions.max():.4f}, "
-              f"mean={predictions.mean():.4f}")
+        # Edge case: this rank had no data
+        local_preds = torch.empty(0, device=accelerator.device)
+        local_targs = torch.empty(0, device=accelerator.device)
 
-    return predictions, targets
+    # Pad local tensors to uniform size for gather
+    world_size = accelerator.num_processes
+    per_rank = math.ceil(actual_n_samples / world_size)
+    pad_size = per_rank - local_preds.shape[0]
+    if pad_size > 0:
+        pad_shape = (pad_size,) + local_preds.shape[1:]
+        local_preds = torch.cat([
+            local_preds,
+            torch.zeros(pad_shape, device=local_preds.device,
+                        dtype=local_preds.dtype)
+        ], dim=0)
+        local_targs = torch.cat([
+            local_targs,
+            torch.zeros(pad_shape, device=local_targs.device,
+                        dtype=local_targs.dtype)
+        ], dim=0)
+
+    # Gather across all ranks
+    gathered_preds = accelerator.gather(local_preds)
+    gathered_targs = accelerator.gather(local_targs)
+
+    if is_main:
+        # Trim padding and convert to numpy
+        predictions = gathered_preds[:actual_n_samples].cpu().numpy()
+        targets = gathered_targs[:actual_n_samples].cpu().numpy()
+
+        # Summary diagnostics
+        n_total = predictions.size
+        n_pred_nan = int(np.isnan(predictions).sum())
+        if nan_batches > 0:
+            print(f"    WARNING: {nan_batches}/{i + 1} batches "
+                  f"had NaN logits")
+        if n_pred_nan > 0:
+            print(f"    WARNING: {n_pred_nan}/{n_total} NaN values "
+                  f"in final predictions array")
+        else:
+            print(f"    predictions: min={predictions.min():.4f}, "
+                  f"max={predictions.max():.4f}, "
+                  f"mean={predictions.mean():.4f}")
+
+        return predictions, targets
+
+    return None, None
 
 
 def save_predictions_csv(
@@ -537,7 +613,9 @@ if __name__ == '__main__':
     MAX_HISTORY_LEN_STEPS = dataset_config.get('MAX_HISTORY_LEN_STEPS', 0)
 
     USE_TEXT = experiment_config['USE_TEXT']
-    USE_HISTORICAL_RECORDS = experiment_config.get('USE_HISTORICAL_RECORDS', True)
+    USE_HISTORICAL_RECORDS = experiment_config.get(
+        'USE_HISTORICAL_RECORDS', True
+    )
     BATCH_SIZE = args.batch_size or experiment_config['BATCH_SIZE']
     MODEL_DIR = args.model_dir
     EXPERIMENT_NAME = args.experiment_name
@@ -562,60 +640,84 @@ if __name__ == '__main__':
         if text_embed_dim == 0:
             raise RuntimeError(
                 "text_embed_dim is 0 in dataset metadata. "
-                "Run embed_text.py to pre-compute text embeddings before inference."
+                "Run embed_text.py to pre-compute text embeddings "
+                "before inference."
             )
         tot_val_feat_dim += len(TEXT_FEATS) * text_embed_dim
     else:
         n_val_feats = len(VALUED_FEATS)
     n_event_types = len(EVENT_FEATS)
 
-    # ---- Device selection ----
-    device = get_device()
-    print(f"Device: {device}")
-    print(f"Model directory: {MODEL_DIR}")
-    print(f"Experiment: {EXPERIMENT_NAME}")
-    print(f"Batch size: {BATCH_SIZE}\n")
+    # ---- Initialize Accelerator ----
+    accelerator = initialize_inference_accelerator()
+
+    if accelerator.is_main_process:
+        print(f"Device: {accelerator.device}")
+        print(f"Number of processes: {accelerator.num_processes}")
+        print(f"Model directory: {MODEL_DIR}")
+        print(f"Experiment: {EXPERIMENT_NAME}")
+        print(f"Batch size: {BATCH_SIZE}\n")
 
     # ---- Iterate over folds ----
     fold_names = get_fold_names(DATA_DIR, exclude=['fold0'])
     if not fold_names:
-        print(f"No fold directories found in {DATA_DIR}")
+        if accelerator.is_main_process:
+            print(f"No fold directories found in {DATA_DIR}")
         exit(1)
 
     for fold_name in fold_names:
-        print(f"{'=' * 60}")
-        print(f"Fold: {fold_name}")
-        print(f"{'=' * 60}")
+        # Recreate accelerator between folds to free resources
+        if 'accelerator' in locals() and accelerator is not None:
+            accelerator.free_memory()
+            del accelerator
+            gc.collect()
+            torch.cuda.empty_cache()
+        accelerator = initialize_inference_accelerator()
+
+        if accelerator.is_main_process:
+            print(f"{'=' * 60}")
+            print(f"Fold: {fold_name}")
+            print(f"{'=' * 60}")
 
         fold_dir = os.path.join(DATA_DIR, fold_name)
 
-        # Load DataLoaders for each available split (no shuffling)
-        pin_memory = device.type == 'cuda'
+        # Load DataLoaders for each available split (sharded by rank)
+        pin_memory = accelerator.device.type == 'cuda'
         loaders: Dict[str, DataLoader] = {}
+        dataset_sizes: Dict[str, int] = {}
         for split in ['train', 'val', 'test']:
-            loader = create_dataloader(
+            loader, total = create_inference_loader(
                 fold_dir, split, BATCH_SIZE,
                 args.num_workers, pin_memory,
                 use_historical_records=USE_HISTORICAL_RECORDS,
-                max_history_len_steps=MAX_HISTORY_LEN_STEPS
+                max_history_len_steps=MAX_HISTORY_LEN_STEPS,
+                world_size=accelerator.num_processes,
+                rank=accelerator.process_index
             )
             if loader is not None:
                 loaders[split] = loader
+                dataset_sizes[split] = total
 
         # Read phenotype class names for CSV column headers
         phenotype_names = get_phenotype_names(fold_dir)
 
         # Determine number of phenotype output classes from the dataset
-        any_dataset = next(iter(loaders.values())).dataset
-        phenotype_arr_shape = any_dataset.phenotype.shape
+        any_loader = next(iter(loaders.values()))
+        # Subset wraps the original dataset; unwrap to access attributes
+        base_dataset = any_loader.dataset
+        if isinstance(base_dataset, Subset):
+            base_dataset = base_dataset.dataset
+        phenotype_arr_shape = base_dataset.phenotype.shape
         n_phenotype_classes = (phenotype_arr_shape[1]
                               if len(phenotype_arr_shape) > 1 else 1)
 
         # ---- Iterate over prediction tasks ----
         for task in ['mortality', 'length_of_stay', 'phenotype']:
-            print(f"\n  Task: {task}")
+            if accelerator.is_main_process:
+                print(f"\n  Task: {task}")
 
-            num_classes = n_phenotype_classes if task == 'phenotype' else 1
+            num_classes = (n_phenotype_classes
+                          if task == 'phenotype' else 1)
 
             # Build a fresh model with random weights
             model = build_classifier(
@@ -634,45 +736,57 @@ if __name__ == '__main__':
                 'pretrained', f'finetuned_{task}.pt'
             )
             if not load_finetuned_weights(model, weights_path):
-                print(f"    WARNING: Weights not found at {weights_path}, "
-                      f"skipping.")
+                if accelerator.is_main_process:
+                    print(f"    WARNING: Weights not found at "
+                          f"{weights_path}, skipping.")
                 del model
                 gc.collect()
                 continue
 
-            model = model.to(device)
-            print(f"    Loaded weights from {weights_path}")
+            if accelerator.is_main_process:
+                print(f"    Loaded weights from {weights_path}")
 
-            # Install forward hooks that replace NaN encoder output with
-            # zeros.  This prevents NaN from propagating through the
-            # padding-mask multiplication and aggregation sum when all
-            # episodes in a batch have padding at a given timestep.
-            hooks = install_nan_hooks(model)
+            # Wrap model with Accelerate for distributed inference
+            model = accelerator.prepare(model)
+
+            # Install NaN hooks on the unwrapped model so they fire
+            # correctly through the DDP/FSDP wrapper
+            unwrapped = accelerator.unwrap_model(model)
+            hooks = install_nan_hooks(unwrapped)
             nan_counts = hooks[0].nan_counts  # shared counter dict
+
+            accelerator.wait_for_everyone()
 
             # Run inference on each data split
             for split, loader in loaders.items():
-                n_samples = len(loader.dataset)
-                print(f"    Split: {split} ({n_samples} samples)")
+                actual_n = dataset_sizes[split]
+                if accelerator.is_main_process:
+                    print(f"    Split: {split} ({actual_n} samples)")
 
                 predictions, targets = run_inference(
-                    model, loader, task, device
+                    model, loader, task, accelerator, actual_n
                 )
 
-                output_path = os.path.join(
-                    MODEL_DIR, EXPERIMENT_NAME, fold_name, task,
-                    f'{task}_{split}_finetuned_output.csv'
-                )
-                save_predictions_csv(
-                    predictions, targets, output_path,
-                    task, phenotype_names
-                )
-                print(f"    -> {output_path}")
+                if accelerator.is_main_process:
+                    output_path = os.path.join(
+                        MODEL_DIR, EXPERIMENT_NAME, fold_name,
+                        task,
+                        f'{task}_{split}_finetuned_output.csv'
+                    )
+                    save_predictions_csv(
+                        predictions, targets, output_path,
+                        task, phenotype_names
+                    )
+                    print(f"    -> {output_path}")
+
+                accelerator.wait_for_everyone()
 
             # Report hook activity and clean up
-            for enc_name, cnt in nan_counts.items():
-                if cnt > 0:
-                    print(f"    NaN→0 replacements in {enc_name}: {cnt}")
+            if accelerator.is_main_process:
+                for enc_name, cnt in nan_counts.items():
+                    if cnt > 0:
+                        print(f"    NaN->0 replacements in "
+                              f"{enc_name}: {cnt}")
             for h in hooks:
                 h.remove()
 
@@ -686,5 +800,6 @@ if __name__ == '__main__':
         del loaders
         gc.collect()
 
-    print(f"\n{'=' * 60}")
-    print("Done.")
+    if accelerator.is_main_process:
+        print(f"\n{'=' * 60}")
+        print("Done.")
