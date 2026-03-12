@@ -16,8 +16,9 @@ Usage (single GPU):
     python dump_finetuned_predictions.py <dataset_config> <experiment_config> <experiment_name> \
         [--model_dir ./models] [--num_workers 0] [--batch_size 750]
 
-Usage (multi-GPU):
-    accelerate launch dump_finetuned_predictions.py <dataset_config> <experiment_config> \
+Usage (multi-GPU with config):
+    accelerate launch --config_file <accelerate_config.yaml> \
+        dump_finetuned_predictions.py <dataset_config> <experiment_config> \
         <experiment_name> [--model_dir ./models] [--num_workers 0] [--batch_size 750]
 """
 
@@ -210,11 +211,27 @@ def create_inference_loader(
     dataset = load_dataset(dataset_path)
     total = len(dataset)
 
-    # Shard sequentially across ranks
+    # Shard sequentially across ranks.  Every rank must receive
+    # exactly ``per_rank`` samples so that all ranks produce the same
+    # number of batches.  Under FSDP each forward pass triggers
+    # all-gather collectives, so an uneven batch count across ranks
+    # causes the faster ranks to block at gather while the slower
+    # ones are still in the forward pass, eventually timing out.
     per_rank = math.ceil(total / world_size)
     start_idx = rank * per_rank
     end_idx = min(start_idx + per_rank, total)
     indices = list(range(start_idx, end_idx))
+
+    # Pad with duplicates of the last sample so every rank has
+    # exactly per_rank entries.  The duplicates land at the tail of
+    # the gathered tensor and are trimmed by actual_n_samples.
+    if indices:
+        while len(indices) < per_rank:
+            indices.append(indices[-1])
+    else:
+        # Rank beyond dataset size (total < world_size) — fill with
+        # index 0 as a dummy; predictions will be trimmed away.
+        indices = [0] * per_rank
 
     subset = Subset(dataset, indices) if world_size > 1 else dataset
 
