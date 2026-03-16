@@ -84,8 +84,11 @@ class EpisodeData(NamedTuple):
         val_categorical_indicators: Array of shape (val_len, n_categorical_feats)
         val_categorical_values: List of arrays, each shape (val_len, feat_dim)
         val_text_indicators: Array of shape (val_len, n_text_feats)
-        val_text_values: List of arrays, each shape (val_len, token_len)
-        val_text_masks: List of arrays, each shape (val_len, token_len)
+        val_text_sparse: Per-feature sparse text entries. Each element
+            is a list of (timestep, token_ids, mask) tuples containing
+            only non-empty text entries. This avoids pickling large
+            dense (val_len, token_len) arrays through IPC when text
+            is sparse (~200x smaller per episode).
         event_times: Array of timestamps for event data, shape (event_len,)
         event_indicators: Array of shape (event_len, n_event_feats)
         static_data: Array of shape (static_total_dim,)
@@ -104,8 +107,7 @@ class EpisodeData(NamedTuple):
     val_categorical_indicators: 'np.ndarray'
     val_categorical_values: list
     val_text_indicators: 'np.ndarray'
-    val_text_values: list
-    val_text_masks: list
+    val_text_sparse: list
     event_times: 'np.ndarray'
     event_indicators: 'np.ndarray'
     static_data: 'np.ndarray'

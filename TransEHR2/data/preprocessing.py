@@ -143,33 +143,38 @@ class DataProcessor:
     def process_valued_data(
         self,
         data: pd.DataFrame
-    ) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], np.ndarray, List[np.ndarray],
-               np.ndarray, List[np.ndarray], List[np.ndarray]]:
+    ) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], np.ndarray,
+               List[np.ndarray], np.ndarray, list]:
         """
         Process value-associated data into flat numpy arrays.
-        
+
+        Text features are returned in sparse format to avoid allocating
+        large dense arrays (n_ts, token_len) that are mostly zeros. This
+        dramatically reduces multiprocessing IPC overhead since only
+        non-empty text entries are pickled and transferred.
+
         Args:
             data: DataFrame with TimedeltaIndex containing valued features
-            
+
         Returns:
             Tuple of:
             - times: (n_timesteps,) float32
             - numeric_indicators: (n_timesteps, n_numeric_feats) float32
-            - numeric_values: List of (n_timesteps, feat_dim) float32 arrays
-            - categorical_indicators: (n_timesteps, n_categorical_feats) float32
-            - categorical_values: List of (n_timesteps, feat_dim) int64 arrays
+            - numeric_values: List of (n_timesteps, feat_dim) float32
+            - categorical_indicators: (n_timesteps, n_cat_feats) float32
+            - categorical_values: List of (n_timesteps, feat_dim) int64
             - text_indicators: (n_timesteps, n_text_feats) float32
-            - text_values: List of (n_timesteps, token_len) int64 arrays
-            - text_masks: List of (n_timesteps, token_len) float32 arrays
+            - text_sparse: List of per-feature sparse entries, each a
+              list of (timestep, token_ids, attention_mask) tuples
         """
         if data.empty:
             n_ts = 0
         else:
             n_ts = len(data)
-        
+
         # Pre-allocate output arrays
         times = np.zeros(n_ts, dtype=np.float32)
-        
+
         # Numeric
         n_num = self.dims.n_numeric_feats
         numeric_indicators = np.zeros((n_ts, n_num), dtype=np.float32)
@@ -177,7 +182,7 @@ class DataProcessor:
             np.zeros((n_ts, dim), dtype=np.float32)
             for dim in self.dims.numeric_feat_dims
         ]
-        
+
         # Categorical
         n_cat = self.dims.n_categorical_feats
         categorical_indicators = np.zeros((n_ts, n_cat), dtype=np.float32)
@@ -185,39 +190,37 @@ class DataProcessor:
             np.zeros((n_ts, dim), dtype=np.int64)
             for dim in self.dims.categorical_feat_dims
         ]
-        
-        # Text
+
+        # Text — sparse: only non-empty entries are stored
         n_txt = self.dims.n_text_feats
         text_indicators = np.zeros((n_ts, n_txt), dtype=np.float32)
-        text_values = [
-            np.zeros((n_ts, dim), dtype=np.int64)
-            for dim in self.dims.text_feat_dims
-        ]
-        text_masks = [
-            np.zeros((n_ts, dim), dtype=np.float32)
-            for dim in self.dims.text_feat_dims
-        ]
-        
+        text_sparse = [[] for _ in range(n_txt)]
+
         if data.empty:
             return (times, numeric_indicators, numeric_values,
                     categorical_indicators, categorical_values,
-                    text_indicators, text_values, text_masks)
-        
+                    text_indicators, text_sparse)
+
         # Convert column names for namedtuple compatibility
         data = data.copy()
-        data.columns = [col.replace(' ', '_').replace('-', '_') for col in data.columns]
-        
+        data.columns = [
+            col.replace(' ', '_').replace('-', '_')
+            for col in data.columns
+        ]
+
         # Process each timestep
-        for t, record in enumerate(data.itertuples(index=True, name='Record')):
+        for t, record in enumerate(
+            data.itertuples(index=True, name='Record')
+        ):
             # Timestamp in hours
             times[t] = record.Index / np.timedelta64(1, 'h')
-            
+
             # Numeric features
             for f, feat in enumerate(self.numeric_feats):
                 feat_name = feat.replace(' ', '_').replace('-', '_')
                 feat_dim = self.dims.numeric_feat_dims[f]
                 cols = self._get_feature_columns(feat_name, record)
-                
+
                 if cols:
                     values = [getattr(record, c) for c in cols]
                     if not all(pd.isna(v) for v in values):
@@ -225,7 +228,7 @@ class DataProcessor:
                         for d, v in enumerate(values):
                             if d < feat_dim and pd.notna(v):
                                 numeric_values[f][t, d] = v
-            
+
             # Categorical features
             for f, feat in enumerate(self.categorical_feats):
                 feat_name = feat.replace(' ', '_').replace('-', '_')
@@ -233,32 +236,45 @@ class DataProcessor:
                     value = getattr(record, feat_name)
                     if pd.notna(value):
                         categorical_indicators[t, f] = 1.0
-                        # Convert to 1-indexed category
-                        cat_map = self.var_properties[feat].get('category_map', {})
+                        cat_map = self.var_properties[feat].get(
+                            'category_map', {}
+                        )
                         if isinstance(value, str):
-                            idx_map = {v: int(k) for k, v in cat_map.items()}
+                            idx_map = {
+                                v: int(k)
+                                for k, v in cat_map.items()
+                            }
                             cat_idx = idx_map.get(value, 0)
                         else:
                             cat_idx = int(value)
-                        # Ensure 1-indexed (0 = missing)
-                        first_idx = min(int(k) for k in cat_map.keys()) if cat_map else 0
+                        first_idx = (
+                            min(int(k) for k in cat_map.keys())
+                            if cat_map else 0
+                        )
                         cat_idx = cat_idx - first_idx + 1
                         categorical_values[f][t, 0] = cat_idx
-            
-            # Text features
+
+            # Text features — collect sparse entries only
             for f, feat in enumerate(self.text_feats):
                 feat_name = feat.replace(' ', '_').replace('-', '_')
                 if hasattr(record, feat_name):
                     value = getattr(record, feat_name)
                     if pd.notna(value) and value.strip():
                         text_indicators[t, f] = 1.0
-                        tokenized = self.tokenizer.process_text(value)
-                        text_values[f][t, :] = tokenized['input_ids']
-                        text_masks[f][t, :] = tokenized['attention_mask'].astype(np.float32)
-        
+                        tokenized = self.tokenizer.process_text(
+                            value
+                        )
+                        text_sparse[f].append((
+                            t,
+                            tokenized['input_ids'],
+                            tokenized['attention_mask'].astype(
+                                np.float32
+                            ),
+                        ))
+
         return (times, numeric_indicators, numeric_values,
                 categorical_indicators, categorical_values,
-                text_indicators, text_values, text_masks)
+                text_indicators, text_sparse)
     
     def process_event_data(
         self,
@@ -687,20 +703,30 @@ def _process_single_episode(
         
         # Process into numpy arrays
         (val_times, num_ind, num_vals, cat_ind, cat_vals,
-         txt_ind, txt_vals, txt_masks) = _tensorized_processor.process_valued_data(val_data)
-        
-        event_times, event_ind = _tensorized_processor.process_event_data(event_data)
-        
+         txt_ind, txt_sparse) = (
+            _tensorized_processor.process_valued_data(val_data)
+        )
+
+        event_times, event_ind = (
+            _tensorized_processor.process_event_data(event_data)
+        )
+
         static_arr = _tensorized_processor.process_static_data(statics)
-        
+
         # Normalize length of stay
         if max_episode_len_hours is not None:
             los = targets['length_of_stay'] - max_episode_len_hours
         else:
-            max_val_t = val_times.max() if len(val_times) > 0 else 0
-            max_event_t = event_times.max() if len(event_times) > 0 else 0
-            los = targets['length_of_stay'] - max(max_val_t, max_event_t)
-        
+            max_val_t = (
+                val_times.max() if len(val_times) > 0 else 0
+            )
+            max_event_t = (
+                event_times.max() if len(event_times) > 0 else 0
+            )
+            los = targets['length_of_stay'] - max(
+                max_val_t, max_event_t
+            )
+
         return EpisodeData(
             idx=i,
             val_len=len(val_times),
@@ -713,8 +739,7 @@ def _process_single_episode(
             val_categorical_indicators=cat_ind,
             val_categorical_values=cat_vals,
             val_text_indicators=txt_ind,
-            val_text_values=txt_vals,
-            val_text_masks=txt_masks,
+            val_text_sparse=txt_sparse,
             event_times=event_times,
             event_indicators=event_ind,
             static_data=static_arr,
@@ -958,9 +983,14 @@ def filter_timeseries_records(
         history_len = min(
             len(historic_record_indices), max_history_len
         )
-        historic_record_indices = (
-            historic_record_indices[-history_len:]
-        )
+        # Guard against -0 slice: array[-0:] returns the full array
+        # instead of an empty slice, so explicitly handle zero case
+        if history_len > 0:
+            historic_record_indices = (
+                historic_record_indices[-history_len:]
+            )
+        else:
+            historic_record_indices = np.array([], dtype=int)
 
         # Combine to give the indices of records to keep
         keep = np.concatenate(
@@ -1597,29 +1627,22 @@ def extract_mimic(
                     out_idx, ve_start:ve_start + val_ep, :
                 ] = ep.val_text_indicators[val_hist:]
 
-            # Sparse text — remap timestep indices to left-padded
-            # layout
+            # Sparse text — iterate over non-empty entries and remap
+            # timestep indices to left-padded layout
             for f in range(dims.n_text_feats):
-                text_count = 0
-                for t in range(val_len):
-                    if ep.val_text_indicators[t, f] > 0:
-                        arrays['_text_values_lists'][f].append(
-                            ep.val_text_values[f][t]
-                        )
-                        arrays['_text_masks_lists'][f].append(
-                            ep.val_text_masks[f][t]
-                        )
-                        # Remap sequential index to left-padded
-                        # position
-                        if t < val_hist:
-                            mapped_t = vh_start + t
-                        else:
-                            mapped_t = ve_start + (t - val_hist)
-                        arrays['_text_timesteps_lists'][f].append(
-                            mapped_t
-                        )
-                        text_count += 1
-                arrays['_text_counts'][f].append(text_count)
+                for (t, token_ids, mask) in ep.val_text_sparse[f]:
+                    if t < val_hist:
+                        mapped_t = vh_start + t
+                    else:
+                        mapped_t = ve_start + (t - val_hist)
+                    arrays['_text_values_lists'][f].append(token_ids)
+                    arrays['_text_masks_lists'][f].append(mask)
+                    arrays['_text_timesteps_lists'][f].append(
+                        mapped_t
+                    )
+                arrays['_text_counts'][f].append(
+                    len(ep.val_text_sparse[f])
+                )
         else:
             for f in range(dims.n_text_feats):
                 arrays['_text_counts'][f].append(0)
