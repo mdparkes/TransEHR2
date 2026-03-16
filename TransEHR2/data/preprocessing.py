@@ -29,21 +29,38 @@ _tensorized_dims = None
 
 class LLMTextProcessor:
 
-    def __init__(self, model_name: str = LLM_NAME, max_length: int = MAX_TOKEN_LENGTH):
+    def __init__(
+        self,
+        model_name: str = LLM_NAME,
+        max_length: int = MAX_TOKEN_LENGTH
+    ):
         """
         Initialize the LLM text processor.
-        
+
         Args:
             model_name (str): The LLM model name to use for tokenization
             max_length (int): Maximum sequence length for tokenized text
         """
 
-        # Use local files to avoid making too many requests and hitting rate limits
+        # Use the Llama-3.1-8B tokenizer explicitly because the
+        # Llama-3.2-1B tokenizer has a broken tekken.json path that
+        # causes AttributeError in convert_slow_tokenizer. The
+        # tokenizer vocabulary is compatible across Llama 3.x models.
+        tokenizer_name = 'meta-llama/Llama-3.1-8B'
         try:
-            self.tokenizer = AutoTokenizer.from_pretrained(model_name, token=HF_API_TOKEN, local_files_only=True)
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_name,
+                token=HF_API_TOKEN,
+                local_files_only=True,
+            )
         except OSError:
-            self.tokenizer = AutoTokenizer.from_pretrained(model_name, token=HF_API_TOKEN)
-        self.tokenizer.add_special_tokens({'pad_token': TOKENIZER_PAD_TOKEN})
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_name,
+                token=HF_API_TOKEN,
+            )
+        self.tokenizer.add_special_tokens(
+            {'pad_token': TOKENIZER_PAD_TOKEN}
+        )
         self.max_length = max_length
 
     
