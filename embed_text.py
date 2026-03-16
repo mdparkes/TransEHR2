@@ -22,7 +22,8 @@ Usage (single GPU):
     python embed_text.py --data-dir /path/to/data [--batch-size 64]
 
 Usage (multi-GPU, e.g. 4 GPUs each with batch_size 200):
-    python embed_text.py --data-dir /path/to/data --num-gpus 4 --batch-size 200
+    python embed_text.py --data-dir /path/to/data --num-gpus 4 \
+        --batch-size 200
 """
 
 import argparse
@@ -129,7 +130,6 @@ def load_episode_ids(part_dir: str) -> Optional[List]:
     if os.path.exists(ids_path):
         with open(ids_path, 'rb') as f:
             return pickle.load(f)
-    # Fallback: look for any *_ids.pkl
     for fname in os.listdir(part_dir):
         if fname.endswith('_ids.pkl'):
             with open(os.path.join(part_dir, fname), 'rb') as f:
@@ -148,8 +148,10 @@ def embed_batch(
 
     Args:
         llm: The GradientTraceableLLM instance.
-        token_ids_batch: (batch_size, token_len) int64 array of token IDs.
-        mask_batch: (batch_size, token_len) int64 array of attention masks.
+        token_ids_batch: (batch_size, token_len) int64 array of token
+            IDs.
+        mask_batch: (batch_size, token_len) int64 array of attention
+            masks.
         device: Torch device to run on.
 
     Returns:
@@ -199,7 +201,9 @@ def process_partition(
         n_non_empty = int(offsets[f][-1])
         if n_non_empty == 0:
             np.save(
-                os.path.join(part_dir, f'val_text_embeddings_{f}.npy'),
+                os.path.join(
+                    part_dir, f'val_text_embeddings_{f}.npy'
+                ),
                 np.zeros((0, embed_dim), dtype=np.float32)
             )
             continue
@@ -251,7 +255,8 @@ def process_partition(
                 0, len(need_embed_indices), batch_size
             ):
                 batch_end = min(
-                    batch_start + batch_size, len(need_embed_indices)
+                    batch_start + batch_size,
+                    len(need_embed_indices)
                 )
                 batch_tokens = token_array[batch_start:batch_end]
                 batch_masks = mask_array[batch_start:batch_end]
@@ -287,7 +292,9 @@ def process_partition(
                 embedding_cache[cache_key] = cached
 
         np.save(
-            os.path.join(part_dir, f'val_text_embeddings_{f}.npy'),
+            os.path.join(
+                part_dir, f'val_text_embeddings_{f}.npy'
+            ),
             all_embeddings
         )
         print(
@@ -307,7 +314,9 @@ def process_partition(
     return new_embeddings_count
 
 
-def worker(rank: int, args: argparse.Namespace, all_fold_names: List[str]):
+def worker(
+    rank: int, args: argparse.Namespace, all_fold_names: List[str]
+):
     """Entry point for each GPU worker process.
 
     Each worker independently loads the LLM onto its assigned GPU and
@@ -317,7 +326,8 @@ def worker(rank: int, args: argparse.Namespace, all_fold_names: List[str]):
     Args:
         rank: GPU index (0-based).
         args: Parsed command-line arguments.
-        all_fold_names: Full list of fold names discovered from data_dir.
+        all_fold_names: Full list of fold names discovered from
+            data_dir.
     """
     device = torch.device(f'cuda:{rank}')
     torch.cuda.set_device(device)
@@ -332,7 +342,8 @@ def worker(rank: int, args: argparse.Namespace, all_fold_names: List[str]):
 
     print(f"[GPU {rank}] Assigned {len(my_folds)} folds: {my_folds}")
     print(
-        f"[GPU {rank}] {len(my_partition_dirs)} partition directories"
+        f"[GPU {rank}] "
+        f"{len(my_partition_dirs)} partition directories"
     )
 
     if not my_partition_dirs:
@@ -388,7 +399,8 @@ def main():
     parser.add_argument(
         '--llm-name', type=str, default=None,
         help='HuggingFace model name for the LLM. '
-             'Defaults to the LLM_NAME constant in TransEHR2.constants.'
+             'Defaults to the LLM_NAME constant in '
+             'TransEHR2.constants.'
     )
     parser.add_argument(
         '--batch-size', type=int, default=64,
@@ -413,9 +425,11 @@ def main():
         print(f"No fold directories found under {args.data_dir}")
         return
 
-    print(f"Found {len(all_fold_names)} folds, "
-          f"using {args.num_gpus} GPU(s), "
-          f"batch_size={args.batch_size}")
+    print(
+        f"Found {len(all_fold_names)} folds, "
+        f"using {args.num_gpus} GPU(s), "
+        f"batch_size={args.batch_size}"
+    )
 
     if args.num_gpus <= 1:
         # Single-GPU: run directly, no spawning needed
