@@ -437,7 +437,7 @@ class MixedClassifier(torch.nn.Module):
                 vals_to_concat.append(categorical_vals)
 
             # Process text features
-            if 'text' in val_data and 'embedded_values' in val_data['text']:
+            if self.use_text and 'text' in val_data and 'embedded_values' in val_data['text']:
                 # Extract text feature indicators and embeddings
                 text_inds = val_data['text']['indicators']
                 inds_to_concat.append(text_inds)
