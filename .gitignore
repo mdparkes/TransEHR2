@@ -94,6 +94,7 @@ analyze_dataload_times.py
 test_run_experiment_accelerate.py
 test_tunes_hyperparameters.py
 test_text_extraction.py
+test_data_integrity.py
 
 # Development notes
 notes.md

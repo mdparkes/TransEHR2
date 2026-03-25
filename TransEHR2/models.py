@@ -3,38 +3,26 @@ import torch
 from torch import Tensor
 from typing import Dict, List, Optional, Tuple, Union
 
-from TransEHR2.constants import TEXT_EMBED_DIM
 from TransEHR2.data.custom_types import MixedTensorDataset, ValueAssociatedTensorData
 from TransEHR2.modules import MaskedTokenDiscriminator, MaskedTokenGenerator, TransformerHawkesProcess
 from TransEHR2.modules import EventDataEncoder, ValueDataEncoder
-from TransEHR2.modules import GradientTraceableLLM
 from TransEHR2.utils import calc_time_diff, sample_non_event_time_diff
 
 
 class ELECTRA(torch.nn.Module):
 
     def __init__(
-        self, 
+        self,
         generator: MaskedTokenGenerator,
         discriminator: MaskedTokenDiscriminator,
         hawkes: TransformerHawkesProcess,
         use_text: bool = False,
-        llm_module: Optional[GradientTraceableLLM] = None
     ):
         super().__init__()
         self.generator = generator
         self.discriminator = discriminator
         self.hawkes = hawkes
         self.use_text = use_text
-        
-        # Use shared LLM if use_text and llm_module provided
-        if self.use_text:
-            if llm_module is not None:
-                self.llm_module = llm_module
-            else:
-                self.llm_module = GradientTraceableLLM()
-        else:
-            self.llm_module = None
 
     def _extract_masked_targets(
         self,
@@ -135,74 +123,6 @@ class ELECTRA(torch.nn.Module):
                 )
         
         return masked_targets
-
-    def _gen_text_embeddings(
-        self,
-        value_data: ValueAssociatedTensorData,
-        trace_grads: bool = False
-    ) -> torch.Tensor:
-        """
-        Process text data through LLM, handling sparse text efficiently.
-        
-        Args:
-            value_data: Dictionary containing text data
-            trace_grads: Whether to trace gradients through LLM
-            
-        Returns:
-            torch.Tensor: Text embeddings with shape [batch, timesteps, features, embed_dim]
-        """
-        # Stack the text tokens and masks
-        text_tokens = torch.stack(value_data['text']['values'], dim=2)  # [batch, timesteps, features, tokens]
-        text_token_masks = torch.stack(value_data['text']['masks'], dim=2)
-        
-        batch_size, max_ts_len, n_text_feats, max_tokens = text_tokens.shape
-        
-        # Create a mask to identify timesteps with actual text data
-        has_text_per_timestep = (text_tokens.max(dim=-1)[0] > 0)  # [batch, timesteps, features]
-        has_any_text = has_text_per_timestep.any()
-
-        # Initialize embeddings tensor with zeros
-        final_embeddings = torch.zeros(
-            batch_size, max_ts_len, n_text_feats, TEXT_EMBED_DIM,
-            device=text_tokens.device, 
-            dtype=torch.float32
-        )
-        
-        # If text is present, perform a forward pass only on those positions. If text is not present anywhere in the
-        # batch, perform a forward pass with a dummy tensor to avoid NCCL timeouts due to desynchronization when using
-        # multiple GPUs in distributed computation.
-
-        if has_any_text:
-
-            # Find positions where we have actual text
-            text_positions = torch.where(has_text_per_timestep)
-            
-            # Extract only the tokens that have actual text
-            batch_indices, timestep_indices, feature_indices = text_positions
-            
-            # Get the actual text tokens and masks for processing
-            tokens_to_process = text_tokens[batch_indices, timestep_indices, feature_indices]  # [N, tokens]
-            masks_to_process = text_token_masks[batch_indices, timestep_indices, feature_indices]  # [N, tokens]
-
-            # Process through LLM
-            #   llm_embeddings shape: [N, TEXT_EMBED_DIM]
-            llm_embeddings = self.llm_module(
-                token_ids=tokens_to_process, 
-                trace_grads=trace_grads, 
-                attention_mask=masks_to_process
-            )
-            
-            # Put the processed embeddings back in their correct positions
-            final_embeddings[batch_indices, timestep_indices, feature_indices] = llm_embeddings
-        
-        else:
-
-            dummy_tokens = torch.zeros(1, max_tokens, dtype=torch.long, device=text_tokens.device)
-            dummy_masks = torch.zeros(1, max_tokens, dtype=torch.long, device=text_tokens.device)
-            _ = self.llm_module(token_ids=dummy_tokens, trace_grads=False, attention_mask=dummy_masks)
-
-
-        return final_embeddings
 
     def _prepare_discriminator_input_inplace(
         self, 
@@ -369,12 +289,8 @@ class ELECTRA(torch.nn.Module):
                 }
             
         value_data = batch['val_data']  # Extract the ValueAssociatedTensorData from the batch
-
-        if self.use_text and 'text' in value_data:
-            # Process text data through LLM
-            text_embeddings = self._gen_text_embeddings(value_data, trace_grads)
-            # Store embeddings in processed batch
-            value_data['text']['embedded_values'] = text_embeddings
+        # Pre-computed text embeddings are already in value_data['text']['embedded_values']
+        # from the dataloader (produced by embed_text.py).
 
         # MEMORY OPTIMIZATION: Extract masked target values BEFORE in-place modification.
         # This stores only the values needed for generator loss (~15-25% of batch) rather than
@@ -405,19 +321,18 @@ class MixedClassifier(torch.nn.Module):
     """
     
     def __init__(
-        self, 
+        self,
         event_encoder: EventDataEncoder,
         val_encoder: ValueDataEncoder,
-        d_event_enc: int, 
+        d_event_enc: int,
         d_val_enc: int,
         d_statics: int,
         num_classes: int,
         aggr: str = 'max',
         use_text: bool = False,
-        llm_module: Optional[GradientTraceableLLM] = None
     ):
         """Initialize MixedClassifier.
-        
+
         Args:
             event_encoder: Encoder for event-associated data
             val_encoder: Encoder for value-associated time series data
@@ -426,10 +341,7 @@ class MixedClassifier(torch.nn.Module):
             d_statics: Dimensionality of static data (0 if no static data)
             num_classes: Number of output classes
             aggr: Aggregation method ('max' or 'mean') for sequence-level encoding
-            use_text: If True, the model will be initialized with a GradientTraceableLLM instance, and the model will   
-                expect text features in the input.
-            llm_module: Optional pre-initialized GradientTraceableLLM instance to use for text processing. If None and 
-                use_text is True, a new instance will be created. This can be used to share the same LLM module across different models (for example, when using a pretrained, frozen LLM), saving a significant amount of memory.
+            use_text: If True, the model will expect pre-computed text embeddings in the input batch.
         """
 
         super().__init__()
@@ -439,75 +351,6 @@ class MixedClassifier(torch.nn.Module):
         self.linear1 = torch.nn.Linear(32, num_classes)
         self.aggr = aggr
         self.use_text = use_text
-
-        # Use shared LLM if use_text and llm_module provided
-        if self.use_text:
-            if llm_module is not None:
-                self.llm_module = llm_module
-            else:
-                self.llm_module = GradientTraceableLLM()
-        else:
-            self.llm_module = None
-
-    def _process_text_embeddings(
-        self, 
-        value_data: Dict, 
-        trace_grads: bool = False
-    ) -> torch.Tensor:
-        """Same method as in ELECTRA - process text through LLM efficiently."""
-        # Copy the exact _gen_text_embeddings method from ELECTRA
-        text_tokens = torch.stack(value_data['text']['values'], dim=2)
-        text_token_masks = torch.stack(value_data['text']['masks'], dim=2)
-        
-        batch_size, max_ts_len, n_text_feats, max_tokens = text_tokens.shape
-        
-        # Create a mask to identify timesteps with actual text data
-        has_text_per_timestep = (text_tokens.max(dim=-1)[0] > 0)
-        has_any_text = has_text_per_timestep.any()
-        
-        # Initialize embeddings tensor with zeros
-        final_embeddings = torch.zeros(
-            batch_size, max_ts_len, n_text_feats, TEXT_EMBED_DIM,
-            device=text_tokens.device, 
-            dtype=torch.float32
-        )
-        
-        # If text is present, perform a forward pass only on those positions. If text is not present anywhere in the
-        # batch, perform a forward pass with a dummy tensor to avoid NCCL timeouts due to desynchronization when using
-        # multiple GPUs in distributed computation.
-        if has_any_text:
-            # Initialize embeddings tensor with zeros
-            final_embeddings = torch.zeros(
-                batch_size, max_ts_len, n_text_feats, TEXT_EMBED_DIM,
-                device=text_tokens.device, 
-                dtype=torch.float32
-            )
-            
-            # Find positions where we have actual text
-            text_positions = torch.where(has_text_per_timestep)
-            
-            # Extract only the tokens that have actual text
-            batch_indices, timestep_indices, feature_indices = text_positions
-            
-            # Get the actual text tokens and masks for processing
-            tokens_to_process = text_tokens[batch_indices, timestep_indices, feature_indices]
-            masks_to_process = text_token_masks[batch_indices, timestep_indices, feature_indices]
-
-            # Process through LLM
-            llm_embeddings = self.llm_module(
-                token_ids=tokens_to_process, 
-                trace_grads=trace_grads, 
-                attention_mask=masks_to_process
-            )
-
-            # Put the processed embeddings back in their correct positions
-            final_embeddings[batch_indices, timestep_indices, feature_indices] = llm_embeddings
-        else:
-            dummy_tokens = torch.zeros(1, max_tokens, dtype=torch.long, device=text_tokens.device)
-            dummy_masks = torch.zeros(1, max_tokens, dtype=torch.long, device=text_tokens.device)
-            _ = self.llm_module(token_ids=dummy_tokens, trace_grads=False, attention_mask=dummy_masks)
-
-        return final_embeddings
 
     def forward(self, batch: MixedTensorDataset, trace_grads: bool = False) -> Tensor:
         """Forward pass through the mixed classifier.
@@ -568,11 +411,8 @@ class MixedClassifier(torch.nn.Module):
             val_times = val_data['times']
             val_masks = val_data['masks']
             
-            if self.use_text and 'text' in val_data:
-                if 'embedded_values' not in val_data['text']:
-                    # Generate text embeddings
-                    text_embeddings = self._process_text_embeddings(val_data, trace_grads)
-                    val_data['text']['embedded_values'] = text_embeddings
+            # Pre-computed text embeddings are already in val_data['text']['embedded_values']
+            # from the dataloader (produced by embed_text.py).
 
             # Combine all feature types along a single axis for the encoder
             inds_to_concat = []
@@ -597,7 +437,7 @@ class MixedClassifier(torch.nn.Module):
                 vals_to_concat.append(categorical_vals)
 
             # Process text features
-            if 'text' in val_data and 'embedded_values' in val_data['text']:
+            if self.use_text and 'text' in val_data and 'embedded_values' in val_data['text']:
                 # Extract text feature indicators and embeddings
                 text_inds = val_data['text']['indicators']
                 inds_to_concat.append(text_inds)

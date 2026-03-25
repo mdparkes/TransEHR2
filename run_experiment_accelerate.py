@@ -18,12 +18,12 @@ from accelerate.utils import DistributedType
 from torch.utils.tensorboard import SummaryWriter
 from typing import List, Union
 
-from TransEHR2.constants import TEXT_EMBED_DIM
+import pickle
+
 from TransEHR2.data.preprocessing import prepare_dataloaders
 from TransEHR2.models import ELECTRA, MixedClassifier
 from TransEHR2.modules import MaskedTokenDiscriminator, MaskedTokenGenerator, TransformerHawkesProcess
 from TransEHR2.modules import EventDataEncoder, ValueDataEncoder
-from TransEHR2.modules import GradientTraceableLLM
 from TransEHR2.routines_accelerate import pretrain_model, finetune_model, evaluate_finetuned_model
 from TransEHR2.routines_accelerate import reshape_flattened_state_dict
 from TransEHR2.utils import create_timer, convert_to_python_types, format_finetuning_performance_table, get_param_shapes
@@ -32,30 +32,26 @@ from TransEHR2.utils import create_timer, convert_to_python_types, format_finetu
 def initialize_accelerator(use_text: bool) -> Accelerator:
     """Initialize an Accelerate Accelerator instance with appropriate settings.
     
-    If use_text is True (derived from experiment config) the model requires an LLM, which has a large memory footprint. To reduce the LLM memory usage per GPU, an accelerator is created with fully sharded data parallel (FSDP) settings. If use_text is False, the model does not require an LLM, so standard distributed data parallel (DDP, i.e. MULTI_GPU) settings suffice. Note that the accelerator config must specify the correct distrbuted computing type (FSDP or MULTI_GPU). If the configuration file does not specify the correct type, this function will raise an error.
+    The accelerator config must specify FSDP or MULTI_GPU distributed type.
 
     Args:
-        use_text (bool): Whether the experiment uses text data and an LLM module.
+        use_text (bool): Whether the experiment uses text data.
 
     Returns:
         Accelerator: Configured Accelerator instance.
-    
+
     Raises:
-        ValueError: If the accelerator's distributed type does not match the expected type based on use_text.
+        ValueError: If the accelerator's distributed type is unsupported.
     """
 
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
-    
-    if use_text and accelerator.distributed_type not in (DistributedType.FSDP, DistributedType.MULTI_GPU):
+
+    if accelerator.distributed_type not in (DistributedType.FSDP, DistributedType.MULTI_GPU):
         raise ValueError(
-            f"USE_TEXT=True requires FSDP or MULTI_GPU but accelerator is configured for {accelerator.distributed_type}."
+            f"Expected FSDP or MULTI_GPU but accelerator is configured for {accelerator.distributed_type}."
         )
-    elif not use_text and accelerator.distributed_type != DistributedType.MULTI_GPU:
-        raise ValueError(
-            f"USE_TEXT=False expects MULTI_GPU (DDP) but accelerator is configured for {accelerator.distributed_type}."
-        )
-    
+
     return accelerator
     
 
@@ -168,6 +164,7 @@ if __name__ == "__main__":
     EVENT_FEATS = dataset_config['EVENT_FEATS']
     TEXT_FEATS = dataset_config['TEXT_FEATS']
     STATIC_FEATS = dataset_config['STATIC_FEATS']
+    MAX_HISTORY_LEN_STEPS = dataset_config.get('MAX_HISTORY_LEN_STEPS', 0)
 
     with open(args['experiment_config'], 'r') as f_in:
         experiment_config = yaml.safe_load(f_in)
@@ -219,6 +216,7 @@ if __name__ == "__main__":
     FINETUNE_LEARNING_RATE = experiment_config.get('FINETUNE_LEARNING_RATE', 2e-4)
     FINETUNE_TOTAL_EPOCH = experiment_config.get('FINETUNE_TOTAL_EPOCH', 500)
     FINETUNE_LEARNING_RATE_DECAY = experiment_config.get('FINETUNE_LEARNING_RATE_DECAY', 0.9)
+    USE_HISTORICAL_RECORDS = experiment_config.get('USE_HISTORICAL_RECORDS', True)
 
     # Create a Timer object for tracking the time it takes to train and evaluate the models
     timer = create_timer(
@@ -245,15 +243,26 @@ if __name__ == "__main__":
             categorical_class_cnts.append(len(variable_properties[feature]['category_map']))
     if USE_TEXT:
         n_val_feats = len(VALUED_FEATS) + len(TEXT_FEATS)
-        tot_val_feat_dim += len(TEXT_FEATS) * TEXT_EMBED_DIM
+        # Read text_embed_dim from the first fold's dataset metadata
+        fold_name_list = get_fold_names(DATA_DIR, exclude='fold0')
+        first_fold_meta_path = os.path.join(
+            DATA_DIR, fold_name_list[0], 'train', 'metadata.pkl'
+        )
+        with open(first_fold_meta_path, 'rb') as f:
+            _meta = pickle.load(f)
+        text_embed_dim = _meta['text_embed_dim']
+        if text_embed_dim == 0:
+            raise RuntimeError(
+                "text_embed_dim is 0 in dataset metadata. "
+                "Run embed_text.py to pre-compute text embeddings before training."
+            )
+        tot_val_feat_dim += len(TEXT_FEATS) * text_embed_dim
     else:
         n_val_feats = len(VALUED_FEATS)
+        text_embed_dim = 0
+        fold_name_list = get_fold_names(DATA_DIR, exclude='fold0')
     # Get number of event types
     n_event_types = len(EVENT_FEATS)
-
-
-    # Get cross validation fold subdirectories' names and iterate over folds
-    fold_name_list = get_fold_names(DATA_DIR, exclude='fold0')  # Fold0 is reserved for hyperparameter tuning
 
     for fold_name in fold_name_list:
         # Create a fresh accelerator because it solves problems
@@ -274,14 +283,16 @@ if __name__ == "__main__":
         fold_dir = os.path.join(DATA_DIR, fold_name)
         # Create the list of dataloaders for the training, validation (optional), and test sets
         dataloader_list = prepare_dataloaders(
-            fold_dir, 
-            BATCH_SIZE, 
+            fold_dir,
+            BATCH_SIZE,
             num_workers=num_workers,
             pin_memory=torch.cuda.is_available(),
             prefetch_factor=2 if num_workers > 0 else 1,
             balance_text=USE_TEXT,
             world_size=accelerator.num_processes,
-            rank=accelerator.process_index
+            rank=accelerator.process_index,
+            use_historical_records=USE_HISTORICAL_RECORDS,
+            max_history_len_steps=MAX_HISTORY_LEN_STEPS
         )
         if len(dataloader_list) == 3:
             train_loader, val_loader, test_loader = dataloader_list
@@ -292,10 +303,6 @@ if __name__ == "__main__":
 
 
         # Initialize models
-        if USE_TEXT:
-            pretrain_llm_module = GradientTraceableLLM()
-        else:
-            pretrain_llm_module = None
         generator_encoder = ValueDataEncoder(
             n_features=n_val_feats,
             feat_dim=tot_val_feat_dim,
@@ -337,6 +344,7 @@ if __name__ == "__main__":
             numeric_dims=numeric_feat_dims,
             categorical_classes=categorical_class_cnts,
             n_text_features=len(TEXT_FEATS) if USE_TEXT else 0,
+            text_embed_dim=text_embed_dim,
             predict_indicators=PREDICT_INDICATORS,
             dim_feedforward=GENERATOR_DIM_FEEDFORWARD
         )
@@ -358,7 +366,6 @@ if __name__ == "__main__":
             discriminator=discriminator,
             hawkes=transformer_hawkes_process,
             use_text=USE_TEXT,
-            llm_module=pretrain_llm_module  # Will be None when USE_TEXT is False
         )
 
 
@@ -443,7 +450,6 @@ if __name__ == "__main__":
         del generator_encoder
         del discriminator_encoder
         del thp_encoder
-        del pretrain_llm_module
         gc.collect()
         torch.cuda.empty_cache()
         accelerator.wait_for_everyone()
@@ -461,6 +467,35 @@ if __name__ == "__main__":
                 gc.collect()
                 torch.cuda.empty_cache()
             accelerator = initialize_accelerator(USE_TEXT)
+
+            # Check if this task is already fully completed or if finetuning can be skipped
+            finetuned_model_path = f'{model_save_dir}/finetuned_{task}.pt'
+            evaluation_file = (
+                f'{MODEL_DIR}/{EXPERIMENT_NAME}/{fold_name}/{task}'
+                f'/evaluation/evaluation_{task}.yaml'
+            )
+            if accelerator.is_main_process:
+                _model_exists = os.path.exists(finetuned_model_path)
+                _eval_exists = os.path.exists(evaluation_file)
+            else:
+                _model_exists = False
+                _eval_exists = False
+            _flags = broadcast_object_list([_model_exists, _eval_exists], from_process=0)
+            _model_exists, _eval_exists = _flags
+
+            # Skip entire task if evaluation already completed
+            if _eval_exists:
+                if accelerator.is_main_process:
+                    print(f"\nEvaluation for {task} already completed, skipping.\n")
+                accelerator.free_memory()
+                del accelerator
+                gc.collect()
+                torch.cuda.empty_cache()
+                continue
+
+            skip_finetuning = _model_exists
+            if skip_finetuning and accelerator.is_main_process:
+                print(f"\nFinetuned {task} model found, skipping finetuning.\n")
 
             checkpoint_dir = f'./checkpoints/{EXPERIMENT_NAME}/{fold_name}/finetuned'
             log_dir = f'./log/{EXPERIMENT_NAME}/{fold_name}/finetuned_{task}'
@@ -489,130 +524,129 @@ if __name__ == "__main__":
                 prediction_output_shape = 1
 
 
-            # Create a new LLM module for this task
-            if USE_TEXT:
-                finetune_llm_module = GradientTraceableLLM()
-            else:
-                finetune_llm_module = None
-            # Initialize the downstream predictor. The encoders are reinitialized with pretraining parameters.
-            predictor_value_encoder = ValueDataEncoder(
-                n_features=n_val_feats,
-                feat_dim=tot_val_feat_dim,
-                d_model=DISCRIMINATOR_ENCODER_D_MODEL,
-                n_heads=DISCRIMINATOR_ENCODER_N_HEADS,
-                n_encoder_blocks=DISCRIMINATOR_ENCODER_N_ENCODER_BLOCKS,
-                dim_feedforward=DISCRIMINATOR_ENCODER_DIM_FEEDFORWARD,
-                dropout=DISCRIMINATOR_ENCODER_DROPOUT,
-                activation=DISCRIMINATOR_ENCODER_ACTIVATION,
-                norm=DISCRIMINATOR_ENCODER_NORM,
-                normalize_before=DISCRIMINATOR_ENCODER_NORM_FIRST
-            )
-            predictor_event_encoder = EventDataEncoder(
-                num_types=n_event_types,
-                d_model=THP_ENCODER_D_MODEL,
-                d_inner=THP_ENCODER_D_INNER,
-                n_layers=THP_ENCODER_N_LAYERS,
-                n_head=THP_ENCODER_N_HEADS,
-                d_k=THP_ENCODER_D_K,
-                d_v=THP_ENCODER_D_V,
-                dropout=THP_ENCODER_DROPOUT,
-                normalize_before=THP_ENCODER_NORM_FIRST
-            )
-            downstream_predictor = MixedClassifier(
-                event_encoder=predictor_event_encoder,
-                val_encoder=predictor_value_encoder,
-                d_event_enc=THP_ENCODER_D_MODEL,
-                d_val_enc=DISCRIMINATOR_ENCODER_D_MODEL,
-                d_statics=len(STATIC_FEATS),
-                num_classes=prediction_output_shape,
-                aggr=PREDICTOR_AGGREGATION_METHOD,
-                use_text=USE_TEXT,
-                llm_module=finetune_llm_module  # Will be None when USE_TEXT is False
-            )
-
-            # Load pretrained encoder weights into downstream predictor
-            pretrained_dir = f'{MODEL_DIR}/{EXPERIMENT_NAME}/{fold_name}/pretrained'
-            value_encoder_path = os.path.join(pretrained_dir, 'value_encoder.pt')
-            event_encoder_path = os.path.join(pretrained_dir, 'event_encoder.pt')
-            if accelerator.is_main_process:
-                encoders_exist = os.path.exists(value_encoder_path) and os.path.exists(event_encoder_path)
-                if not encoders_exist:
-                    raise FileNotFoundError(
-                        f"Encoder weights not found in {pretrained_dir}. "
-                        f"Expected files: value_encoder.pt and event_encoder.pt. "
-                        f"Make sure pretraining completed successfully."
-                    )
-                else:
-                    print(f"\nLoading encoder weights from {pretrained_dir}\n")
-                    value_encoder_state = torch.load(value_encoder_path, map_location='cpu', weights_only=False)
-                    event_encoder_state = torch.load(event_encoder_path, map_location='cpu', weights_only=False)
-            else:
-                value_encoder_state = None
-                event_encoder_state = None
-            value_encoder_state = broadcast_object_list([value_encoder_state], from_process=0)[0]
-            event_encoder_state = broadcast_object_list([event_encoder_state], from_process=0)[0]
-            downstream_predictor.val_encoder.load_state_dict(value_encoder_state)
-            downstream_predictor.event_encoder.load_state_dict(event_encoder_state)
-            del value_encoder_state
-            del event_encoder_state
-            if accelerator.is_main_process:
-                    print("Successfully loaded encoder weights\n")
-            accelerator.wait_for_everyone()
-
-
-            # Get parameter shapes before wrapping with Accelerator
-            if accelerator.is_main_process:
-                finetune_param_shapes = get_param_shapes(downstream_predictor)
-            else:
-                finetune_param_shapes = None
-            finetune_param_shapes = broadcast_object_list([finetune_param_shapes], from_process=0)[0]
-
-
-            # Supervised task-specific finetuning
-            # Returns the scores from the best-performing epoch as determined by validation set performance
-            timer.start_phase('finetune', is_main_process=accelerator.is_main_process)
-            try:
-                best_train_scores, best_validation_scores = finetune_model(
-                    model=downstream_predictor,
-                    save_path=f'{model_save_dir}/finetuned_{task}.pt',
-                    loaders=[train_loader, val_loader],
-                    task=task,
-                    writer=writer,
-                    learning_rate=FINETUNE_LEARNING_RATE,
-                    learning_rate_decay=FINETUNE_LEARNING_RATE_DECAY,
-                    total_epoch=FINETUNE_TOTAL_EPOCH,
-                    checkpoint_dir=checkpoint_dir,
-                    accelerator=accelerator,
-                    mem_test_mode=mem_test_mode
+            if not skip_finetuning:
+                # Initialize the downstream predictor. The encoders are reinitialized with pretraining parameters.
+                predictor_value_encoder = ValueDataEncoder(
+                    n_features=n_val_feats,
+                    feat_dim=tot_val_feat_dim,
+                    d_model=DISCRIMINATOR_ENCODER_D_MODEL,
+                    n_heads=DISCRIMINATOR_ENCODER_N_HEADS,
+                    n_encoder_blocks=DISCRIMINATOR_ENCODER_N_ENCODER_BLOCKS,
+                    dim_feedforward=DISCRIMINATOR_ENCODER_DIM_FEEDFORWARD,
+                    dropout=DISCRIMINATOR_ENCODER_DROPOUT,
+                    activation=DISCRIMINATOR_ENCODER_ACTIVATION,
+                    norm=DISCRIMINATOR_ENCODER_NORM,
+                    normalize_before=DISCRIMINATOR_ENCODER_NORM_FIRST
                 )
-            except Exception as e:
+                predictor_event_encoder = EventDataEncoder(
+                    num_types=n_event_types,
+                    d_model=THP_ENCODER_D_MODEL,
+                    d_inner=THP_ENCODER_D_INNER,
+                    n_layers=THP_ENCODER_N_LAYERS,
+                    n_head=THP_ENCODER_N_HEADS,
+                    d_k=THP_ENCODER_D_K,
+                    d_v=THP_ENCODER_D_V,
+                    dropout=THP_ENCODER_DROPOUT,
+                    normalize_before=THP_ENCODER_NORM_FIRST
+                )
+                downstream_predictor = MixedClassifier(
+                    event_encoder=predictor_event_encoder,
+                    val_encoder=predictor_value_encoder,
+                    d_event_enc=THP_ENCODER_D_MODEL,
+                    d_val_enc=DISCRIMINATOR_ENCODER_D_MODEL,
+                    d_statics=len(STATIC_FEATS),
+                    num_classes=prediction_output_shape,
+                    aggr=PREDICTOR_AGGREGATION_METHOD,
+                    use_text=USE_TEXT,
+                )
+
+                # Load pretrained encoder weights into downstream predictor
+                pretrained_dir = f'{MODEL_DIR}/{EXPERIMENT_NAME}/{fold_name}/pretrained'
+                value_encoder_path = os.path.join(pretrained_dir, 'value_encoder.pt')
+                event_encoder_path = os.path.join(pretrained_dir, 'event_encoder.pt')
                 if accelerator.is_main_process:
-                    print(f'Error during finetuning for task {task}: {e}')
-                raise
-            timer.end_phase('finetune', is_main_process=accelerator.is_main_process)
+                    encoders_exist = os.path.exists(value_encoder_path) and os.path.exists(event_encoder_path)
+                    if not encoders_exist:
+                        raise FileNotFoundError(
+                            f"Encoder weights not found in {pretrained_dir}. "
+                            f"Expected files: value_encoder.pt and event_encoder.pt. "
+                            f"Make sure pretraining completed successfully."
+                        )
+                    else:
+                        print(f"\nLoading encoder weights from {pretrained_dir}\n")
+                        value_encoder_state = torch.load(value_encoder_path, map_location='cpu', weights_only=False)
+                        event_encoder_state = torch.load(event_encoder_path, map_location='cpu', weights_only=False)
+                else:
+                    value_encoder_state = None
+                    event_encoder_state = None
+                value_encoder_state = broadcast_object_list([value_encoder_state], from_process=0)[0]
+                event_encoder_state = broadcast_object_list([event_encoder_state], from_process=0)[0]
+                downstream_predictor.val_encoder.load_state_dict(value_encoder_state)
+                downstream_predictor.event_encoder.load_state_dict(event_encoder_state)
+                del value_encoder_state
+                del event_encoder_state
+                if accelerator.is_main_process:
+                        print("Successfully loaded encoder weights\n")
+                accelerator.wait_for_everyone()
 
 
-            # Clean up
-            if writer is not None:
-                writer.close()
-                del writer
-            del downstream_predictor
-            del predictor_value_encoder
-            del predictor_event_encoder
-            del finetune_llm_module
-            del accelerator
-            gc.collect()
-            torch.cuda.empty_cache()
+                # Get parameter shapes before wrapping with Accelerator
+                if accelerator.is_main_process:
+                    finetune_param_shapes = get_param_shapes(downstream_predictor)
+                else:
+                    finetune_param_shapes = None
+                finetune_param_shapes = broadcast_object_list([finetune_param_shapes], from_process=0)[0]
+
+
+                # Supervised task-specific finetuning
+                # Returns the scores from the best-performing epoch as determined by validation set performance
+                timer.start_phase('finetune', is_main_process=accelerator.is_main_process)
+                try:
+                    best_train_scores, best_validation_scores = finetune_model(
+                        model=downstream_predictor,
+                        save_path=f'{model_save_dir}/finetuned_{task}.pt',
+                        loaders=[train_loader, val_loader],
+                        task=task,
+                        writer=writer,
+                        learning_rate=FINETUNE_LEARNING_RATE,
+                        learning_rate_decay=FINETUNE_LEARNING_RATE_DECAY,
+                        total_epoch=FINETUNE_TOTAL_EPOCH,
+                        checkpoint_dir=checkpoint_dir,
+                        accelerator=accelerator,
+                        mem_test_mode=mem_test_mode
+                    )
+                except Exception as e:
+                    if accelerator.is_main_process:
+                        print(f'Error during finetuning for task {task}: {e}')
+                    raise
+                timer.end_phase('finetune', is_main_process=accelerator.is_main_process)
+
+
+                # Clean up
+                if writer is not None:
+                    writer.close()
+                    del writer
+                del downstream_predictor
+                del predictor_value_encoder
+                del predictor_event_encoder
+                del accelerator
+                gc.collect()
+                torch.cuda.empty_cache()
+            else:
+                # Close unused TensorBoard writer and clean up accelerator
+                if writer is not None:
+                    writer.close()
+                    del writer
+                accelerator.free_memory()
+                del accelerator
+                gc.collect()
+                torch.cuda.empty_cache()
 
 
             # Create a fresh accelerator because it solves problems
             accelerator = initialize_accelerator(USE_TEXT)
 
             # Reinitialize the model for evaluation
-            if USE_TEXT:
-                finetune_llm_module = GradientTraceableLLM()
-            else:
-                finetune_llm_module = None
             predictor_value_encoder = ValueDataEncoder(
                 n_features=n_val_feats,
                 feat_dim=tot_val_feat_dim,
@@ -645,8 +679,14 @@ if __name__ == "__main__":
                 num_classes=prediction_output_shape,
                 aggr=PREDICTOR_AGGREGATION_METHOD,
                 use_text=USE_TEXT,
-                llm_module=finetune_llm_module
             )
+
+            # Get parameter shapes from the unwrapped model for reshaping finetuned state dict
+            if accelerator.is_main_process:
+                finetune_param_shapes = get_param_shapes(downstream_predictor)
+            else:
+                finetune_param_shapes = None
+            finetune_param_shapes = broadcast_object_list([finetune_param_shapes], from_process=0)[0]
 
             # Load the finetuned state dict from file on the main process
             finetuned_state_dict_path = f'{model_save_dir}/finetuned_{task}.pt'
@@ -681,7 +721,6 @@ if __name__ == "__main__":
             del downstream_predictor
             del predictor_value_encoder
             del predictor_event_encoder
-            del finetune_llm_module
             gc.collect()
             torch.cuda.empty_cache()
             accelerator.wait_for_everyone()
@@ -689,8 +728,10 @@ if __name__ == "__main__":
 
             # Save and print results from this task
             if accelerator.is_main_process:
-                best_train_scores = convert_to_python_types(best_train_scores)
-                best_validation_scores = convert_to_python_types(best_validation_scores)
+                if best_train_scores is not None:
+                    best_train_scores = convert_to_python_types(best_train_scores)
+                if best_validation_scores is not None:
+                    best_validation_scores = convert_to_python_types(best_validation_scores)
                 best_test_scores = convert_to_python_types(best_test_scores)
                 # Save performance metrics from the best models to YAML files
                 evaluation_dir = f'{MODEL_DIR}/{EXPERIMENT_NAME}/{fold_name}/{task}/evaluation'
@@ -725,9 +766,16 @@ if __name__ == "__main__":
         gc.collect()
         torch.cuda.empty_cache()
 
+        # Ensure accelerator exists (it may have been deleted if all tasks were skipped)
+        if 'accelerator' not in locals():
+            accelerator = initialize_accelerator(USE_TEXT)
 
         timer.end_fold(is_main_process=accelerator.is_main_process)
 
+
+    # Ensure accelerator exists for final summary
+    if 'accelerator' not in locals():
+        accelerator = initialize_accelerator(USE_TEXT)
 
     if accelerator.is_main_process:
         timer.print_final_summary(is_main_process=accelerator.is_main_process)

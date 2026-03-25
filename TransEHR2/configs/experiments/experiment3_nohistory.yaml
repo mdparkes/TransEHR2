@@ -1,6 +1,6 @@
 # Establishes a baseline level of performance using the TransEHR model of Xu et al.
 
-EXPERIMENT_NAME: "experiment1_baseline"
+EXPERIMENT_NAME: "experiment3_nohistory"
 
 BATCH_SIZE: 200
 
@@ -10,7 +10,7 @@ USE_TEXT: False
 # Whether to use pre-admission historical records. If False, historical
 # timesteps are masked out at collation time so the model only sees
 # episode data. Requires data extracted with left-padded history layout.
-USE_HISTORICAL_RECORDS: True
+USE_HISTORICAL_RECORDS: False
 
 # Whether to let the generator and discriminator predict feature presence indicators as well as values
 PREDICT_INDICATORS: False

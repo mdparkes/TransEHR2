@@ -10,7 +10,6 @@ from datetime import timedelta
 from torch import Tensor
 from typing import Any, Dict, List, OrderedDict, Tuple, Union
 
-from TransEHR2.constants import TEXT_EMBED_DIM
 from TransEHR2.data.datasets import MixedDataset
 from TransEHR2.data.custom_types import MixedTensorDataset
 
@@ -417,8 +416,9 @@ def generate_record_masks(
             # Initialize indicator mask tensor
             indicator_mask = torch.zeros_like(feature_data['indicators'], device=batch_device)
             if feature_type == 'text':
-                # Text features get embedded to TEXT_EMBED_DIM
-                value_mask_shape = (batch_size, max_ts_len, TEXT_EMBED_DIM)
+                # Text features use pre-computed embeddings; get dim from batch
+                text_embed_dim = feature_data['embedded_values'].shape[-1]
+                value_mask_shape = (batch_size, max_ts_len, text_embed_dim)
                 val_masks[feature_type] = {
                     'indicators': indicator_mask,
                     'embedded_values': [torch.zeros(value_mask_shape, device=batch_device) for _ in range(n_features)]
@@ -515,7 +515,10 @@ def _gen_val_assoc_feat_mask(
 
     # Process value masks per feature (vectorized within each feature)
     for f in range(n_features):
-        feat_dim = TEXT_EMBED_DIM if feature_type == 'text' else values_data[f].shape[-1]
+        if feature_type == 'text':
+            feat_dim = data['val_data']['text']['embedded_values'].shape[-1]
+        else:
+            feat_dim = values_data[f].shape[-1]
         n_components_to_mask = max(1, int(subsample_rate * feat_dim))
 
         # Filter to positions for this feature
@@ -798,20 +801,34 @@ def convert_to_python_types(data: Dict[str, Any]) -> Dict[str, Any]:
 
 def calc_time_diff(event_times: Tensor, non_pad_mask: Tensor, device: str) -> Tensor:
         """Calculate time differences between consecutive events.
-        
-        Temporal differences are calculated between the current timestamp and the previous one.
+
+        Temporal differences are calculated between the current
+        timestamp and the previous one. A delta is valid only when
+        *both* the current and previous timesteps are non-padding;
+        otherwise the delta is zeroed out. This prevents spurious
+        deltas at the boundary between left-padded zeros and the
+        first real historical timestep.
 
         Args:
-            event_times (Tensor): Event timestamps of shape (batch_size, max_ts_len)
-            non_pad_mask (Tensor): Non-padding mask of shape (batch_size, max_ts_len)
-        
+            event_times (Tensor): Event timestamps of shape
+                (batch_size, max_ts_len)
+            non_pad_mask (Tensor): Non-padding mask of shape
+                (batch_size, max_ts_len)
+
         Returns:
-            Tensor: Time differences of shape (batch_size, max_ts_len). The first timestep has a time difference of zero.
-        
+            Tensor: Time differences of shape
+                (batch_size, max_ts_len). The first timestep has
+                a time difference of zero.
+
         """
-        
+
         time_diff = torch.zeros_like(event_times, device=device)
-        time_diff[:, 1:] = (event_times[:, 1:] - event_times[:, :-1]) * non_pad_mask[:, 1:]
+        # A delta at position i is valid only when both position i
+        # and position i-1 are non-padding.
+        both_valid = non_pad_mask[:, 1:] * non_pad_mask[:, :-1]
+        time_diff[:, 1:] = (
+            (event_times[:, 1:] - event_times[:, :-1]) * both_valid
+        )
 
         return time_diff
 

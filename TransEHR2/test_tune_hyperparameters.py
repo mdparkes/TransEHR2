@@ -16,12 +16,13 @@ from accelerate.utils import DistributedType
 from torch.utils.tensorboard import SummaryWriter
 from typing import Any, Dict, Tuple
 
-from TransEHR2.constants import TEXT_EMBED_DIM
+import pickle
+import re
+
 from TransEHR2.data.preprocessing import prepare_dataloaders
 from TransEHR2.models import ELECTRA
 from TransEHR2.modules import MaskedTokenDiscriminator, MaskedTokenGenerator, TransformerHawkesProcess
 from TransEHR2.modules import EventDataEncoder, ValueDataEncoder
-from TransEHR2.modules import GradientTraceableLLM
 from TransEHR2.routines_accelerate import pretrain_with_hyperparameter
 from TransEHR2.utils import create_timer, convert_to_python_types
 
@@ -38,13 +39,9 @@ def initialize_accelerator(use_text: bool) -> Accelerator:
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
     
-    if use_text and accelerator.distributed_type not in (DistributedType.FSDP, DistributedType.MULTI_GPU):
+    if accelerator.distributed_type not in (DistributedType.FSDP, DistributedType.MULTI_GPU):
         raise ValueError(
-            f"USE_TEXT=True requires FSDP or MULTI_GPU but accelerator is configured for {accelerator.distributed_type}."
-        )
-    elif not use_text and accelerator.distributed_type != DistributedType.MULTI_GPU:
-        raise ValueError(
-            f"USE_TEXT=False expects MULTI_GPU (DDP) but accelerator is configured for {accelerator.distributed_type}."
+            f"Expected FSDP or MULTI_GPU but accelerator is configured for {accelerator.distributed_type}."
         )
     
     return accelerator
@@ -210,6 +207,7 @@ if __name__ == "__main__":
     EVENT_FEATS = dataset_config['EVENT_FEATS']
     TEXT_FEATS = dataset_config['TEXT_FEATS']
     STATIC_FEATS = dataset_config['STATIC_FEATS']
+    MAX_HISTORY_LEN_STEPS = dataset_config.get('MAX_HISTORY_LEN_STEPS', 0)
 
     # Get experiment config parameters
     with open(args['experiment_config'], 'r') as f_in:
@@ -226,6 +224,7 @@ if __name__ == "__main__":
     GENERATOR_ENCODER_DROPOUT = experiment_config['GENERATOR_ENCODER_DROPOUT']
     GENERATOR_ENCODER_ACTIVATION = experiment_config['GENERATOR_ENCODER_ACTIVATION']
     GENERATOR_ENCODER_NORM = experiment_config['GENERATOR_ENCODER_NORM']
+    GENERATOR_ENCODER_NORM_FIRST = experiment_config.get('GENERATOR_ENCODER_NORM_FIRST', False)
     DISCRIMINATOR_ENCODER_D_MODEL = experiment_config['DISCRIMINATOR_ENCODER_D_MODEL']
     DISCRIMINATOR_ENCODER_N_HEADS = experiment_config['DISCRIMINATOR_ENCODER_N_HEADS']
     DISCRIMINATOR_ENCODER_N_ENCODER_BLOCKS = experiment_config['DISCRIMINATOR_ENCODER_N_ENCODER_BLOCKS']
@@ -233,6 +232,7 @@ if __name__ == "__main__":
     DISCRIMINATOR_ENCODER_DROPOUT = experiment_config['DISCRIMINATOR_ENCODER_DROPOUT']
     DISCRIMINATOR_ENCODER_ACTIVATION = experiment_config['DISCRIMINATOR_ENCODER_ACTIVATION']
     DISCRIMINATOR_ENCODER_NORM = experiment_config['DISCRIMINATOR_ENCODER_NORM']
+    DISCRIMINATOR_ENCODER_NORM_FIRST = experiment_config.get('DISCRIMINATOR_ENCODER_NORM_FIRST', False)
     THP_ENCODER_D_MODEL = experiment_config['THP_ENCODER_D_MODEL']
     THP_ENCODER_D_INNER = experiment_config['THP_ENCODER_D_INNER']
     THP_ENCODER_N_LAYERS = experiment_config['THP_ENCODER_N_LAYERS']
@@ -240,6 +240,7 @@ if __name__ == "__main__":
     THP_ENCODER_D_K = experiment_config['THP_ENCODER_D_K']
     THP_ENCODER_D_V = experiment_config['THP_ENCODER_D_V']
     THP_ENCODER_DROPOUT = experiment_config['THP_ENCODER_DROPOUT']
+    THP_ENCODER_NORM_FIRST = experiment_config.get('THP_ENCODER_NORM_FIRST', False)
     GENERATOR_D_MODEL = experiment_config['GENERATOR_D_MODEL']
     GENERATOR_DIM_FEEDFORWARD = experiment_config['GENERATOR_DIM_FEEDFORWARD']
     DISCRIMINATOR_DIM_FEEDFORWARD = experiment_config['DISCRIMINATOR_DIM_FEEDFORWARD']
@@ -260,6 +261,7 @@ if __name__ == "__main__":
     FINETUNE_LEARNING_RATE = experiment_config.get('FINETUNE_LEARNING_RATE', 2e-4)
     FINETUNE_TOTAL_EPOCH = experiment_config.get('FINETUNE_TOTAL_EPOCH', 500)
     FINETUNE_LEARNING_RATE_DECAY = experiment_config.get('FINETUNE_LEARNING_RATE_DECAY', 0.8)
+    USE_HISTORICAL_RECORDS = experiment_config.get('USE_HISTORICAL_RECORDS', True)
 
 
     # Create timer
@@ -282,17 +284,27 @@ if __name__ == "__main__":
             numeric_feat_dims.append(variable_properties[feature]['size'])
         elif variable_properties[feature]['type'] == 'categorical':
             categorical_class_cnts.append(len(variable_properties[feature]['category_map']))
-    if USE_TEXT:
-        n_val_feats = len(VALUED_FEATS) + len(TEXT_FEATS)
-        tot_val_feat_dim += len(TEXT_FEATS) * TEXT_EMBED_DIM
-    else:
-        n_val_feats = len(VALUED_FEATS)
-    n_event_types = len(EVENT_FEATS)
-
-
     # Get fold directory
     fold_name = 'fold0'
     fold_dir = os.path.join(DATA_DIR, fold_name)
+
+    if USE_TEXT:
+        n_val_feats = len(VALUED_FEATS) + len(TEXT_FEATS)
+        # Read text_embed_dim from fold0's dataset metadata
+        meta_path = os.path.join(fold_dir, 'train', 'metadata.pkl')
+        with open(meta_path, 'rb') as f:
+            _meta = pickle.load(f)
+        text_embed_dim = _meta['text_embed_dim']
+        if text_embed_dim == 0:
+            raise RuntimeError(
+                "text_embed_dim is 0 in dataset metadata. "
+                "Run embed_text.py to pre-compute text embeddings before tuning."
+            )
+        tot_val_feat_dim += len(TEXT_FEATS) * text_embed_dim
+    else:
+        n_val_feats = len(VALUED_FEATS)
+        text_embed_dim = 0
+    n_event_types = len(EVENT_FEATS)
 
 
     # Setup directories
@@ -304,13 +316,28 @@ if __name__ == "__main__":
     os.makedirs(evaluation_dir, exist_ok=True)
 
 
-    # Create dataloaders using the optimized tensorized format
+    # Get distributed info for dataloader creation
+    # We need world_size and rank before creating dataloaders for text-balanced sampling
+    _temp_accelerator = initialize_accelerator(USE_TEXT)
+    _world_size = _temp_accelerator.num_processes
+    _rank = _temp_accelerator.process_index
+    _temp_accelerator.free_memory()
+    del _temp_accelerator
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    # Create dataloaders using the optimized tensorized format with text-balanced sampling
     dataloader_list = prepare_dataloaders(
-        fold_dir, 
-        BATCH_SIZE, 
+        fold_dir,
+        BATCH_SIZE,
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
-        prefetch_factor=2 if num_workers > 0 else None
+        prefetch_factor=2 if num_workers > 0 else 1,
+        balance_text=USE_TEXT,
+        world_size=_world_size,
+        rank=_rank,
+        use_historical_records=USE_HISTORICAL_RECORDS,
+        max_history_len_steps=MAX_HISTORY_LEN_STEPS
     )
     # For HP tuning, we use train and test loaders only (test is used for model selection)
     if len(dataloader_list) == 3:
@@ -372,7 +399,6 @@ if __name__ == "__main__":
 
 
                 # Initialize models
-                pretrain_llm_module = GradientTraceableLLM() if USE_TEXT else None
                 generator_encoder = ValueDataEncoder(
                     n_features=n_val_feats, feat_dim=tot_val_feat_dim,
                     d_model=GENERATOR_ENCODER_D_MODEL, n_heads=GENERATOR_ENCODER_N_HEADS,
@@ -380,7 +406,8 @@ if __name__ == "__main__":
                     dim_feedforward=GENERATOR_ENCODER_DIM_FEEDFORWARD,
                     dropout=GENERATOR_ENCODER_DROPOUT,
                     activation=GENERATOR_ENCODER_ACTIVATION,
-                    norm=GENERATOR_ENCODER_NORM
+                    norm=GENERATOR_ENCODER_NORM,
+                    normalize_before=GENERATOR_ENCODER_NORM_FIRST
                 )
                 discriminator_encoder = ValueDataEncoder(
                     n_features=n_val_feats, feat_dim=tot_val_feat_dim,
@@ -389,13 +416,15 @@ if __name__ == "__main__":
                     dim_feedforward=DISCRIMINATOR_ENCODER_DIM_FEEDFORWARD,
                     dropout=DISCRIMINATOR_ENCODER_DROPOUT,
                     activation=DISCRIMINATOR_ENCODER_ACTIVATION,
-                    norm=DISCRIMINATOR_ENCODER_NORM
+                    norm=DISCRIMINATOR_ENCODER_NORM,
+                    normalize_before=DISCRIMINATOR_ENCODER_NORM_FIRST
                 )
                 thp_encoder = EventDataEncoder(
                     num_types=n_event_types, d_model=THP_ENCODER_D_MODEL,
                     d_inner=THP_ENCODER_D_INNER, n_layers=THP_ENCODER_N_LAYERS,
                     n_head=THP_ENCODER_N_HEADS, d_k=THP_ENCODER_D_K,
-                    d_v=THP_ENCODER_D_V, dropout=THP_ENCODER_DROPOUT
+                    d_v=THP_ENCODER_D_V, dropout=THP_ENCODER_DROPOUT,
+                    normalize_before=THP_ENCODER_NORM_FIRST
                 )
                 generator = MaskedTokenGenerator(
                     encoder=generator_encoder, d_model=GENERATOR_D_MODEL,
@@ -403,7 +432,8 @@ if __name__ == "__main__":
                     categorical_classes=categorical_class_cnts,
                     n_text_features=len(TEXT_FEATS) if USE_TEXT else 0,
                     predict_indicators=PREDICT_INDICATORS,
-                    dim_feedforward=GENERATOR_DIM_FEEDFORWARD
+                    dim_feedforward=GENERATOR_DIM_FEEDFORWARD,
+                    text_embed_dim=text_embed_dim,
                 )
                 discriminator = MaskedTokenDiscriminator(
                     encoder=discriminator_encoder,
@@ -419,11 +449,10 @@ if __name__ == "__main__":
                     num_types=n_event_types
                 )
                 electra = ELECTRA(
-                    generator=generator, 
+                    generator=generator,
                     discriminator=discriminator,
-                    hawkes=transformer_hawkes_process, 
+                    hawkes=transformer_hawkes_process,
                     use_text=USE_TEXT,
-                    llm_module=pretrain_llm_module  # Will be None when USE_TEXT is False
                 )
 
                 # Create TensorBoard writer
@@ -487,7 +516,6 @@ if __name__ == "__main__":
                 del generator_encoder
                 del discriminator_encoder
                 del thp_encoder
-                del pretrain_llm_module
                 gc.collect()
                 torch.cuda.empty_cache()
                 accelerator.wait_for_everyone()

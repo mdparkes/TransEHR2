@@ -4,7 +4,7 @@ from torch import Tensor
 from transformers import AutoTokenizer, AutoModel
 from typing import Dict, List, Optional, Tuple
 
-from TransEHR2.constants import HF_API_TOKEN, LLM_NAME, MAX_TOKEN_LENGTH, PAD, TEXT_EMBED_DIM, TOKENIZER_PAD_TOKEN
+from TransEHR2.constants import HF_API_TOKEN, LLM_NAME, MAX_TOKEN_LENGTH, PAD, TOKENIZER_PAD_TOKEN
 from TransEHR2.data.custom_types import EventAssociatedTensorData, ValueAssociatedTensorData
 from TransEHR2.layers import EncoderLayer, TemporalPositionEncoding, TransformerBatchNormEncoderLayer
 from TransEHR2.utils import combine_value_and_text_data
@@ -485,12 +485,13 @@ class MaskedTokenGenerator(torch.nn.Module):
     """
 
     def __init__(
-        self, 
+        self,
         encoder: torch.nn.Module,
-        d_model: int, 
-        numeric_dims: List[int], 
-        categorical_classes: List[int], 
+        d_model: int,
+        numeric_dims: List[int],
+        categorical_classes: List[int],
         n_text_features: int = 0,
+        text_embed_dim: int = 0,
         predict_indicators: bool = False,
         dim_feedforward: Optional[int] = 128
     ):
@@ -501,18 +502,19 @@ class MaskedTokenGenerator(torch.nn.Module):
             d_model (int): The dimensionality of the model's embedding vectors
             numeric_dims (List[int]): List of dimensions for each numeric feature
             categorical_classes (List[int]): List of class counts for each categorical feature
-            n_text_features (int): Number of text features. Defaults to 0. If 0, no text features will be processed or 
+            n_text_features (int): Number of text features. Defaults to 0. If 0, no text features will be processed or
                 predicted.
+            text_embed_dim (int): Dimensionality of pre-computed text embeddings. Required when n_text_features > 0.
             predict_indicators (bool): Whether to predict feature presence indicators
-            dim_feedforward (int, optional): Used when predict_indicators is True. The dimensionality of the hidden 
+            dim_feedforward (int, optional): Used when predict_indicators is True. The dimensionality of the hidden
                 layer in the MLP that predicts indicators. Defaults to 128.
         """
 
         super().__init__()
         self.encoder = encoder
 
-        # In the original implementation that only considered scalar real-valued features, the output head was a single 
-        # linear layer that produced a tensor with n_features as the last dimension. In this implementation, there is a 
+        # In the original implementation that only considered scalar real-valued features, the output head was a single
+        # linear layer that produced a tensor with n_features as the last dimension. In this implementation, there is a
         # separate output head for each feature type.
 
         self.numeric_heads = torch.nn.ModuleList([
@@ -522,7 +524,7 @@ class MaskedTokenGenerator(torch.nn.Module):
             torch.nn.Linear(d_model, n_classes) for n_classes in categorical_classes
         ])
         self.text_heads = torch.nn.ModuleList([
-            torch.nn.Linear(d_model, TEXT_EMBED_DIM) for _ in range(n_text_features)
+            torch.nn.Linear(d_model, text_embed_dim) for _ in range(n_text_features)
         ])
 
         self.predict_numeric_feats = len(self.numeric_heads) > 0

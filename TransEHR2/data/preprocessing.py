@@ -29,21 +29,38 @@ _tensorized_dims = None
 
 class LLMTextProcessor:
 
-    def __init__(self, model_name: str = LLM_NAME, max_length: int = MAX_TOKEN_LENGTH):
+    def __init__(
+        self,
+        model_name: str = LLM_NAME,
+        max_length: int = MAX_TOKEN_LENGTH
+    ):
         """
         Initialize the LLM text processor.
-        
+
         Args:
             model_name (str): The LLM model name to use for tokenization
             max_length (int): Maximum sequence length for tokenized text
         """
 
-        # Use local files to avoid making too many requests and hitting rate limits
+        # Use the Llama-3.1-8B tokenizer explicitly because the
+        # Llama-3.2-1B tokenizer has a broken tekken.json path that
+        # causes AttributeError in convert_slow_tokenizer. The
+        # tokenizer vocabulary is compatible across Llama 3.x models.
+        tokenizer_name = 'meta-llama/Llama-3.1-8B'
         try:
-            self.tokenizer = AutoTokenizer.from_pretrained(model_name, token=HF_API_TOKEN, local_files_only=True)
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_name,
+                token=HF_API_TOKEN,
+                local_files_only=True,
+            )
         except OSError:
-            self.tokenizer = AutoTokenizer.from_pretrained(model_name, token=HF_API_TOKEN)
-        self.tokenizer.add_special_tokens({'pad_token': TOKENIZER_PAD_TOKEN})
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_name,
+                token=HF_API_TOKEN,
+            )
+        self.tokenizer.add_special_tokens(
+            {'pad_token': TOKENIZER_PAD_TOKEN}
+        )
         self.max_length = max_length
 
     
@@ -143,33 +160,38 @@ class DataProcessor:
     def process_valued_data(
         self,
         data: pd.DataFrame
-    ) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], np.ndarray, List[np.ndarray],
-               np.ndarray, List[np.ndarray], List[np.ndarray]]:
+    ) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], np.ndarray,
+               List[np.ndarray], np.ndarray, list]:
         """
         Process value-associated data into flat numpy arrays.
-        
+
+        Text features are returned in sparse format to avoid allocating
+        large dense arrays (n_ts, token_len) that are mostly zeros. This
+        dramatically reduces multiprocessing IPC overhead since only
+        non-empty text entries are pickled and transferred.
+
         Args:
             data: DataFrame with TimedeltaIndex containing valued features
-            
+
         Returns:
             Tuple of:
             - times: (n_timesteps,) float32
             - numeric_indicators: (n_timesteps, n_numeric_feats) float32
-            - numeric_values: List of (n_timesteps, feat_dim) float32 arrays
-            - categorical_indicators: (n_timesteps, n_categorical_feats) float32
-            - categorical_values: List of (n_timesteps, feat_dim) int64 arrays
+            - numeric_values: List of (n_timesteps, feat_dim) float32
+            - categorical_indicators: (n_timesteps, n_cat_feats) float32
+            - categorical_values: List of (n_timesteps, feat_dim) int64
             - text_indicators: (n_timesteps, n_text_feats) float32
-            - text_values: List of (n_timesteps, token_len) int64 arrays
-            - text_masks: List of (n_timesteps, token_len) float32 arrays
+            - text_sparse: List of per-feature sparse entries, each a
+              list of (timestep, token_ids, attention_mask) tuples
         """
         if data.empty:
             n_ts = 0
         else:
             n_ts = len(data)
-        
+
         # Pre-allocate output arrays
         times = np.zeros(n_ts, dtype=np.float32)
-        
+
         # Numeric
         n_num = self.dims.n_numeric_feats
         numeric_indicators = np.zeros((n_ts, n_num), dtype=np.float32)
@@ -177,7 +199,7 @@ class DataProcessor:
             np.zeros((n_ts, dim), dtype=np.float32)
             for dim in self.dims.numeric_feat_dims
         ]
-        
+
         # Categorical
         n_cat = self.dims.n_categorical_feats
         categorical_indicators = np.zeros((n_ts, n_cat), dtype=np.float32)
@@ -185,39 +207,37 @@ class DataProcessor:
             np.zeros((n_ts, dim), dtype=np.int64)
             for dim in self.dims.categorical_feat_dims
         ]
-        
-        # Text
+
+        # Text — sparse: only non-empty entries are stored
         n_txt = self.dims.n_text_feats
         text_indicators = np.zeros((n_ts, n_txt), dtype=np.float32)
-        text_values = [
-            np.zeros((n_ts, dim), dtype=np.int64)
-            for dim in self.dims.text_feat_dims
-        ]
-        text_masks = [
-            np.zeros((n_ts, dim), dtype=np.float32)
-            for dim in self.dims.text_feat_dims
-        ]
-        
+        text_sparse = [[] for _ in range(n_txt)]
+
         if data.empty:
             return (times, numeric_indicators, numeric_values,
                     categorical_indicators, categorical_values,
-                    text_indicators, text_values, text_masks)
-        
+                    text_indicators, text_sparse)
+
         # Convert column names for namedtuple compatibility
         data = data.copy()
-        data.columns = [col.replace(' ', '_').replace('-', '_') for col in data.columns]
-        
+        data.columns = [
+            col.replace(' ', '_').replace('-', '_')
+            for col in data.columns
+        ]
+
         # Process each timestep
-        for t, record in enumerate(data.itertuples(index=True, name='Record')):
+        for t, record in enumerate(
+            data.itertuples(index=True, name='Record')
+        ):
             # Timestamp in hours
             times[t] = record.Index / np.timedelta64(1, 'h')
-            
+
             # Numeric features
             for f, feat in enumerate(self.numeric_feats):
                 feat_name = feat.replace(' ', '_').replace('-', '_')
                 feat_dim = self.dims.numeric_feat_dims[f]
                 cols = self._get_feature_columns(feat_name, record)
-                
+
                 if cols:
                     values = [getattr(record, c) for c in cols]
                     if not all(pd.isna(v) for v in values):
@@ -225,7 +245,7 @@ class DataProcessor:
                         for d, v in enumerate(values):
                             if d < feat_dim and pd.notna(v):
                                 numeric_values[f][t, d] = v
-            
+
             # Categorical features
             for f, feat in enumerate(self.categorical_feats):
                 feat_name = feat.replace(' ', '_').replace('-', '_')
@@ -233,32 +253,45 @@ class DataProcessor:
                     value = getattr(record, feat_name)
                     if pd.notna(value):
                         categorical_indicators[t, f] = 1.0
-                        # Convert to 1-indexed category
-                        cat_map = self.var_properties[feat].get('category_map', {})
+                        cat_map = self.var_properties[feat].get(
+                            'category_map', {}
+                        )
                         if isinstance(value, str):
-                            idx_map = {v: int(k) for k, v in cat_map.items()}
+                            idx_map = {
+                                v: int(k)
+                                for k, v in cat_map.items()
+                            }
                             cat_idx = idx_map.get(value, 0)
                         else:
                             cat_idx = int(value)
-                        # Ensure 1-indexed (0 = missing)
-                        first_idx = min(int(k) for k in cat_map.keys()) if cat_map else 0
+                        first_idx = (
+                            min(int(k) for k in cat_map.keys())
+                            if cat_map else 0
+                        )
                         cat_idx = cat_idx - first_idx + 1
                         categorical_values[f][t, 0] = cat_idx
-            
-            # Text features
+
+            # Text features — collect sparse entries only
             for f, feat in enumerate(self.text_feats):
                 feat_name = feat.replace(' ', '_').replace('-', '_')
                 if hasattr(record, feat_name):
                     value = getattr(record, feat_name)
                     if pd.notna(value) and value.strip():
                         text_indicators[t, f] = 1.0
-                        tokenized = self.tokenizer.process_text(value)
-                        text_values[f][t, :] = tokenized['input_ids']
-                        text_masks[f][t, :] = tokenized['attention_mask'].astype(np.float32)
-        
+                        tokenized = self.tokenizer.process_text(
+                            value
+                        )
+                        text_sparse[f].append((
+                            t,
+                            tokenized['input_ids'],
+                            tokenized['attention_mask'].astype(
+                                np.float32
+                            ),
+                        ))
+
         return (times, numeric_indicators, numeric_values,
                 categorical_indicators, categorical_values,
-                text_indicators, text_values, text_masks)
+                text_indicators, text_sparse)
     
     def process_event_data(
         self,
@@ -669,9 +702,12 @@ def _process_single_episode(
         val_data = val_data.dropna(axis=0, how='all')
         
         # Filter timeseries
-        val_data, event_data, text_data = filter_timeseries_records(
+        (val_data, event_data, text_data,
+         val_history_len, event_history_len,
+         _max_history_len) = filter_timeseries_records(
             val_data, event_data, text_data,
-            max_history_len_steps, max_episode_len_steps, max_episode_len_hours
+            max_history_len_steps, max_episode_len_steps,
+            max_episode_len_hours
         )
         
         # Merge text with value data
@@ -684,32 +720,43 @@ def _process_single_episode(
         
         # Process into numpy arrays
         (val_times, num_ind, num_vals, cat_ind, cat_vals,
-         txt_ind, txt_vals, txt_masks) = _tensorized_processor.process_valued_data(val_data)
-        
-        event_times, event_ind = _tensorized_processor.process_event_data(event_data)
-        
+         txt_ind, txt_sparse) = (
+            _tensorized_processor.process_valued_data(val_data)
+        )
+
+        event_times, event_ind = (
+            _tensorized_processor.process_event_data(event_data)
+        )
+
         static_arr = _tensorized_processor.process_static_data(statics)
-        
+
         # Normalize length of stay
         if max_episode_len_hours is not None:
             los = targets['length_of_stay'] - max_episode_len_hours
         else:
-            max_val_t = val_times.max() if len(val_times) > 0 else 0
-            max_event_t = event_times.max() if len(event_times) > 0 else 0
-            los = targets['length_of_stay'] - max(max_val_t, max_event_t)
-        
+            max_val_t = (
+                val_times.max() if len(val_times) > 0 else 0
+            )
+            max_event_t = (
+                event_times.max() if len(event_times) > 0 else 0
+            )
+            los = targets['length_of_stay'] - max(
+                max_val_t, max_event_t
+            )
+
         return EpisodeData(
             idx=i,
             val_len=len(val_times),
+            val_history_len=val_history_len,
             event_len=len(event_times),
+            event_history_len=event_history_len,
             val_times=val_times,
             val_numeric_indicators=num_ind,
             val_numeric_values=num_vals,
             val_categorical_indicators=cat_ind,
             val_categorical_values=cat_vals,
             val_text_indicators=txt_ind,
-            val_text_values=txt_vals,
-            val_text_masks=txt_masks,
+            val_text_sparse=txt_sparse,
             event_times=event_times,
             event_indicators=event_ind,
             static_data=static_arr,
@@ -910,77 +957,147 @@ def filter_timeseries_records(
         max_history_len: int = 0,
         max_episode_len: int = 100,
         max_episode_len_hours: Optional[int] = None
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, int, int, int]:
+    """Filter timeseries records by history and episode length constraints.
+
+    Returns:
+        Tuple of (numeric_data, event_data, text_data,
+                  val_history_len, event_history_len, max_history_len)
+        where val_history_len and event_history_len are the actual
+        number of pre-admission timesteps retained for value-associated
+        and event-associated data respectively, and max_history_len is
+        the configured maximum history length (for computing left-pad
+        offsets during array insertion).
+    """
+
     def filter(df):
-       
+
         df = df.sort_index()
-            
-        # Exclude records collected more than x hours into the current ICU stay episode
+
+        # Exclude records collected more than x hours into the
+        # current ICU stay episode
         if max_episode_len_hours is not None:
-            selected_records = df.index < np.timedelta64(max_episode_len_hours, 'h')
+            selected_records = (
+                df.index < np.timedelta64(max_episode_len_hours, 'h')
+            )
             df = df.loc[selected_records, :]
 
-        # Get indices of up to x records from the current ICU stay episode, starting from the earliest record
-        episode_record_indices = np.where(df.index >= np.timedelta64(0, 'h'))[0]
-        episode_len = min(len(episode_record_indices), max_episode_len)
-        episode_record_indices = episode_record_indices[:episode_len]  # Indices of the stay's earliest records
-        
-        # Get indices of up to x most recent records that were collected before the current ICU stay episode
-        historic_record_indices = np.where(df.index < np.timedelta64(0, 'h'))[0]
-        history_len = min(len(historic_record_indices), max_history_len)
-        historic_record_indices = historic_record_indices[-history_len:]  # Indices of most recent historic records
-        
-        # Combine to give the indices of records to keep
-        keep = np.concatenate((historic_record_indices, episode_record_indices))  # Indices of records to keep
-        
-        return df.iloc[keep, :]
+        # Get indices of up to x records from the current ICU stay
+        # episode, starting from the earliest record
+        episode_record_indices = np.where(
+            df.index >= np.timedelta64(0, 'h')
+        )[0]
+        episode_len = min(
+            len(episode_record_indices), max_episode_len
+        )
+        episode_record_indices = episode_record_indices[:episode_len]
 
-    event_data = filter(event_data)
-    
-    # Text data will eventually be embedded and merged with numeric feature data, so they must be filtered together
-    # to ensure that the length of the merged timeseries does not exceed the maximum allowed timeseries length.
+        # Get indices of up to x most recent records that were
+        # collected before the current ICU stay episode
+        historic_record_indices = np.where(
+            df.index < np.timedelta64(0, 'h')
+        )[0]
+        history_len = min(
+            len(historic_record_indices), max_history_len
+        )
+        # Guard against -0 slice: array[-0:] returns the full array
+        # instead of an empty slice, so explicitly handle zero case
+        if history_len > 0:
+            historic_record_indices = (
+                historic_record_indices[-history_len:]
+            )
+        else:
+            historic_record_indices = np.array([], dtype=int)
+
+        # Combine to give the indices of records to keep
+        keep = np.concatenate(
+            (historic_record_indices, episode_record_indices)
+        )
+
+        return df.iloc[keep, :], history_len
+
+    event_data, event_history_len = filter(event_data)
+
+    # Text data will eventually be embedded and merged with numeric
+    # feature data, so they must be filtered together to ensure that
+    # the length of the merged timeseries does not exceed the maximum
+    # allowed timeseries length.
     if text_data is not None:
-        # Merge text and numeric data on timestamps; used for filtering the numeric and text data
-        merged = numeric_data.merge(text_data, how='outer', left_index=True, right_index=True, indicator=True)
-        # Get the names of the numeric and text features so that they can be recovered after filtering
+        # Merge text and numeric data on timestamps; used for
+        # filtering the numeric and text data
+        merged = numeric_data.merge(
+            text_data, how='outer',
+            left_index=True, right_index=True, indicator=True
+        )
+        # Get the names of the numeric and text features so that
+        # they can be recovered after filtering
         numeric_feats = numeric_data.columns
         text_feats = text_data.columns
-        filtered = filter(merged)
-        # Split the filtered numeric and text data back into separate DataFrames
-        numeric_data = filtered.loc[filtered['_merge'].isin(['both', 'left_only']), numeric_feats]
-        text_data = filtered.loc[filtered['_merge'].isin(['both', 'right_only']), text_feats]
+        filtered, val_history_len = filter(merged)
+        # Split the filtered numeric and text data back into
+        # separate DataFrames
+        numeric_data = filtered.loc[
+            filtered['_merge'].isin(['both', 'left_only']),
+            numeric_feats
+        ]
+        text_data = filtered.loc[
+            filtered['_merge'].isin(['both', 'right_only']),
+            text_feats
+        ]
     else:
         # No text data, so there's no need to merge timesteps
-        numeric_data = filter(numeric_data)
+        numeric_data, val_history_len = filter(numeric_data)
 
-    return numeric_data, event_data, text_data
+    return (numeric_data, event_data, text_data,
+            val_history_len, event_history_len, max_history_len)
 
 
-def collate_tensorized(batch: MixedDataset) -> MixedTensorDataset:
+def collate_tensorized(
+    batch: MixedDataset,
+    use_historical_records: bool = True,
+    max_history_len_steps: int = 0
+) -> MixedTensorDataset:
     """Collate function for MixedDataset.
-    
-    Takes a list of episode dicts and stacks them into the MixedTensorDataset format expected by the model.
+
+    Takes a list of episode dicts and stacks them into the
+    MixedTensorDataset format expected by the model. Pre-computed text
+    embeddings are stacked into a single tensor at
+    batch['val_data']['text']['embedded_values'] with shape
+    [batch_size, max_ts_len, n_text_feats, embed_dim].
+
+    Args:
+        batch: List of episode dicts from MixedDataset.__getitem__.
+        use_historical_records: If False, zero out masks for the
+            history region [0, max_history_len_steps) so the model
+            ignores pre-admission data. Defaults to True.
+        max_history_len_steps: Number of timestep indices reserved
+            for historical records. Only used when
+            use_historical_records is False.
     """
-    
+
     # Stack simple tensors directly
     val_times = torch.stack([b['val_times'] for b in batch], dim=0)
     val_masks = torch.stack([b['val_masks'] for b in batch], dim=0)
     event_times = torch.stack([b['event_times'] for b in batch], dim=0)
     event_masks = torch.stack([b['event_masks'] for b in batch], dim=0)
+
+    # Mask out history region when historical records are disabled
+    if not use_historical_records and max_history_len_steps > 0:
+        val_masks[:, :max_history_len_steps] = 0.0
+        event_masks[:, :max_history_len_steps] = 0.0
     static_data = torch.stack([b['static_data'] for b in batch], dim=0)
-    
+
     # Stack indicator tensors
     val_numeric_ind = torch.stack([b['val_numeric_indicators'] for b in batch], dim=0)
     val_categorical_ind = torch.stack([b['val_categorical_indicators'] for b in batch], dim=0)
     val_text_ind = torch.stack([b['val_text_indicators'] for b in batch], dim=0)
     event_ind = torch.stack([b['event_indicators'] for b in batch], dim=0)
-    
+
     # Stack per-feature value tensors
     n_numeric_feats = len(batch[0]['val_numeric_values'])
     n_categorical_feats = len(batch[0]['val_categorical_values'])
-    n_text_feats = len(batch[0]['val_text_values'])
-    
+    n_text_feats = len(batch[0]['val_text_embeddings'])
+
     val_numeric_values = [
         torch.stack([b['val_numeric_values'][f] for b in batch], dim=0)
         for f in range(n_numeric_feats)
@@ -989,22 +1106,26 @@ def collate_tensorized(batch: MixedDataset) -> MixedTensorDataset:
         torch.stack([b['val_categorical_values'][f] for b in batch], dim=0)
         for f in range(n_categorical_feats)
     ]
-    val_text_values = [
-        torch.stack([b['val_text_values'][f] for b in batch], dim=0)
-        for f in range(n_text_feats)
-    ]
-    val_text_masks = [
-        torch.stack([b['val_text_masks'][f] for b in batch], dim=0)
-        for f in range(n_text_feats)
-    ]
-    
+
+    # Stack pre-computed text embeddings into [batch, max_ts, n_text_feats, embed_dim]
+    # Each b['val_text_embeddings'][f] has shape [max_ts_len, embed_dim]
+    # First stack features: [max_ts_len, n_text_feats, embed_dim] per episode
+    # Then stack episodes: [batch_size, max_ts_len, n_text_feats, embed_dim]
+    if n_text_feats > 0:
+        val_text_embeddings = torch.stack([
+            torch.stack(b['val_text_embeddings'], dim=1)  # [max_ts, n_feats, embed_dim]
+            for b in batch
+        ], dim=0)  # [batch, max_ts, n_feats, embed_dim]
+    else:
+        val_text_embeddings = None
+
     # Stack targets
     mortality = torch.stack([b['mortality'] for b in batch], dim=0).unsqueeze(-1)
     length_of_stay = torch.stack([b['length_of_stay'] for b in batch], dim=0).unsqueeze(-1)
     phenotype = torch.stack([b['phenotype'] for b in batch], dim=0)
-    
+
     # Build the MixedTensorDataset structure expected by the model
-    return {
+    result = {
         'val_data': {
             'numeric': {
                 'indicators': val_numeric_ind,
@@ -1013,11 +1134,6 @@ def collate_tensorized(batch: MixedDataset) -> MixedTensorDataset:
             'categorical': {
                 'indicators': val_categorical_ind,
                 'values': val_categorical_values,
-            },
-            'text': {
-                'indicators': val_text_ind,
-                'values': val_text_values,
-                'masks': val_text_masks,
             },
             'times': val_times,
             'masks': val_masks,
@@ -1035,16 +1151,24 @@ def collate_tensorized(batch: MixedDataset) -> MixedTensorDataset:
         },
     }
 
+    if val_text_embeddings is not None:
+        result['val_data']['text'] = {
+            'indicators': val_text_ind,
+            'embedded_values': val_text_embeddings,
+        }
+
+    return result
+
 
 def save_dataset(dataset: MixedDataset, base_path: str) -> None:
     """
     Save tensorized dataset as directory of .npy files (memory-mappable).
     """
     os.makedirs(base_path, exist_ok=True)
-    
+
     def save_array(name: str, arr: np.ndarray):
         np.save(os.path.join(base_path, f'{name}.npy'), arr)
-    
+
     # Dense arrays
     save_array('val_numeric_indicators', dataset.val_numeric_indicators)
     save_array('val_categorical_indicators', dataset.val_categorical_indicators)
@@ -1058,7 +1182,7 @@ def save_dataset(dataset: MixedDataset, base_path: str) -> None:
     save_array('mortality', dataset.mortality)
     save_array('length_of_stay', dataset.length_of_stay)
     save_array('phenotype', dataset.phenotype)
-    
+
     # Per-feature arrays
     for i, arr in enumerate(dataset.val_numeric_values):
         save_array(f'val_numeric_values_{i}', arr)
@@ -1072,35 +1196,55 @@ def save_dataset(dataset: MixedDataset, base_path: str) -> None:
         save_array(f'val_text_masks_{i}', arr)
     for i, arr in enumerate(dataset.val_text_timesteps):
         save_array(f'val_text_timesteps_{i}', arr)
-    
+    for i, arr in enumerate(dataset.val_text_embeddings):
+        save_array(f'val_text_embeddings_{i}', arr)
+
     # Metadata
     metadata = {
         'max_ts_len': dataset.max_ts_len,
         'text_token_len': dataset.text_token_len,
+        'text_embed_dim': dataset.text_embed_dim,
         'n_numeric_feats': len(dataset.val_numeric_values),
         'n_categorical_feats': len(dataset.val_categorical_values),
         'n_text_feats': dataset.n_text_feats,
     }
     with open(os.path.join(base_path, 'metadata.pkl'), 'wb') as f:
         pickle.dump(metadata, f)
-    
+
     print(f"Saved tensorized dataset to {base_path}/")
 
 
 def load_dataset(base_path: str) -> MixedDataset:
     """
     Load tensorized dataset with memory-mapped arrays.
+
+    Backward-compatible: if pre-computed embedding files are not present
+    (old datasets created before the pre-embedding overhaul), empty lists
+    are used for val_text_embeddings and text_embed_dim defaults to 0.
+    The training script will fail fast if it expects embeddings and they
+    are missing.
     """
     def load_mmap(name: str) -> np.ndarray:
         return np.load(os.path.join(base_path, f'{name}.npy'), mmap_mode='r')
-    
+
     with open(os.path.join(base_path, 'metadata.pkl'), 'rb') as f:
         metadata = pickle.load(f)
-    
+
     n_num = metadata['n_numeric_feats']
     n_cat = metadata['n_categorical_feats']
     n_txt = metadata['n_text_feats']
-    
+    text_embed_dim = metadata.get('text_embed_dim', 0)
+
+    # Load pre-computed embeddings if available (backward-compatible)
+    val_text_embeddings = []
+    if text_embed_dim > 0:
+        for i in range(n_txt):
+            embed_path = os.path.join(base_path, f'val_text_embeddings_{i}.npy')
+            if os.path.exists(embed_path):
+                val_text_embeddings.append(
+                    np.load(embed_path, mmap_mode='r')
+                )
+
     return MixedDataset(
         val_numeric_indicators=load_mmap('val_numeric_indicators'),
         val_numeric_values=[load_mmap(f'val_numeric_values_{i}') for i in range(n_num)],
@@ -1113,6 +1257,8 @@ def load_dataset(base_path: str) -> MixedDataset:
         val_text_values=[load_mmap(f'val_text_values_{i}') for i in range(n_txt)],
         val_text_masks=[load_mmap(f'val_text_masks_{i}') for i in range(n_txt)],
         val_text_timesteps=[load_mmap(f'val_text_timesteps_{i}') for i in range(n_txt)],
+        val_text_embeddings=val_text_embeddings,
+        text_embed_dim=text_embed_dim,
         event_indicators=load_mmap('event_indicators'),
         event_times=load_mmap('event_times'),
         event_masks=load_mmap('event_masks'),
@@ -1431,38 +1577,118 @@ def extract_mimic(
     for out_idx, ep in enumerate(tqdm(results, desc="Building arrays")):
         valid_ids.append(reader.patient_episode_ids[ep.idx])
         val_len = ep.val_len
+        val_hist = ep.val_history_len
+        val_ep = val_len - val_hist
         event_len = ep.event_len
-        
+        event_hist = ep.event_history_len
+        event_ep = event_len - event_hist
+
+        # Left-pad history: actual history data is right-justified
+        # within [0, max_history_len_steps). Episode data starts at
+        # index max_history_len_steps.
+        vh_start = max_history_len_steps - val_hist
+        ve_start = max_history_len_steps
+        eh_start = max_history_len_steps - event_hist
+        ee_start = max_history_len_steps
+
         if val_len > 0:
-            arrays['val_times'][out_idx, :val_len] = ep.val_times
-            arrays['val_masks'][out_idx, :val_len] = 1.0
-            arrays['val_numeric_indicators'][out_idx, :val_len, :] = ep.val_numeric_indicators
-            for f, vals in enumerate(ep.val_numeric_values):
-                arrays['val_numeric_values'][f][out_idx, :val_len, :] = vals
-            arrays['val_categorical_indicators'][out_idx, :val_len, :] = ep.val_categorical_indicators
-            for f, vals in enumerate(ep.val_categorical_values):
-                arrays['val_categorical_values'][f][out_idx, :val_len, :] = vals
-            arrays['val_text_indicators'][out_idx, :val_len, :] = ep.val_text_indicators
-            
-            # Sparse text
+            # History portion (right-justified in history region)
+            if val_hist > 0:
+                arrays['val_times'][
+                    out_idx, vh_start:max_history_len_steps
+                ] = ep.val_times[:val_hist]
+                arrays['val_masks'][
+                    out_idx, vh_start:max_history_len_steps
+                ] = 1.0
+                arrays['val_numeric_indicators'][
+                    out_idx, vh_start:max_history_len_steps, :
+                ] = ep.val_numeric_indicators[:val_hist]
+                for f, vals in enumerate(ep.val_numeric_values):
+                    arrays['val_numeric_values'][f][
+                        out_idx, vh_start:max_history_len_steps, :
+                    ] = vals[:val_hist]
+                arrays['val_categorical_indicators'][
+                    out_idx, vh_start:max_history_len_steps, :
+                ] = ep.val_categorical_indicators[:val_hist]
+                for f, vals in enumerate(ep.val_categorical_values):
+                    arrays['val_categorical_values'][f][
+                        out_idx, vh_start:max_history_len_steps, :
+                    ] = vals[:val_hist]
+                arrays['val_text_indicators'][
+                    out_idx, vh_start:max_history_len_steps, :
+                ] = ep.val_text_indicators[:val_hist]
+
+            # Episode portion (starts at max_history_len_steps)
+            if val_ep > 0:
+                arrays['val_times'][
+                    out_idx, ve_start:ve_start + val_ep
+                ] = ep.val_times[val_hist:]
+                arrays['val_masks'][
+                    out_idx, ve_start:ve_start + val_ep
+                ] = 1.0
+                arrays['val_numeric_indicators'][
+                    out_idx, ve_start:ve_start + val_ep, :
+                ] = ep.val_numeric_indicators[val_hist:]
+                for f, vals in enumerate(ep.val_numeric_values):
+                    arrays['val_numeric_values'][f][
+                        out_idx, ve_start:ve_start + val_ep, :
+                    ] = vals[val_hist:]
+                arrays['val_categorical_indicators'][
+                    out_idx, ve_start:ve_start + val_ep, :
+                ] = ep.val_categorical_indicators[val_hist:]
+                for f, vals in enumerate(ep.val_categorical_values):
+                    arrays['val_categorical_values'][f][
+                        out_idx, ve_start:ve_start + val_ep, :
+                    ] = vals[val_hist:]
+                arrays['val_text_indicators'][
+                    out_idx, ve_start:ve_start + val_ep, :
+                ] = ep.val_text_indicators[val_hist:]
+
+            # Sparse text — iterate over non-empty entries and remap
+            # timestep indices to left-padded layout
             for f in range(dims.n_text_feats):
-                text_count = 0
-                for t in range(val_len):
-                    if ep.val_text_indicators[t, f] > 0:
-                        arrays['_text_values_lists'][f].append(ep.val_text_values[f][t])
-                        arrays['_text_masks_lists'][f].append(ep.val_text_masks[f][t])
-                        arrays['_text_timesteps_lists'][f].append(t)
-                        text_count += 1
-                arrays['_text_counts'][f].append(text_count)
+                for (t, token_ids, mask) in ep.val_text_sparse[f]:
+                    if t < val_hist:
+                        mapped_t = vh_start + t
+                    else:
+                        mapped_t = ve_start + (t - val_hist)
+                    arrays['_text_values_lists'][f].append(token_ids)
+                    arrays['_text_masks_lists'][f].append(mask)
+                    arrays['_text_timesteps_lists'][f].append(
+                        mapped_t
+                    )
+                arrays['_text_counts'][f].append(
+                    len(ep.val_text_sparse[f])
+                )
         else:
             for f in range(dims.n_text_feats):
                 arrays['_text_counts'][f].append(0)
-        
+
         if event_len > 0:
-            arrays['event_times'][out_idx, :event_len] = ep.event_times
-            arrays['event_masks'][out_idx, :event_len] = 1.0
-            arrays['event_indicators'][out_idx, :event_len, :] = ep.event_indicators
-        
+            # History portion (right-justified in history region)
+            if event_hist > 0:
+                arrays['event_times'][
+                    out_idx, eh_start:max_history_len_steps
+                ] = ep.event_times[:event_hist]
+                arrays['event_masks'][
+                    out_idx, eh_start:max_history_len_steps
+                ] = 1.0
+                arrays['event_indicators'][
+                    out_idx, eh_start:max_history_len_steps, :
+                ] = ep.event_indicators[:event_hist]
+
+            # Episode portion (starts at max_history_len_steps)
+            if event_ep > 0:
+                arrays['event_times'][
+                    out_idx, ee_start:ee_start + event_ep
+                ] = ep.event_times[event_hist:]
+                arrays['event_masks'][
+                    out_idx, ee_start:ee_start + event_ep
+                ] = 1.0
+                arrays['event_indicators'][
+                    out_idx, ee_start:ee_start + event_ep, :
+                ] = ep.event_indicators[event_hist:]
+
         arrays['static_data'][out_idx, :] = ep.static_data
         arrays['mortality'][out_idx] = ep.mortality
         arrays['length_of_stay'][out_idx] = ep.length_of_stay
@@ -1497,7 +1723,7 @@ def extract_mimic(
     print("Saving dataset...")
     sys.stdout.flush()
     
-    # Create dataset with sparse text
+    # Create dataset with sparse text (embeddings will be added later by embed_text.py)
     dataset = MixedDataset(
         val_numeric_indicators=arrays['val_numeric_indicators'],
         val_numeric_values=arrays['val_numeric_values'],
@@ -1506,11 +1732,13 @@ def extract_mimic(
         val_text_indicators=arrays['val_text_indicators'],
         val_times=arrays['val_times'],
         val_masks=arrays['val_masks'],
-        # Sparse text
+        # Sparse text (tokens for XAI, embeddings added by embed_text.py)
         val_text_offsets=val_text_offsets,
         val_text_values=val_text_values,
         val_text_masks=val_text_masks,
         val_text_timesteps=val_text_timesteps,
+        val_text_embeddings=[],  # Populated by embed_text.py
+        text_embed_dim=0,  # Set by embed_text.py
         # Event data
         event_indicators=arrays['event_indicators'],
         event_times=arrays['event_times'],
@@ -1545,7 +1773,9 @@ def prepare_dataloaders(
     prefetch_factor: int = 2,
     balance_text: bool = False,
     world_size: Optional[int] = None,
-    rank: Optional[int] = None
+    rank: Optional[int] = None,
+    use_historical_records: bool = True,
+    max_history_len_steps: int = 0
 ) -> List[DataLoader]:
     """Prepare training, (validation), and test DataLoaders for MixedDataset.
 
@@ -1599,9 +1829,14 @@ def prepare_dataloaders(
             accelerator.prepare_data_loader() to add standard distributed sampling.
         world_size (int, optional): Number of distributed processes. Required if balance_text=True.
             Can be obtained from accelerator.num_processes.
-        rank (int, optional): Current process rank. Required if balance_text=True. Can be obtained 
+        rank (int, optional): Current process rank. Required if balance_text=True. Can be obtained
             from accelerator.process_index.
-        
+        use_historical_records (bool, optional): If False, zero out masks for the history region
+            [0, max_history_len_steps) so the model ignores pre-admission data. Defaults to True.
+        max_history_len_steps (int, optional): Number of timestep indices reserved for historical
+            records in the extracted arrays. Only used when use_historical_records is False.
+            Defaults to 0.
+
     Returns:
         List[DataLoader]: List of DataLoaders in order: [train_loader, val_loader (if available), 
             test_loader]. If validation data are not found, only [train_loader, test_loader] is 
@@ -1655,12 +1890,18 @@ def prepare_dataloaders(
             )
             shuffle = False  # Sampler handles shuffling
         
+        collate_fn = partial(
+            collate_tensorized,
+            use_historical_records=use_historical_records,
+            max_history_len_steps=max_history_len_steps,
+        )
+
         loader = DataLoader(
             dataset,
             batch_size=batch_size,
             shuffle=shuffle if sampler is None else False,
             sampler=sampler,
-            collate_fn=collate_tensorized,
+            collate_fn=collate_fn,
             num_workers=num_workers,
             pin_memory=pin_memory if num_workers > 0 else False,
             prefetch_factor=prefetch_factor if num_workers > 0 else None,
