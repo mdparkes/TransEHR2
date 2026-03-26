@@ -89,6 +89,7 @@ checkpoints/
 TransEHR2/configs/**/test*.yaml
 
 # Test scripts
+tests/
 analyze_timestep_counts.py
 analyze_dataload_times.py
 test_run_experiment_accelerate.py

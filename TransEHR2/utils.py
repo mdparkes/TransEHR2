@@ -408,7 +408,7 @@ def generate_record_masks(
     event_masks = None
 
     # Initialize value-associated data masks
-    for feature_type in ['numeric', 'categorical', 'text']:
+    for feature_type in ['numeric', 'categorical', 'ordinal', 'text']:
         if feature_type in data['val_data']:
             feature_data = data['val_data'][feature_type]
             # Get number of features from first episode's first timestep

@@ -235,14 +235,21 @@ if __name__ == "__main__":
     tot_val_feat_dim = 0  # Counts the total number of dimensions of all input features
     numeric_feat_dims = []  # The dimension of each numeric feature
     categorical_class_cnts = []  # The number of classes for each categorical feature
+    ordinal_features = []  # The number of levels for each ordinal feature
     for feature in VALUED_FEATS:
-        tot_val_feat_dim += variable_properties[feature]['size'] # Accumulate numeric feature sizes
+        tot_val_feat_dim += variable_properties[feature]['size']
         if variable_properties[feature]['type'] == 'numeric':
             numeric_feat_dims.append(variable_properties[feature]['size'])
         elif variable_properties[feature]['type'] == 'categorical':
-            categorical_class_cnts.append(len(variable_properties[feature]['category_map']))
+            categorical_class_cnts.append(
+                len(variable_properties[feature]['category_map'])
+            )
+        elif variable_properties[feature]['type'] == 'ordinal':
+            ordinal_features.append(
+                len(variable_properties[feature]['category_map'])
+            )
     if USE_TEXT:
-        n_val_feats = len(VALUED_FEATS) + len(TEXT_FEATS)
+        n_val_feats = len(VALUED_FEATS) + len(TEXT_FEATS)  # includes numeric + categorical + ordinal + text
         # Read text_embed_dim from the first fold's dataset metadata
         fold_name_list = get_fold_names(DATA_DIR, exclude='fold0')
         first_fold_meta_path = os.path.join(
@@ -343,6 +350,7 @@ if __name__ == "__main__":
             d_model=GENERATOR_D_MODEL,
             numeric_dims=numeric_feat_dims,
             categorical_classes=categorical_class_cnts,
+            ordinal_features=ordinal_features if ordinal_features else None,
             n_text_features=len(TEXT_FEATS) if USE_TEXT else 0,
             text_embed_dim=text_embed_dim,
             predict_indicators=PREDICT_INDICATORS,
@@ -353,6 +361,7 @@ if __name__ == "__main__":
             d_model=DISCRIMINATOR_ENCODER_D_MODEL,
             n_numeric_features=len(numeric_feat_dims),
             n_categorical_features=len(categorical_class_cnts),
+            n_ordinal_features=len(ordinal_features),
             n_text_features=len(TEXT_FEATS) if USE_TEXT else 0,
             n_static_features=len(STATIC_FEATS),
             dim_feedforward=DISCRIMINATOR_DIM_FEEDFORWARD
@@ -429,7 +438,8 @@ if __name__ == "__main__":
                     cmpnt_mask_ratio=CMPNT_MASK_RATIO,
                     checkpoint_dir=checkpoint_dir,
                     accelerator=accelerator,
-                    mem_test_mode=mem_test_mode
+                    mem_test_mode=mem_test_mode,
+                    ordinal_features=ordinal_features if ordinal_features else None
                 )
             except Exception as e:
                 if accelerator.is_main_process:

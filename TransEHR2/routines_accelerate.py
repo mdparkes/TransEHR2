@@ -18,7 +18,7 @@ from torch import Tensor
 from torch.distributed.fsdp import FullStateDictConfig, StateDictType
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from tqdm import tqdm
-from typing import Any, Dict, Optional, OrderedDict, Tuple, TypeAlias
+from typing import Any, Dict, List, Optional, OrderedDict, Tuple, TypeAlias
 
 from TransEHR2.losses import MaskedDiscriminatorLoss, MaskedGeneratorLoss, TransformerHawkesLoss
 from TransEHR2.models import MixedClassifier
@@ -930,7 +930,8 @@ def pretrain_model(
     resume_from_checkpoint: bool = True,
     timer: Optional[DistributedTimer] = None,
     accelerator: Accelerator = None,
-    mem_test_mode: bool = False
+    mem_test_mode: bool = False,
+    ordinal_features: Optional[List[int]] = None
 ) -> Tuple[Dict[str, float], Dict[str, float]]:
     """Pre-train an ELECTRA-style model with Accelerate support (FSDP or DDP).
     
@@ -988,7 +989,9 @@ def pretrain_model(
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=learning_rate_decay)
 
     # Initialize loss functions
-    gen_loss_fn = MaskedGeneratorLoss()
+    gen_loss_fn = MaskedGeneratorLoss(
+        ordinal_features=ordinal_features
+    )
     disc_loss_fn = MaskedDiscriminatorLoss(weight=disc_loss_weight)
     thp_loss_fn = TransformerHawkesLoss(
         add_prediction_loss=use_thp_pred_loss,
@@ -1510,10 +1513,11 @@ def pretrain_with_hyperparameter(
     checkpoint_dir: str = None,
     resume_from_checkpoint: bool = True,
     timer: Optional[DistributedTimer] = None,
-    accelerator: Accelerator = None
+    accelerator: Accelerator = None,
+    ordinal_features: Optional[List[int]] = None
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Pretrain a model using a specific hyperparameter setting with Accelerate.
-    
+
     This is the hyperparameter tuning version of pretrain_model.
     
     Args:
@@ -1573,7 +1577,9 @@ def pretrain_with_hyperparameter(
 
 
     # Initialize loss functions
-    gen_loss_fn = MaskedGeneratorLoss()
+    gen_loss_fn = MaskedGeneratorLoss(
+        ordinal_features=ordinal_features
+    )
     disc_loss_fn = MaskedDiscriminatorLoss(weight=disc_loss_weight)
     thp_loss_fn = TransformerHawkesLoss(
         add_prediction_loss=use_thp_pred_loss,

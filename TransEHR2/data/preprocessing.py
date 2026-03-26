@@ -141,12 +141,15 @@ class DataProcessor:
         # Separate valued_feats by type
         self.numeric_feats = []
         self.categorical_feats = []
+        self.ordinal_feats = []
         for feat in valued_feats:
             feat_type = self.var_properties[feat]['type']
             if feat_type == 'numeric':
                 self.numeric_feats.append(feat)
             elif feat_type == 'categorical':
                 self.categorical_feats.append(feat)
+            elif feat_type == 'ordinal':
+                self.ordinal_feats.append(feat)
         
         self.text_feats = text_feats or []
         self.event_feats = event_feats
@@ -180,6 +183,8 @@ class DataProcessor:
             - numeric_values: List of (n_timesteps, feat_dim) float32
             - categorical_indicators: (n_timesteps, n_cat_feats) float32
             - categorical_values: List of (n_timesteps, feat_dim) int64
+            - ordinal_indicators: (n_timesteps, n_ordinal_feats) float32
+            - ordinal_values: List of (n_timesteps, feat_dim) int64
             - text_indicators: (n_timesteps, n_text_feats) float32
             - text_sparse: List of per-feature sparse entries, each a
               list of (timestep, token_ids, attention_mask) tuples
@@ -208,6 +213,14 @@ class DataProcessor:
             for dim in self.dims.categorical_feat_dims
         ]
 
+        # Ordinal
+        n_ord = self.dims.n_ordinal_feats
+        ordinal_indicators = np.zeros((n_ts, n_ord), dtype=np.float32)
+        ordinal_values = [
+            np.zeros((n_ts, dim), dtype=np.int64)
+            for dim in self.dims.ordinal_feat_dims
+        ]
+
         # Text — sparse: only non-empty entries are stored
         n_txt = self.dims.n_text_feats
         text_indicators = np.zeros((n_ts, n_txt), dtype=np.float32)
@@ -216,6 +229,7 @@ class DataProcessor:
         if data.empty:
             return (times, numeric_indicators, numeric_values,
                     categorical_indicators, categorical_values,
+                    ordinal_indicators, ordinal_values,
                     text_indicators, text_sparse)
 
         # Convert column names for namedtuple compatibility
@@ -271,6 +285,31 @@ class DataProcessor:
                         cat_idx = cat_idx - first_idx + 1
                         categorical_values[f][t, 0] = cat_idx
 
+            # Ordinal features (same storage format as categorical)
+            for f, feat in enumerate(self.ordinal_feats):
+                feat_name = feat.replace(' ', '_').replace('-', '_')
+                if hasattr(record, feat_name):
+                    value = getattr(record, feat_name)
+                    if pd.notna(value):
+                        ordinal_indicators[t, f] = 1.0
+                        cat_map = self.var_properties[feat].get(
+                            'category_map', {}
+                        )
+                        if isinstance(value, str):
+                            idx_map = {
+                                v: int(k)
+                                for k, v in cat_map.items()
+                            }
+                            cat_idx = idx_map.get(value, 0)
+                        else:
+                            cat_idx = int(value)
+                        first_idx = (
+                            min(int(k) for k in cat_map.keys())
+                            if cat_map else 0
+                        )
+                        cat_idx = cat_idx - first_idx + 1
+                        ordinal_values[f][t, 0] = cat_idx
+
             # Text features — collect sparse entries only
             for f, feat in enumerate(self.text_feats):
                 feat_name = feat.replace(' ', '_').replace('-', '_')
@@ -291,6 +330,7 @@ class DataProcessor:
 
         return (times, numeric_indicators, numeric_values,
                 categorical_indicators, categorical_values,
+                ordinal_indicators, ordinal_values,
                 text_indicators, text_sparse)
     
     def process_event_data(
@@ -377,7 +417,7 @@ class DataProcessor:
                     if pd.notna(value):
                         static_array[offset] = float(value)
                 
-                elif feat_type == 'categorical':
+                elif feat_type in ('categorical', 'ordinal'):
                     if pd.notna(value):
                         cat_map = self.var_properties[feat].get('category_map', {})
                         if isinstance(value, str):
@@ -388,7 +428,7 @@ class DataProcessor:
                         first_idx = min(int(k) for k in cat_map.keys()) if cat_map else 0
                         cat_idx = cat_idx - first_idx + 1
                         static_array[offset] = float(cat_idx)
-                
+
                 elif feat_type == 'text':
                     if pd.notna(value) and value.strip():
                         tokenized = self.tokenizer.process_text(value)
@@ -720,7 +760,7 @@ def _process_single_episode(
         
         # Process into numpy arrays
         (val_times, num_ind, num_vals, cat_ind, cat_vals,
-         txt_ind, txt_sparse) = (
+         ord_ind, ord_vals, txt_ind, txt_sparse) = (
             _tensorized_processor.process_valued_data(val_data)
         )
 
@@ -755,6 +795,8 @@ def _process_single_episode(
             val_numeric_values=num_vals,
             val_categorical_indicators=cat_ind,
             val_categorical_values=cat_vals,
+            val_ordinal_indicators=ord_ind,
+            val_ordinal_values=ord_vals,
             val_text_indicators=txt_ind,
             val_text_sparse=txt_sparse,
             event_times=event_times,
@@ -808,16 +850,20 @@ def _get_tensor_dimensions(
     # Separate valued_feats by type
     numeric_feats = []
     categorical_feats = []
+    ordinal_feats = []
     for feat in valued_feats:
         feat_type = var_properties[feat]['type']
         if feat_type == 'numeric':
             numeric_feats.append(feat)
         elif feat_type == 'categorical':
             categorical_feats.append(feat)
-    
+        elif feat_type == 'ordinal':
+            ordinal_feats.append(feat)
+
     # Get dimensions for each feature type
     numeric_feat_dims = [var_properties[f]['size'] for f in numeric_feats]
     categorical_feat_dims = [var_properties[f]['size'] for f in categorical_feats]
+    ordinal_feat_dims = [var_properties[f]['size'] for f in ordinal_feats]
     
     # Text features use max_token_length for their dimension
     text_feats = text_feats or []
@@ -838,10 +884,12 @@ def _get_tensor_dimensions(
         max_ts_len_event=max_ts_len,
         n_numeric_feats=len(numeric_feats),
         n_categorical_feats=len(categorical_feats),
+        n_ordinal_feats=len(ordinal_feats),
         n_text_feats=len(text_feats),
         n_event_feats=len(event_feats),
         numeric_feat_dims=numeric_feat_dims,
         categorical_feat_dims=categorical_feat_dims,
+        ordinal_feat_dims=ordinal_feat_dims,
         text_feat_dims=text_feat_dims,
         static_feat_dims=static_feat_dims,
         static_total_dim=sum(static_feat_dims),
@@ -891,7 +939,13 @@ def _allocate_output_arrays(dims: TensorDimensions) -> Dict[str, np.ndarray]:
         np.zeros((n, ts_val, dim), dtype=np.int64)
         for dim in dims.categorical_feat_dims
     ]
-    
+
+    arrays['val_ordinal_indicators'] = np.zeros((n, ts_val, dims.n_ordinal_feats), dtype=np.float32)
+    arrays['val_ordinal_values'] = [
+        np.zeros((n, ts_val, dim), dtype=np.int64)
+        for dim in dims.ordinal_feat_dims
+    ]
+
     arrays['val_text_indicators'] = np.zeros((n, ts_val, dims.n_text_feats), dtype=np.float32)
     
     # Sparse text - collect as lists, finalize later
@@ -1090,12 +1144,14 @@ def collate_tensorized(
     # Stack indicator tensors
     val_numeric_ind = torch.stack([b['val_numeric_indicators'] for b in batch], dim=0)
     val_categorical_ind = torch.stack([b['val_categorical_indicators'] for b in batch], dim=0)
+    val_ordinal_ind = torch.stack([b['val_ordinal_indicators'] for b in batch], dim=0)
     val_text_ind = torch.stack([b['val_text_indicators'] for b in batch], dim=0)
     event_ind = torch.stack([b['event_indicators'] for b in batch], dim=0)
 
     # Stack per-feature value tensors
     n_numeric_feats = len(batch[0]['val_numeric_values'])
     n_categorical_feats = len(batch[0]['val_categorical_values'])
+    n_ordinal_feats = len(batch[0]['val_ordinal_values'])
     n_text_feats = len(batch[0]['val_text_embeddings'])
 
     val_numeric_values = [
@@ -1105,6 +1161,10 @@ def collate_tensorized(
     val_categorical_values = [
         torch.stack([b['val_categorical_values'][f] for b in batch], dim=0)
         for f in range(n_categorical_feats)
+    ]
+    val_ordinal_values = [
+        torch.stack([b['val_ordinal_values'][f] for b in batch], dim=0)
+        for f in range(n_ordinal_feats)
     ]
 
     # Stack pre-computed text embeddings into [batch, max_ts, n_text_feats, embed_dim]
@@ -1134,6 +1194,10 @@ def collate_tensorized(
             'categorical': {
                 'indicators': val_categorical_ind,
                 'values': val_categorical_values,
+            },
+            'ordinal': {
+                'indicators': val_ordinal_ind,
+                'values': val_ordinal_values,
             },
             'times': val_times,
             'masks': val_masks,
@@ -1172,6 +1236,7 @@ def save_dataset(dataset: MixedDataset, base_path: str) -> None:
     # Dense arrays
     save_array('val_numeric_indicators', dataset.val_numeric_indicators)
     save_array('val_categorical_indicators', dataset.val_categorical_indicators)
+    save_array('val_ordinal_indicators', dataset.val_ordinal_indicators)
     save_array('val_text_indicators', dataset.val_text_indicators)
     save_array('val_times', dataset.val_times)
     save_array('val_masks', dataset.val_masks)
@@ -1188,6 +1253,8 @@ def save_dataset(dataset: MixedDataset, base_path: str) -> None:
         save_array(f'val_numeric_values_{i}', arr)
     for i, arr in enumerate(dataset.val_categorical_values):
         save_array(f'val_categorical_values_{i}', arr)
+    for i, arr in enumerate(dataset.val_ordinal_values):
+        save_array(f'val_ordinal_values_{i}', arr)
     for i, arr in enumerate(dataset.val_text_offsets):
         save_array(f'val_text_offsets_{i}', arr)
     for i, arr in enumerate(dataset.val_text_values):
@@ -1206,6 +1273,7 @@ def save_dataset(dataset: MixedDataset, base_path: str) -> None:
         'text_embed_dim': dataset.text_embed_dim,
         'n_numeric_feats': len(dataset.val_numeric_values),
         'n_categorical_feats': len(dataset.val_categorical_values),
+        'n_ordinal_feats': len(dataset.val_ordinal_values),
         'n_text_feats': dataset.n_text_feats,
     }
     with open(os.path.join(base_path, 'metadata.pkl'), 'wb') as f:
@@ -1232,6 +1300,7 @@ def load_dataset(base_path: str) -> MixedDataset:
 
     n_num = metadata['n_numeric_feats']
     n_cat = metadata['n_categorical_feats']
+    n_ord = metadata.get('n_ordinal_feats', 0)
     n_txt = metadata['n_text_feats']
     text_embed_dim = metadata.get('text_embed_dim', 0)
 
@@ -1250,6 +1319,8 @@ def load_dataset(base_path: str) -> MixedDataset:
         val_numeric_values=[load_mmap(f'val_numeric_values_{i}') for i in range(n_num)],
         val_categorical_indicators=load_mmap('val_categorical_indicators'),
         val_categorical_values=[load_mmap(f'val_categorical_values_{i}') for i in range(n_cat)],
+        val_ordinal_indicators=load_mmap('val_ordinal_indicators') if n_ord > 0 else np.empty((0, 0, 0), dtype=np.float32),
+        val_ordinal_values=[load_mmap(f'val_ordinal_values_{i}') for i in range(n_ord)],
         val_text_indicators=load_mmap('val_text_indicators'),
         val_times=load_mmap('val_times'),
         val_masks=load_mmap('val_masks'),
@@ -1499,10 +1570,12 @@ def extract_mimic(
         'max_ts_len_event': dims.max_ts_len_event,
         'n_numeric_feats': dims.n_numeric_feats,
         'n_categorical_feats': dims.n_categorical_feats,
+        'n_ordinal_feats': dims.n_ordinal_feats,
         'n_text_feats': dims.n_text_feats,
         'n_event_feats': dims.n_event_feats,
         'numeric_feat_dims': dims.numeric_feat_dims,
         'categorical_feat_dims': dims.categorical_feat_dims,
+        'ordinal_feat_dims': dims.ordinal_feat_dims,
         'text_feat_dims': dims.text_feat_dims,
         'static_feat_dims': dims.static_feat_dims,
         'static_total_dim': dims.static_total_dim,
@@ -1554,10 +1627,12 @@ def extract_mimic(
         max_ts_len_event=dims.max_ts_len_event,
         n_numeric_feats=dims.n_numeric_feats,
         n_categorical_feats=dims.n_categorical_feats,
+        n_ordinal_feats=dims.n_ordinal_feats,
         n_text_feats=dims.n_text_feats,
         n_event_feats=dims.n_event_feats,
         numeric_feat_dims=dims.numeric_feat_dims,
         categorical_feat_dims=dims.categorical_feat_dims,
+        ordinal_feat_dims=dims.ordinal_feat_dims,
         text_feat_dims=dims.text_feat_dims,
         static_feat_dims=dims.static_feat_dims,
         static_total_dim=dims.static_total_dim,
@@ -1614,6 +1689,13 @@ def extract_mimic(
                     arrays['val_categorical_values'][f][
                         out_idx, vh_start:max_history_len_steps, :
                     ] = vals[:val_hist]
+                arrays['val_ordinal_indicators'][
+                    out_idx, vh_start:max_history_len_steps, :
+                ] = ep.val_ordinal_indicators[:val_hist]
+                for f, vals in enumerate(ep.val_ordinal_values):
+                    arrays['val_ordinal_values'][f][
+                        out_idx, vh_start:max_history_len_steps, :
+                    ] = vals[:val_hist]
                 arrays['val_text_indicators'][
                     out_idx, vh_start:max_history_len_steps, :
                 ] = ep.val_text_indicators[:val_hist]
@@ -1638,6 +1720,13 @@ def extract_mimic(
                 ] = ep.val_categorical_indicators[val_hist:]
                 for f, vals in enumerate(ep.val_categorical_values):
                     arrays['val_categorical_values'][f][
+                        out_idx, ve_start:ve_start + val_ep, :
+                    ] = vals[val_hist:]
+                arrays['val_ordinal_indicators'][
+                    out_idx, ve_start:ve_start + val_ep, :
+                ] = ep.val_ordinal_indicators[val_hist:]
+                for f, vals in enumerate(ep.val_ordinal_values):
+                    arrays['val_ordinal_values'][f][
                         out_idx, ve_start:ve_start + val_ep, :
                     ] = vals[val_hist:]
                 arrays['val_text_indicators'][
@@ -1729,6 +1818,8 @@ def extract_mimic(
         val_numeric_values=arrays['val_numeric_values'],
         val_categorical_indicators=arrays['val_categorical_indicators'],
         val_categorical_values=arrays['val_categorical_values'],
+        val_ordinal_indicators=arrays['val_ordinal_indicators'],
+        val_ordinal_values=arrays['val_ordinal_values'],
         val_text_indicators=arrays['val_text_indicators'],
         val_times=arrays['val_times'],
         val_masks=arrays['val_masks'],

@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 
+from dlordinal.losses import BetaLoss
 from torch import Tensor
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -26,40 +27,58 @@ class MaskedGeneratorLoss(torch.nn.Module):
     """
     
     def __init__(
-        self, 
-        numeric_weight: float = 1.0, 
-        categorical_weight: float = 1.0, 
-        text_weight: float = 1.0, 
-        indicator_weight: float = 1.0
+        self,
+        numeric_weight: float = 1.0,
+        categorical_weight: float = 1.0,
+        ordinal_weight: float = 1.0,
+        text_weight: float = 1.0,
+        indicator_weight: float = 1.0,
+        ordinal_features: Optional[List[int]] = None
     ):
         """
         Initialize MultiOutputLoss with optional weights for different feature types.
-        
+
         Args:
             numeric_weight (float): Weight for numeric feature loss
             categorical_weight (float): Weight for categorical feature loss
+            ordinal_weight (float): Weight for ordinal feature loss
             text_weight (float): Weight for text feature loss
             indicator_weight (float): Weight for indicator prediction loss
+            ordinal_features (List[int], optional): List of number of levels for
+                each ordinal feature. Required if ordinal features are present.
         """
         super().__init__()
         self.numeric_weight = numeric_weight
         self.categorical_weight = categorical_weight
+        self.ordinal_weight = ordinal_weight
         self.text_weight = text_weight
         self.indicator_weight = indicator_weight
-        
+
         # Define loss functions
         #
-        # NOTE The feature-wise loss for numeric features is the squared L2 norm of the difference between targets and 
+        # NOTE The feature-wise loss for numeric features is the squared L2 norm of the difference between targets and
         # predictions. The sample-wise loss is the sum of the feature-wise losses across all features. Note that
         # this differs from MSELoss with reduction set to 'mean', which would rescale the feature-wise loss by the
-        # number of dimensions in the feature vector. On the one hand, using 'mean' reduction would compensate for   
+        # number of dimensions in the feature vector. On the one hand, using 'mean' reduction would compensate for
         # loss inflation from high-dimensional features when features dimensions vary widely. On the other
-        # hand, the current implementation takes the straight-line distance between the target and prediction, 
+        # hand, the current implementation takes the straight-line distance between the target and prediction,
         # treating all features as equal regardless of their dimensions. The current implementation requires that the
         # MSELoss reduction be set to 'none' followed by summation across feature components in the forward pass.
-        self.mse_loss = torch.nn.MSELoss(reduction='none') 
+        self.mse_loss = torch.nn.MSELoss(reduction='none')
         self.ce_loss = torch.nn.CrossEntropyLoss(reduction='none')
         self.bce_loss = torch.nn.BCEWithLogitsLoss(reduction='none')
+
+        # Ordinal loss: BetaLoss wrapping CrossEntropyLoss, one per ordinal feature
+        if ordinal_features:
+            self.ordinal_beta_losses = torch.nn.ModuleList([
+                BetaLoss(
+                    base_loss=torch.nn.CrossEntropyLoss(reduction='none'),
+                    num_classes=n_levels
+                )
+                for n_levels in ordinal_features
+            ])
+        else:
+            self.ordinal_beta_losses = None
     
     def _calculate_indicator_loss_sparse(
         self, 
@@ -179,13 +198,51 @@ class MaskedGeneratorLoss(torch.nn.Module):
                     total_loss += self.indicator_weight * indicator_loss
                     n_masked += indicator_n_masked
         
+        # Process ordinal features
+        if 'ordinal' in predictions and 'ordinal' in masked_targets and self.ordinal_beta_losses is not None:
+            pred_values = predictions['ordinal']['values']
+            target_values = masked_targets['ordinal']['values']
+            feature_masks = record_masks['ordinal']['indicators']
+
+            ord_loss = 0.0
+            ord_n_masked = 0
+            for f, (pred, target, beta_loss) in enumerate(
+                zip(pred_values, target_values, self.ordinal_beta_losses)
+            ):
+                if target.numel() == 0:
+                    continue
+                feat_mask = feature_masks[:, :, f].bool()
+                # pred shape: (batch, max_ts, n_levels) — CLM probabilities
+                pred_at_masked = pred[feat_mask]  # (n_masked, n_levels)
+                # target shape: (n_masked, 1) — 1-indexed class indices
+                # Convert to 0-indexed for BetaLoss
+                target_classes = (target[:, 0] - 1).long()
+                # BetaLoss expects (N, J) probs and (N,) targets
+                feature_loss = beta_loss(pred_at_masked, target_classes)
+                ord_loss += feature_loss.sum()
+                ord_n_masked += target_classes.numel()
+
+            total_loss += self.ordinal_weight * ord_loss
+            n_masked += ord_n_masked
+
+            # Process ordinal indicators
+            if 'indicators' in predictions['ordinal'] and predictions['ordinal']['indicators'] is not None:
+                if 'indicators' in masked_targets['ordinal']:
+                    indicator_loss, indicator_n_masked = self._calculate_indicator_loss_sparse(
+                        predictions['ordinal']['indicators'],
+                        masked_targets['ordinal']['indicators'],
+                        feature_masks.bool()
+                    )
+                    total_loss += self.indicator_weight * indicator_loss
+                    n_masked += indicator_n_masked
+
         # Process text features
         if 'text' in predictions and 'text' in masked_targets:
             if 'embedded_values' in masked_targets['text']:
                 pred_values = predictions['text']['embedded_values']
                 target_values = masked_targets['text']['embedded_values']
                 feature_masks = record_masks['text']['indicators']
-                
+
                 text_loss = 0.0
                 text_n_masked = 0
                 for f, (pred, target) in enumerate(zip(pred_values, target_values)):
@@ -212,14 +269,14 @@ class MaskedGeneratorLoss(torch.nn.Module):
                     cosine_sim = torch.sum(pred_norm * target_norm, dim=-1)
                     # Convert similarity [-1,1] to distance [0,2] and rescale to [0,1]
                     cosine_distance = (1.0 - cosine_sim) / 2.0
-                    
+
                     # For text, count each valid masked embedding as one loss unit
                     text_loss += cosine_distance.sum()
                     text_n_masked += cosine_distance.numel()
-                
+
                 total_loss += self.text_weight * text_loss
                 n_masked += text_n_masked
-                
+
                 # Process text indicators
                 if 'indicators' in predictions['text'] and predictions['text']['indicators'] is not None:
                     if 'indicators' in masked_targets['text']:
@@ -230,7 +287,7 @@ class MaskedGeneratorLoss(torch.nn.Module):
                         )
                         total_loss += self.indicator_weight * indicator_loss
                         n_masked += indicator_n_masked
-        
+
         # Normalize the total loss by the number of masked values
         if n_masked > 0:
             total_loss = total_loss / n_masked
@@ -359,11 +416,47 @@ class MaskedGeneratorLoss(torch.nn.Module):
                 total_loss += self.indicator_weight * masked_indicator_loss
                 n_masked += indicator_n_masked
         
+        # Process ordinal features
+        if 'ordinal' in predictions and 'ordinal' in targets['val_data'] and self.ordinal_beta_losses is not None:
+            pred_values = predictions['ordinal']['values']  # List of (batch, max_ts, n_levels)
+            # Get masks for ordinal features
+            feature_masks = record_masks['ordinal']['indicators']  # [batch_size, max_ts_len, n_ord_feats]
+
+            ord_loss = 0.0
+            for f, (pred, beta_loss) in enumerate(
+                zip(pred_values, self.ordinal_beta_losses)
+            ):
+                feat_mask = feature_masks[:, :, f].bool().flatten()  # [batch_size * max_ts_len]
+                if not feat_mask.any():
+                    continue
+                batch_size, max_ts_len, n_levels = pred.shape
+                pred_flat = pred.reshape(-1, n_levels)  # (B*T, n_levels)
+                # Target: 1-indexed class index stored in (batch, max_ts, 1)
+                target = targets['val_data']['ordinal']['values'][f]
+                target_flat = (target[:, :, 0] - 1).long().reshape(-1)  # 0-indexed, (B*T,)
+                # BetaLoss expects (N, J) probs and (N,) targets
+                feature_loss = beta_loss(pred_flat, target_flat)  # (B*T,)
+                masked_loss = feature_loss * feat_mask
+                ord_loss += masked_loss.sum()
+                n_masked += feat_mask.sum().item()
+
+            total_loss += self.ordinal_weight * ord_loss
+
+            # Process ordinal indicators if available
+            if 'indicators' in predictions['ordinal'] and predictions['ordinal']['indicators'] is not None:
+                pred_indicators = predictions['ordinal']['indicators']
+                target_indicators = targets['val_data']['ordinal']['indicators']
+                indicator_loss = self.bce_loss(pred_indicators, target_indicators.float())
+                masked_indicator_loss = (indicator_loss * feature_masks.bool()).sum()
+                indicator_n_masked = feature_masks.bool().sum().item()
+                total_loss += self.indicator_weight * masked_indicator_loss
+                n_masked += indicator_n_masked
+
         # Process text features
         if 'text' in predictions and 'text' in targets['val_data']:
             # Get predicted text embeddings
             pred_values = predictions['text']['values']  # List of tensors, one per feature
-            
+
             # Get LLM-generated embeddings from target tokens
             # The LLM embeddings should already be computed in the targets
             if 'embedded_values' in targets['val_data']['text']:
@@ -506,9 +599,9 @@ class MaskedDiscriminatorLoss(torch.nn.Module):
         n_predictions = 0
         
         # Process each feature type
-        for feat_type in ['numeric', 'categorical', 'text']:
+        for feat_type in ['numeric', 'categorical', 'ordinal', 'text']:
             if feat_type not in predictions or feat_type not in record_masks:
-                continue 
+                continue
             pred_logits = predictions[feat_type]  # (batch_size, max_ts_len, n_features)
             indicator_mask = record_masks[feat_type]['indicators']  # (batch_size, max_ts_len, n_features)
             # Create target labels: 1 for generated (masked), 0 for real (not masked)

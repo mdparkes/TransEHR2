@@ -89,6 +89,8 @@ class MixedDataset(Dataset):
         val_numeric_values: List[np.ndarray],
         val_categorical_indicators: np.ndarray,
         val_categorical_values: List[np.ndarray],
+        val_ordinal_indicators: np.ndarray,
+        val_ordinal_values: List[np.ndarray],
         val_text_indicators: np.ndarray,
         val_times: np.ndarray,
         val_masks: np.ndarray,
@@ -119,6 +121,8 @@ class MixedDataset(Dataset):
         self.val_numeric_values = val_numeric_values
         self.val_categorical_indicators = val_categorical_indicators
         self.val_categorical_values = val_categorical_values
+        self.val_ordinal_indicators = val_ordinal_indicators
+        self.val_ordinal_values = val_ordinal_values
         self.val_text_indicators = val_text_indicators
         self.val_times = val_times
         self.val_masks = val_masks
@@ -169,6 +173,8 @@ class MixedDataset(Dataset):
             'val_numeric_values': [torch.from_numpy(v[idx].copy()) for v in self.val_numeric_values],
             'val_categorical_indicators': torch.from_numpy(self.val_categorical_indicators[idx].copy()),
             'val_categorical_values': [torch.from_numpy(v[idx].copy()) for v in self.val_categorical_values],
+            'val_ordinal_indicators': torch.from_numpy(self.val_ordinal_indicators[idx].copy()) if self.val_ordinal_indicators.size > 0 else torch.empty(0),
+            'val_ordinal_values': [torch.from_numpy(v[idx].copy()) for v in self.val_ordinal_values],
             'val_text_indicators': torch.from_numpy(self.val_text_indicators[idx].copy()),
             'val_text_embeddings': text_embeddings_dense,
             'val_times': torch.from_numpy(self.val_times[idx].copy()),
