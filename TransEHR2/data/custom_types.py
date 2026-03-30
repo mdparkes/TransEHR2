@@ -35,10 +35,12 @@ class TensorDimensions:
         max_ts_len_event: Maximum timesteps for event-associated data
         n_numeric_feats: Number of numeric features
         n_categorical_feats: Number of categorical features
+        n_ordinal_feats: Number of ordinal features
         n_text_feats: Number of text features
         n_event_feats: Number of event features
         numeric_feat_dims: List of dimensions for each numeric feature
         categorical_feat_dims: List of dimensions for each categorical feature
+        ordinal_feat_dims: List of dimensions for each ordinal feature
         text_feat_dims: List of token sequence lengths for each text feature
         static_feat_dims: List of dimensions for each static feature
         static_total_dim: Total dimension of concatenated static features
@@ -49,10 +51,12 @@ class TensorDimensions:
     max_ts_len_event: int
     n_numeric_feats: int
     n_categorical_feats: int
+    n_ordinal_feats: int
     n_text_feats: int
     n_event_feats: int
     numeric_feat_dims: list
     categorical_feat_dims: list
+    ordinal_feat_dims: list
     text_feat_dims: list
     static_feat_dims: list
     static_total_dim: int
@@ -83,6 +87,8 @@ class EpisodeData(NamedTuple):
         val_numeric_values: List of arrays, each shape (val_len, feat_dim)
         val_categorical_indicators: Array of shape (val_len, n_categorical_feats)
         val_categorical_values: List of arrays, each shape (val_len, feat_dim)
+        val_ordinal_indicators: Array of shape (val_len, n_ordinal_feats)
+        val_ordinal_values: List of arrays, each shape (val_len, feat_dim)
         val_text_indicators: Array of shape (val_len, n_text_feats)
         val_text_sparse: Per-feature sparse text entries. Each element
             is a list of (timestep, token_ids, mask) tuples containing
@@ -106,6 +112,8 @@ class EpisodeData(NamedTuple):
     val_numeric_values: list
     val_categorical_indicators: 'np.ndarray'
     val_categorical_values: list
+    val_ordinal_indicators: 'np.ndarray'
+    val_ordinal_values: list
     val_text_indicators: 'np.ndarray'
     val_text_sparse: list
     event_times: 'np.ndarray'

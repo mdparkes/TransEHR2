@@ -67,12 +67,12 @@ class ELECTRA(torch.nn.Module):
         """
         masked_targets = {}
         
-        for feat_type in ['numeric', 'categorical', 'text']:
+        for feat_type in ['numeric', 'categorical', 'ordinal', 'text']:
             if feat_type not in value_data or feat_type not in record_masks:
                 continue
-                
+
             masked_targets[feat_type] = {'values': []}
-            
+
             if feat_type == 'numeric':
                 # For numeric features, extract only the masked value components.
                 # Each feature may have different dimensionality, so we store per-feature tensors.
@@ -82,7 +82,7 @@ class ELECTRA(torch.nn.Module):
                     # Extract masked values as a 1D tensor of all masked components
                     # This is memory-efficient as we only store ~15-25% of original values
                     masked_targets[feat_type]['values'].append(orig_vals[value_mask].clone())
-                    
+
             elif feat_type == 'categorical':
                 # For categorical features, extract the full one-hot vectors at masked positions.
                 # We need the complete one-hot encoding to compute cross-entropy loss.
@@ -93,7 +93,18 @@ class ELECTRA(torch.nn.Module):
                     # Extract complete one-hot vectors at masked (batch, timestep) positions
                     # Result shape: (n_masked_positions, n_classes)
                     masked_targets[feat_type]['values'].append(orig_vals[feat_mask].clone())
-                    
+
+            elif feat_type == 'ordinal':
+                # For ordinal features, extract the 1-indexed class index at masked positions.
+                # Values are stored as (batch, max_ts, 1) integer class indices.
+                feature_masks = record_masks[feat_type]['indicators']  # (batch_size, max_ts_len, n_ord_feats)
+                for i, orig_vals in enumerate(value_data[feat_type]['values']):
+                    # feat_mask shape: (batch_size, max_ts_len)
+                    feat_mask = feature_masks[:, :, i].bool()
+                    # Extract class index values at masked positions
+                    # Result shape: (n_masked_positions, 1)
+                    masked_targets[feat_type]['values'].append(orig_vals[feat_mask].clone())
+
             elif feat_type == 'text':
                 # For text features, we must store the COMPLETE embedding vectors at masked positions.
                 # The cosine similarity loss requires the full embedding for proper L2 normalization;
@@ -150,14 +161,14 @@ class ELECTRA(torch.nn.Module):
         Returns:
             None. The value_data dictionary is modified in-place.
         """
-        for feat_type in ['numeric', 'categorical', 'text']:
+        for feat_type in ['numeric', 'categorical', 'ordinal', 'text']:
             # The generator output only has keys for feature types that were used for prediction.
-            # If the input batch's feature list for a type was empty, the output will not have 
-            # a key for that type. Text is only processed if the MaskedTokenGenerator was 
+            # If the input batch's feature list for a type was empty, the output will not have
+            # a key for that type. Text is only processed if the MaskedTokenGenerator was
             # initialized with n_text_features > 0.
             if feat_type not in gen_output or feat_type not in value_data:
                 continue
-                
+
             if feat_type == 'numeric':
                 # Replace masked numeric values with generator predictions in-place
                 for i, pred_vals in enumerate(gen_output[feat_type]['values']):
@@ -167,7 +178,7 @@ class ELECTRA(torch.nn.Module):
                     dest_tensor = value_data[feat_type]['values'][i]
                     # In-place update: cast predictions to destination dtype before assignment
                     dest_tensor[value_mask] = pred_vals[value_mask].to(dest_tensor.dtype)
-                    
+
             elif feat_type == 'categorical':
                 # Convert generator logits to class indices and replace in-place
                 for i, pred_logits in enumerate(gen_output[feat_type]['values']):
@@ -180,7 +191,20 @@ class ELECTRA(torch.nn.Module):
                     dest_tensor = value_data[feat_type]['values'][i]
                     # In-place update at masked positions, casting to destination dtype
                     dest_tensor[value_mask] = pred_classes[value_mask].to(dest_tensor.dtype)
-                    
+
+            elif feat_type == 'ordinal':
+                # Convert generator CLM probabilities to class indices and replace in-place
+                # CLM outputs are PMFs (class probabilities), so argmax gives the predicted class
+                for i, pred_probs in enumerate(gen_output[feat_type]['values']):
+                    # value_mask shape: (batch_size, max_ts_len, 1) - ordinal features are 1D
+                    value_mask = record_masks[feat_type]['values'][i].bool()
+                    # Argmax of PMF to get predicted class (0-indexed), then +1 for 1-indexed storage
+                    pred_classes = (torch.argmax(pred_probs, dim=-1, keepdim=True) + 1).float()
+                    # Get destination tensor and its dtype for casting
+                    dest_tensor = value_data[feat_type]['values'][i]
+                    # In-place update at masked positions, casting to destination dtype
+                    dest_tensor[value_mask] = pred_classes[value_mask].to(dest_tensor.dtype)
+
             elif feat_type == 'text':
                 # Replace masked text embeddings with generator predictions in-place
                 # embedded_values shape: (batch_size, max_ts_len, n_text_feats, TEXT_EMBED_DIM)
@@ -435,6 +459,15 @@ class MixedClassifier(torch.nn.Module):
                 # Extract and concatenate categorical feature values
                 categorical_vals = torch.cat(val_data['categorical']['values'], dim=2)
                 vals_to_concat.append(categorical_vals)
+
+            # Process ordinal features
+            if 'ordinal' in val_data and val_data['ordinal']['values']:
+                # Extract ordinal feature indicators
+                ordinal_inds = val_data['ordinal']['indicators']
+                inds_to_concat.append(ordinal_inds)
+                # Extract and concatenate ordinal feature values
+                ordinal_vals = torch.cat(val_data['ordinal']['values'], dim=2)
+                vals_to_concat.append(ordinal_vals)
 
             # Process text features
             if self.use_text and 'text' in val_data and 'embedded_values' in val_data['text']:

@@ -8,28 +8,45 @@ if __name__ == "__main__":
 
     var_map is a mapping from feature names to properties of those features. Each feature is represented as a dictionary with the following keys:
 
-        'type': 
-        
-            The data type of the feature, which can be 'numeric', 'categorical', or 'text'. This indicates the    original data type of the feature read from timeseries CSV files during data preprocessing. It is used to determine how the feature should be processed and what kind of loss to use for optimization during training.
+        'type':
+
+            The data type of the feature, which can be 'numeric', 'categorical', 'ordinal', or 'text'. This
+            indicates the original data type of the feature read from timeseries CSV files during data
+            preprocessing. It is used to determine how the feature should be processed and what kind of loss
+            to use for optimization during training.
+
+            'ordinal' designates an ordered categorical feature (e.g. a Likert scale). Ordinal features use
+            a Cumulative Link Model (CLM) output layer in the generator and a beta cross-entropy loss, both
+            of which respect the ordering of the categories.
 
         'size':
 
-            The number of components in the feature. For numeric scalar features, this is 1. For numeric vector features, this is the number of dimensions in the vector. For categorical features, it is the number of unique categories. For text features, this is the number of strings that comprise the text feature (usually 1).
+            The number of components in the feature. For numeric scalar features, this is 1. For numeric
+            vector features, this is the number of dimensions in the vector. For categorical and ordinal
+            features, this is 1 (a single integer class index is stored). For text features, this is the
+            number of strings that comprise the text feature (usually 1).
 
         'category_map':
 
-            Only used for features of type 'categorical'. It maps integer values to categorical labels. The integer values should be 1-indexed, meaning that the first category is represented by 1, the second by 2, and so on. Zero is reserved to indicate that the categorical feature was not recorded at a particular timestep. If the data are already indexed from a different starting point, the data extraction tools will reindex them.
-            
-            If 'type' is not 'categorical', this key should map to an empty dictionary.
-    
+            Used for features of type 'categorical' or 'ordinal'. It maps integer values to category labels.
+            For ordinal features, the mapping should reflect the natural ordering of the categories (e.g.
+            {0: 'Strongly disagree', 1: 'Disagree', 2: 'Neutral', 3: 'Agree', 4: 'Strongly agree'}).
+
+            The integer values should be 1-indexed, meaning that the first category is represented by 1,
+            the second by 2, and so on. Zero is reserved to indicate that the feature was not recorded at a
+            particular timestep. If the data are already indexed from a different starting point, the data
+            extraction tools will reindex them.
+
+            If 'type' is not 'categorical' or 'ordinal', this key should map to an empty dictionary.
+
     """
 
 
-    # In var_map, category_map is only used for categorical features. It maps integer values to categorical labels.
-    # 'type' is either 'numeric', 'categorical', or 'text'. The 'numeric' type should not be confused with the numeric 
-    # designation of the value-associated feature table. 'type' refers to the data type of the original feature read by 
-    # the MimicDataReader class's __getitem__ method during data preprocessing, and is used to determine how the 
-    # feature should be processed and what kind of loss to use during training.
+    # In var_map, category_map is used for categorical and ordinal features. It maps integer values to category labels.
+    # 'type' is 'numeric', 'categorical', 'ordinal', or 'text'. The 'numeric' type should not be confused with the
+    # numeric designation of the value-associated feature table. 'type' refers to the data type of the original feature
+    # read by the MimicDataReader class's __getitem__ method during data preprocessing, and is used to determine how
+    # the feature should be processed and what kind of loss to use during training.
     var_map = {
         # Features for numeric data tables
         'Diastolic arterial blood pressure':{
