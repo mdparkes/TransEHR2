@@ -8,8 +8,6 @@ TransEHR consists of a generator network, a discriminator network, and a transfo
 
 TransEHR2 improves upon the original TransEHR model. It supports additional data types for input, namely: vector-valued features, categorical features, and text. In contrast, the original TransEHR model only supported scalar value-associated features. TransEHR2 also distinguishes between records collected before and after a reference time. For example, it can be set up to distinguish between medical records collected before and after admission to ICU. TransEHR can thus leverage information that only appears in antecedent records, such as discharge summaries from previous hospitalizations. Whereas TransEHR was originally evaluated on MIMIC-III data (among other datasets), TransEHR2 is set up to work with MIMIC-IV. TransEHR2 also corrects known errors in Xu *et al.*'s loss calculations for the transformer Hawkes process. It also supports cross-validation, which was not implemented in Xu *et al.*'s code.
 
-TransEHR2 is potentially more computationally and memmory-intensive than its predecessor, particularly when it uses longer medical record histories and text features. Text features are embedded by an integrated Llama model with frozen weights. As such, the code is set up for multi-GPU computing. If text features are input to the model, fully sharded data-parallel computation is performed. Otherwise, distributed data parallel computing is done without model sharding.
-
 ## Installation
 
 Clone the repository and create a virtual environment (optional but advisable).
