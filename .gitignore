@@ -97,6 +97,9 @@ test_tunes_hyperparameters.py
 test_text_extraction.py
 test_data_integrity.py
 
+# Other
+misc/
+
 # Development notes
 notes.md
 
