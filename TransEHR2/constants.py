@@ -19,5 +19,6 @@ PAD = 0
 TOKENIZER_PAD_TOKEN = '[PAD]'
 
 # LLM_NAME = 'meta-llama/Llama-3.1-8B' # Name of LLM on Hugging Face
-LLM_NAME = 'meta-llama/Llama-3.2-1B' # Small, quantized model for local debugging
+# LLM_NAME = 'meta-llama/Llama-3.2-1B' # Small, quantized model for local debugging
+LLM_NAME = 'meta-llama/Llama-3.1-70B'
 MAX_TOKEN_LENGTH = 1024  # Maximum length of text token sequences

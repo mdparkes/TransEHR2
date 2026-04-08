@@ -46,7 +46,10 @@ class LLMTextProcessor:
         # Llama-3.2-1B tokenizer has a broken tekken.json path that
         # causes AttributeError in convert_slow_tokenizer. The
         # tokenizer vocabulary is compatible across Llama 3.x models.
-        tokenizer_name = 'meta-llama/Llama-3.1-8B'
+        if 'meta-llama/Llama-3.2-1B' in model_name:
+            tokenizer_name = 'meta-llama/Llama-3.1-8B'
+        else:
+            tokenizer_name = model_name
         try:
             self.tokenizer = AutoTokenizer.from_pretrained(
                 tokenizer_name,
