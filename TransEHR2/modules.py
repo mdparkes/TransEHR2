@@ -14,10 +14,12 @@ class GradientTraceableLLM(torch.nn.Module):
     """A wrapper for a language model that allows gradients to be traced through it."""
 
     def __init__(
-        self, 
+        self,
         model_name: str = LLM_NAME,
         max_length: int = MAX_TOKEN_LENGTH,
-        use_gradient_checkpointing: bool = True
+        use_gradient_checkpointing: bool = True,
+        device_map: str = 'cpu',
+        torch_dtype=None,
     ):
 
         super().__init__()
@@ -44,7 +46,8 @@ class GradientTraceableLLM(torch.nn.Module):
         self.model = AutoModel.from_pretrained(
             model_name,
             token=HF_API_TOKEN,
-            device_map='cpu'
+            device_map=device_map,
+            torch_dtype=torch_dtype,
         )
         # Resize to account for padding token
         self.model.resize_token_embeddings(len(self.tokenizer))

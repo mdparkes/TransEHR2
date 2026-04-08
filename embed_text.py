@@ -8,22 +8,18 @@ writes the resulting embedding arrays alongside the existing sparse text
 storage. Episode IDs are used to deduplicate across folds so that each unique
 text entry is embedded at most once.
 
-Multi-GPU parallelism is handled via ``torch.multiprocessing.spawn`` — no
-distributed launcher (``accelerate launch``, ``torchrun``) required.  Each
-GPU process independently loads the model and processes its assigned folds
-round-robin.  There is no inter-GPU communication (no NCCL, no process
-group), so ranks can finish at different times without timeout errors.
+The LLM is loaded with ``device_map="auto"`` so that HuggingFace
+automatically distributes model layers across all visible GPUs (pipeline
+parallelism).  To control which GPUs are used, set the
+``CUDA_VISIBLE_DEVICES`` environment variable before running this script.
+The model is loaded in bfloat16 to halve memory requirements.
 
 After running this script, each partition directory will contain:
     val_text_embeddings_{i}.npy  -- (n_non_empty, embed_dim) float32
     metadata.pkl                 -- updated with 'text_embed_dim'
 
-Usage (single GPU):
+Usage:
     python embed_text.py --data-dir /path/to/data [--batch-size 64]
-
-Usage (multi-GPU, e.g. 4 GPUs each with batch_size 200):
-    python embed_text.py --data-dir /path/to/data --num-gpus 4 \
-        --batch-size 200
 """
 
 import argparse
@@ -33,7 +29,6 @@ import os
 import pickle
 import re
 import torch
-import torch.multiprocessing as mp
 
 from typing import Dict, List, Optional, Tuple
 
@@ -152,7 +147,8 @@ def embed_batch(
             IDs.
         mask_batch: (batch_size, token_len) int64 array of attention
             masks.
-        device: Torch device to run on.
+        device: Torch device for input tensors (should match the
+            device of the model's first parameter).
 
     Returns:
         (batch_size, embed_dim) float32 numpy array of embeddings.
@@ -178,7 +174,7 @@ def process_partition(
     Args:
         part_dir: Path to the partition directory.
         llm: The loaded LLM module.
-        device: Torch device.
+        device: Torch device for input tensors.
         batch_size: Batch size for LLM inference.
         embedding_cache: Dict mapping cache_key ->
             {local_idx -> embedding}.  Used for deduplication across
@@ -314,80 +310,6 @@ def process_partition(
     return new_embeddings_count
 
 
-def worker(
-    rank: int, args: argparse.Namespace, all_fold_names: List[str]
-):
-    """Entry point for each GPU worker process.
-
-    Each worker independently loads the LLM onto its assigned GPU and
-    processes its subset of folds.  There is no inter-process
-    communication — no NCCL, no process group, no barrier.
-
-    Args:
-        rank: GPU index (0-based).
-        args: Parsed command-line arguments.
-        all_fold_names: Full list of fold names discovered from
-            data_dir.
-    """
-    device = torch.device(f'cuda:{rank}')
-    torch.cuda.set_device(device)
-
-    my_folds = [
-        all_fold_names[i]
-        for i in range(rank, len(all_fold_names), args.num_gpus)
-    ]
-    my_partition_dirs = get_partition_dirs_for_folds(
-        args.data_dir, my_folds
-    )
-
-    print(f"[GPU {rank}] Assigned {len(my_folds)} folds: {my_folds}")
-    print(
-        f"[GPU {rank}] "
-        f"{len(my_partition_dirs)} partition directories"
-    )
-
-    if not my_partition_dirs:
-        print(f"[GPU {rank}] Nothing to do, exiting.")
-        return
-
-    # Load LLM
-    print(f"[GPU {rank}] Loading LLM...")
-    llm_kwargs = {}
-    if args.llm_name:
-        llm_kwargs['model_name'] = args.llm_name
-    llm = GradientTraceableLLM(
-        use_gradient_checkpointing=False, **llm_kwargs
-    )
-    llm.eval()
-    embed_dim = llm.model.config.hidden_size
-    llm = llm.to(device)
-    print(
-        f"[GPU {rank}] LLM loaded: "
-        f"{llm.model.config._name_or_path}, embed_dim={embed_dim}"
-    )
-
-    embedding_cache: Dict[str, Dict[int, np.ndarray]] = {}
-    total_new = 0
-
-    for part_dir in my_partition_dirs:
-        print(f"[GPU {rank}] Processing: {part_dir}")
-        new_count = process_partition(
-            part_dir, llm, device, args.batch_size,
-            embedding_cache, embed_dim
-        )
-        total_new += new_count
-        print(f"[GPU {rank}]   {new_count} new embeddings computed")
-
-        if device.type == 'cuda':
-            torch.cuda.empty_cache()
-
-    print(f"[GPU {rank}] Done. Total new embeddings: {total_new}")
-
-    del llm
-    gc.collect()
-    torch.cuda.empty_cache()
-
-
 def main():
     parser = argparse.ArgumentParser(
         description='Pre-embed text features with a frozen LLM'
@@ -404,45 +326,69 @@ def main():
     )
     parser.add_argument(
         '--batch-size', type=int, default=64,
-        help='Batch size for LLM inference per GPU (default: 64)'
-    )
-    parser.add_argument(
-        '--num-gpus', type=int, default=None,
-        help='Number of GPUs to use. Defaults to all available GPUs, '
-             'or 1 if CUDA is unavailable.'
+        help='Batch size for LLM inference (default: 64)'
     )
     args = parser.parse_args()
-
-    if args.num_gpus is None:
-        args.num_gpus = (
-            torch.cuda.device_count()
-            if torch.cuda.is_available()
-            else 1
-        )
 
     all_fold_names = get_fold_names(args.data_dir)
     if not all_fold_names:
         print(f"No fold directories found under {args.data_dir}")
         return
 
+    all_partition_dirs = get_partition_dirs_for_folds(
+        args.data_dir, all_fold_names
+    )
     print(
         f"Found {len(all_fold_names)} folds, "
-        f"using {args.num_gpus} GPU(s), "
+        f"{len(all_partition_dirs)} partition directories, "
         f"batch_size={args.batch_size}"
     )
 
-    if args.num_gpus <= 1:
-        # Single-GPU: run directly, no spawning needed
-        worker(0, args, all_fold_names)
-    else:
-        mp.spawn(
-            worker,
-            args=(args, all_fold_names),
-            nprocs=args.num_gpus,
-            join=True,
-        )
+    if not all_partition_dirs:
+        print("No partition directories to process.")
+        return
 
-    print("All workers finished.")
+    # Load LLM with device_map="auto" to distribute across all
+    # visible GPUs, and bfloat16 to halve memory.
+    print("Loading LLM with device_map='auto'...")
+    llm_kwargs = {}
+    if args.llm_name:
+        llm_kwargs['model_name'] = args.llm_name
+    llm = GradientTraceableLLM(
+        use_gradient_checkpointing=False,
+        device_map='auto',
+        torch_dtype=torch.bfloat16,
+        **llm_kwargs,
+    )
+    llm.eval()
+    embed_dim = llm.model.config.hidden_size
+    # Input tensors must be on the device of the model's first
+    # parameter (the embedding layer).
+    input_device = next(llm.model.parameters()).device
+    print(
+        f"LLM loaded: {llm.model.config._name_or_path}, "
+        f"embed_dim={embed_dim}, input_device={input_device}"
+    )
+
+    embedding_cache: Dict[str, Dict[int, np.ndarray]] = {}
+    total_new = 0
+
+    for part_dir in all_partition_dirs:
+        print(f"Processing: {part_dir}")
+        new_count = process_partition(
+            part_dir, llm, input_device, args.batch_size,
+            embedding_cache, embed_dim
+        )
+        total_new += new_count
+        print(f"  {new_count} new embeddings computed")
+
+        torch.cuda.empty_cache()
+
+    print(f"Done. Total new embeddings: {total_new}")
+
+    del llm
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 if __name__ == '__main__':
