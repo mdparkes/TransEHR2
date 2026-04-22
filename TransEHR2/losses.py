@@ -178,12 +178,17 @@ class MaskedGeneratorLoss(torch.nn.Module):
                 if target.numel() == 0:
                     continue
                 feat_mask = feature_masks[:, :, f].bool()
-                pred_at_masked = pred[feat_mask]
-                target_classes = torch.argmax(target, dim=-1)
+                # Skip zero-vector targets (unknown / out-of-domain values): cross-entropy
+                # is undefined when the one-hot target sums to zero.
+                valid = target.sum(dim=-1) > 0
+                if not valid.any():
+                    continue
+                pred_at_masked = pred[feat_mask][valid]
+                target_classes = torch.argmax(target[valid], dim=-1)
                 feature_loss = self.ce_loss(pred_at_masked, target_classes)
                 cat_loss += feature_loss.sum()
                 cat_n_masked += target_classes.numel()
-            
+
             total_loss += self.categorical_weight * cat_loss
             n_masked += cat_n_masked
             
@@ -212,11 +217,15 @@ class MaskedGeneratorLoss(torch.nn.Module):
                 if target.numel() == 0:
                     continue
                 feat_mask = feature_masks[:, :, f].bool()
+                # Skip zero-vector targets (unknown / out-of-domain values): the ordinal
+                # loss is undefined when the one-hot target sums to zero.
+                valid = target.sum(dim=-1) > 0
+                if not valid.any():
+                    continue
                 # pred shape: (batch, max_ts, n_levels) — CLM probabilities
-                pred_at_masked = pred[feat_mask]  # (n_masked, n_levels)
-                # target shape: (n_masked, 1) — 1-indexed class indices
-                # Convert to 0-indexed for BetaLoss
-                target_classes = (target[:, 0] - 1).long()
+                pred_at_masked = pred[feat_mask][valid]  # (n_valid, n_levels)
+                # target shape: (n_masked, n_levels) — one-hot; pick class via argmax
+                target_classes = torch.argmax(target[valid], dim=-1).long()
                 # BetaLoss expects (N, J) probs and (N,) targets
                 feature_loss = beta_loss(pred_at_masked, target_classes)
                 ord_loss += feature_loss.sum()
@@ -372,36 +381,35 @@ class MaskedGeneratorLoss(torch.nn.Module):
         if 'categorical' in predictions and 'categorical' in targets['val_data']:
             # Get predicted values
             pred_values = predictions['categorical']['values']  # List of tensors, one per feature
-            # Get ground truth values - need to convert from one-hot to class indices
-            target_values = []
-            for target in targets['val_data']['categorical']['values']:
-                # Convert one-hot encoding to class indices (vectorized)
-                target_class = torch.argmax(target, dim=-1)
-                target_values.append(target_class)
-            
+            # Keep the one-hot targets so we can both derive class indices AND detect
+            # zero-vector (unknown / out-of-domain) rows, whose CE loss is undefined.
+            target_one_hots = targets['val_data']['categorical']['values']  # List of (B, T, n_classes)
+
             # Get masks for categorical features
             feature_masks = record_masks['categorical']['indicators']  # [batch_size, max_ts_len, n_cat_feats]
-            
+
             cat_loss = 0.0
             # Process each categorical feature
-            for f, (pred, target) in enumerate(zip(pred_values, target_values)):
+            for f, (pred, target_one_hot) in enumerate(zip(pred_values, target_one_hots)):
                 # Extract feature mask for this feature
                 feat_mask = feature_masks[:, :, f].bool().flatten()  # [batch_size * max_ts_len]
-                # Skip if no masked values
-                if not feat_mask.any():
+                # Exclude zero-vector targets (loss undefined)
+                valid_mask = (target_one_hot.sum(dim=-1) > 0).flatten()
+                combined_mask = feat_mask & valid_mask
+                if not combined_mask.any():
                     continue
                 # Reshape for cross entropy loss (vectorized)
                 batch_size, max_ts_len, n_classes = pred.shape
                 pred_flat = pred.reshape(-1, n_classes)
-                target_flat = target.reshape(-1)
+                target_flat = torch.argmax(target_one_hot, dim=-1).reshape(-1)
                 # Calculate CE loss for all positions
                 feature_loss = self.ce_loss(pred_flat, target_flat)  # [batch_size * max_ts_len]
-                # Apply mask and sum
-                masked_loss = feature_loss * feat_mask
+                # Apply combined mask and sum
+                masked_loss = feature_loss * combined_mask
                 cat_loss += masked_loss.sum()
-                # Count masked elements
-                n_masked += feat_mask.sum().item()
-            
+                # Count masked-and-valid elements
+                n_masked += combined_mask.sum().item()
+
             total_loss += self.categorical_weight * cat_loss
             
             # Process categorical indicators if available
@@ -431,14 +439,19 @@ class MaskedGeneratorLoss(torch.nn.Module):
                     continue
                 batch_size, max_ts_len, n_levels = pred.shape
                 pred_flat = pred.reshape(-1, n_levels)  # (B*T, n_levels)
-                # Target: 1-indexed class index stored in (batch, max_ts, 1)
+                # Target: one-hot of shape (batch, max_ts, n_levels); a zero row means
+                # unknown / out-of-domain and the loss is undefined there.
                 target = targets['val_data']['ordinal']['values'][f]
-                target_flat = (target[:, :, 0] - 1).long().reshape(-1)  # 0-indexed, (B*T,)
+                valid_mask = (target.sum(dim=-1) > 0).flatten()
+                combined_mask = feat_mask & valid_mask
+                if not combined_mask.any():
+                    continue
+                target_flat = torch.argmax(target, dim=-1).long().reshape(-1)  # 0-indexed, (B*T,)
                 # BetaLoss expects (N, J) probs and (N,) targets
                 feature_loss = beta_loss(pred_flat, target_flat)  # (B*T,)
-                masked_loss = feature_loss * feat_mask
+                masked_loss = feature_loss * combined_mask
                 ord_loss += masked_loss.sum()
-                n_masked += feat_mask.sum().item()
+                n_masked += combined_mask.sum().item()
 
             total_loss += self.ordinal_weight * ord_loss
 

@@ -90,19 +90,20 @@ class ELECTRA(torch.nn.Module):
                 for i, orig_vals in enumerate(value_data[feat_type]['values']):
                     # feat_mask shape: (batch_size, max_ts_len)
                     feat_mask = feature_masks[:, :, i].bool()
-                    # Extract complete one-hot vectors at masked (batch, timestep) positions
+                    # Extract complete categorical features at masked (batch, timestep) positions
                     # Result shape: (n_masked_positions, n_classes)
                     masked_targets[feat_type]['values'].append(orig_vals[feat_mask].clone())
 
             elif feat_type == 'ordinal':
-                # For ordinal features, extract the 1-indexed class index at masked positions.
-                # Values are stored as (batch, max_ts, 1) integer class indices.
+                # For ordinal features, extract the full one-hot vectors at masked positions.
+                # Values are stored as (batch, max_ts, n_levels) one-hot encodings; a zero
+                # row encodes an unknown / out-of-domain value.
                 feature_masks = record_masks[feat_type]['indicators']  # (batch_size, max_ts_len, n_ord_feats)
                 for i, orig_vals in enumerate(value_data[feat_type]['values']):
                     # feat_mask shape: (batch_size, max_ts_len)
                     feat_mask = feature_masks[:, :, i].bool()
-                    # Extract class index values at masked positions
-                    # Result shape: (n_masked_positions, 1)
+                    # Extract complete ordinal one-hot vectors at masked (batch, timestep) positions
+                    # Result shape: (n_masked_positions, n_levels)
                     masked_targets[feat_type]['values'].append(orig_vals[feat_mask].clone())
 
             elif feat_type == 'text':
@@ -180,30 +181,34 @@ class ELECTRA(torch.nn.Module):
                     dest_tensor[value_mask] = pred_vals[value_mask].to(dest_tensor.dtype)
 
             elif feat_type == 'categorical':
-                # Convert generator logits to class indices and replace in-place
+                # Convert generator logits to one-hot vectors and replace in-place.
+                # Categorical features are stored as one-hot encodings of shape
+                # (batch_size, max_ts_len, n_classes).
                 for i, pred_logits in enumerate(gen_output[feat_type]['values']):
-                    # value_mask shape: (batch_size, max_ts_len, 1) - categorical features are 1D
+                    # value_mask shape: (batch_size, max_ts_len, n_classes); True for every
+                    # component of a masked (batch, timestep) position.
                     value_mask = record_masks[feat_type]['values'][i].bool()
-                    # Convert logits to class indices: softmax -> argmax
-                    pred_probs = torch.softmax(pred_logits, dim=-1)
-                    pred_classes = torch.argmax(pred_probs, dim=-1, keepdim=True).float()
-                    # Get destination tensor and its dtype for casting
+                    n_classes = pred_logits.shape[-1]
+                    pred_classes = torch.argmax(pred_logits, dim=-1)
+                    pred_one_hot = torch.nn.functional.one_hot(
+                        pred_classes, num_classes=n_classes
+                    )
                     dest_tensor = value_data[feat_type]['values'][i]
-                    # In-place update at masked positions, casting to destination dtype
-                    dest_tensor[value_mask] = pred_classes[value_mask].to(dest_tensor.dtype)
+                    dest_tensor[value_mask] = pred_one_hot.to(dest_tensor.dtype)[value_mask]
 
             elif feat_type == 'ordinal':
-                # Convert generator CLM probabilities to class indices and replace in-place
-                # CLM outputs are PMFs (class probabilities), so argmax gives the predicted class
+                # Convert generator CLM probabilities to one-hot vectors and replace in-place.
+                # Ordinal features are stored as one-hot encodings of shape
+                # (batch_size, max_ts_len, n_levels); argmax of the CLM PMF picks the class.
                 for i, pred_probs in enumerate(gen_output[feat_type]['values']):
-                    # value_mask shape: (batch_size, max_ts_len, 1) - ordinal features are 1D
                     value_mask = record_masks[feat_type]['values'][i].bool()
-                    # Argmax of PMF to get predicted class (0-indexed), then +1 for 1-indexed storage
-                    pred_classes = (torch.argmax(pred_probs, dim=-1, keepdim=True) + 1).float()
-                    # Get destination tensor and its dtype for casting
+                    n_levels = pred_probs.shape[-1]
+                    pred_classes = torch.argmax(pred_probs, dim=-1)
+                    pred_one_hot = torch.nn.functional.one_hot(
+                        pred_classes, num_classes=n_levels
+                    )
                     dest_tensor = value_data[feat_type]['values'][i]
-                    # In-place update at masked positions, casting to destination dtype
-                    dest_tensor[value_mask] = pred_classes[value_mask].to(dest_tensor.dtype)
+                    dest_tensor[value_mask] = pred_one_hot.to(dest_tensor.dtype)[value_mask]
 
             elif feat_type == 'text':
                 # Replace masked text embeddings with generator predictions in-place

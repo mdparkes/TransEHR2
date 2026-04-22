@@ -145,14 +145,14 @@ class DataProcessor:
         self.numeric_feats = []
         self.categorical_feats = []
         self.ordinal_feats = []
-        for feat in valued_feats:
-            feat_type = self.var_properties[feat]['type']
+        for feat_name in valued_feats:
+            feat_type = self.var_properties[feat_name]['type']
             if feat_type == 'numeric':
-                self.numeric_feats.append(feat)
+                self.numeric_feats.append(feat_name)
             elif feat_type == 'categorical':
-                self.categorical_feats.append(feat)
+                self.categorical_feats.append(feat_name)
             elif feat_type == 'ordinal':
-                self.ordinal_feats.append(feat)
+                self.ordinal_feats.append(feat_name)
         
         self.text_feats = text_feats or []
         self.event_feats = event_feats
@@ -213,7 +213,7 @@ class DataProcessor:
         categorical_indicators = np.zeros((n_ts, n_cat), dtype=np.float32)
         categorical_values = [
             np.zeros((n_ts, dim), dtype=np.int64)
-            for dim in self.dims.categorical_feat_dims
+            for dim in self.dims.categorical_feat_dims  # From the "size" field in variable_properties.yaml
         ]
 
         # Ordinal
@@ -270,23 +270,18 @@ class DataProcessor:
                     value = getattr(record, feat_name)
                     if pd.notna(value):
                         categorical_indicators[t, f] = 1.0
-                        cat_map = self.var_properties[feat].get(
-                            'category_map', {}
-                        )
-                        if isinstance(value, str):
-                            idx_map = {
-                                v: int(k)
-                                for k, v in cat_map.items()
-                            }
-                            cat_idx = idx_map.get(value, 0)
-                        else:
-                            cat_idx = int(value)
-                        first_idx = (
-                            min(int(k) for k in cat_map.keys())
-                            if cat_map else 0
-                        )
-                        cat_idx = cat_idx - first_idx + 1
-                        categorical_values[f][t, 0] = cat_idx
+                        # var_properties maps indices of one-hot encodings (LHS) to original category values (RHS)
+                        cat_map = self.var_properties[feat].get('category_map', {})
+                        # Check the indices to ensure they range from zero to size - 1
+                        if min(cat_map.keys()) != 0 or max(cat_map.keys()) != self.dims.categorical_feat_dims[f] - 1:
+                            raise ValueError(
+                                f"Invalid category_map for feature '{feat}': keys must range from 0 to size-1"
+                            )
+                        idx_map = {v: int(k) for k, v in cat_map.items()}  # map from original value to category index
+                        if value in idx_map.keys():
+                            idx = idx_map[value]
+                            categorical_values[f][t, idx] = 1.0  # Set the appropriate index to 1 for one-hot encoding
+                        # Value will be zero vector if the recorded value is out-of-domain or unknown
 
             # Ordinal features (same storage format as categorical)
             for f, feat in enumerate(self.ordinal_feats):
@@ -295,23 +290,17 @@ class DataProcessor:
                     value = getattr(record, feat_name)
                     if pd.notna(value):
                         ordinal_indicators[t, f] = 1.0
-                        cat_map = self.var_properties[feat].get(
-                            'category_map', {}
-                        )
-                        if isinstance(value, str):
-                            idx_map = {
-                                v: int(k)
-                                for k, v in cat_map.items()
-                            }
-                            cat_idx = idx_map.get(value, 0)
-                        else:
-                            cat_idx = int(value)
-                        first_idx = (
-                            min(int(k) for k in cat_map.keys())
-                            if cat_map else 0
-                        )
-                        cat_idx = cat_idx - first_idx + 1
-                        ordinal_values[f][t, 0] = cat_idx
+                        cat_map = self.var_properties[feat].get('category_map', {})
+                        # Check the indices to ensure they range from zero to size - 1
+                        if min(cat_map.keys()) != 0 or max(cat_map.keys()) != self.dims.ordinal_feat_dims[f] - 1:
+                            raise ValueError(
+                                f"Invalid category_map for feature '{feat}': keys must range from 0 to size-1"
+                            )
+                        idx_map = {v: int(k) for k, v in cat_map.items()}  # map from original value to category index
+                        if value in idx_map.keys():
+                            idx = idx_map[value]
+                            ordinal_values[f][t, idx] = 1.0  # Set the appropriate index to 1 for one-hot encoding
+                        # Value will be zero vector if the recorded value is out-of-domain or unknown
 
             # Text features — collect sparse entries only
             for f, feat in enumerate(self.text_feats):
