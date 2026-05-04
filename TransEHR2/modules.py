@@ -1,5 +1,6 @@
 import torch
 
+from dlordinal.output_layers import CLM
 from torch import Tensor
 from transformers import AutoTokenizer, AutoModel
 from typing import Dict, List, Optional, Tuple
@@ -535,13 +536,11 @@ class MaskedTokenGenerator(torch.nn.Module):
 
         # Ordinal features: Linear(d_model, 1) -> CLM(n_levels, 'logit')
         # CLM maps a scalar latent variable to ordinal class probabilities via cumulative thresholds
-        from dlordinal.output_layers import CLM
         self.ordinal_heads = torch.nn.ModuleList([
             torch.nn.Linear(d_model, 1) for _ in ordinal_features
         ])
         self.ordinal_clms = torch.nn.ModuleList([
-            CLM(num_classes=n_levels, link_function='logit')
-            for n_levels in ordinal_features
+            CLM(num_classes=n_levels, link_function='logit') for n_levels in ordinal_features
         ])
 
         self.text_heads = torch.nn.ModuleList([
@@ -638,7 +637,7 @@ class MaskedTokenGenerator(torch.nn.Module):
             vals_to_concat.append(masked_ordinal_vals)
 
         # Concatenate the tensors for numeric, categorical, and ordinal features along the feature dimension
-        #   masked_indicators shape: (batch_size, max_timeseries_length, n_num_feats + n_cat_feats)
+        #   masked_indicators shape: (batch_size, max_timeseries_length, n_num_feats + n_cat_feats + n_ord_feats)
         #   masked_values shape: (batch_size, max_timeseries_length, total_feat_dim)
         masked_indicators = torch.cat(inds_to_concat, dim=2)
         masked_values = torch.cat(vals_to_concat, dim=2)

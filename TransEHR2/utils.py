@@ -354,7 +354,7 @@ def generate_record_masks(
 ) -> Tuple[Dict[str, Dict[str, Union[Tensor, List[Tensor]]]], Tensor]:
     """Generate masks for observed and unobserved records in the dataset.
 
-    This function randomly selects records to mask in the dataset. It samples a fixed percentage of the observed records to mask and tries to sample a number of unobserved records such that the ratio of masked observed records to masked unobserved records satisfies a specified ratio (`obs_unobs_ratio`). The components of vector-valued features that were selected for masking are subsampled so that only a specified portion of the components are masked. The number of components to subsample is max(1, floor(subsample_rate * dim)), where `dim` is the number of components in the vector-valued feature. Masked components are represented as ones; unmasked components are represented as zeros.
+    This function randomly selects records to mask in the dataset. It samples a fixed percentage of the observed records to mask and tries to sample a number of unobserved records such that the ratio of masked observed records to masked unobserved records satisfies a specified ratio (`obs_unobs_ratio`). For numeric features, the components of vector-valued features that were selected for masking are subsampled so that only a specified portion of the components are masked; the number of components to subsample is max(1, floor(subsample_rate * dim)), where `dim` is the number of components in the vector-valued feature. For categorical and ordinal features, which are stored as one-hot vectors, every component of the selected feature position is masked so that the generator predicts the full class distribution. Masked components are represented as ones; unmasked components are represented as zeros.
 
     Args:
         data: Batched MixedTensorDataset from DataLoader containing value-associated and event-associated data.
@@ -435,7 +435,7 @@ def generate_record_masks(
         event_masks = torch.zeros_like(data['event_data']['indicators'], device=batch_device)
 
     # Generate the value-associated masks
-    for feature_type in ['numeric', 'categorical', 'text']:
+    for feature_type in ['numeric', 'categorical', 'ordinal', 'text']:
         if feature_type in val_masks:
             _gen_val_assoc_feat_mask(
                 data, feature_type, val_masks, feature_sample_rate, obs_unobs_ratio, subsample_rate
@@ -519,31 +519,40 @@ def _gen_val_assoc_feat_mask(
             feat_dim = data['val_data']['text']['embedded_values'].shape[-1]
         else:
             feat_dim = values_data[f].shape[-1]
-        n_components_to_mask = max(1, int(subsample_rate * feat_dim))
 
         # Filter to positions for this feature
         feat_mask = all_selected[:, 2] == f
         feat_positions = all_selected[feat_mask]
-        
+
         n_pos = feat_positions.size(0)
         if n_pos == 0:
             continue
 
-        # Generate component masks for all positions at once using random sorting
-        rand_vals = torch.rand(n_pos, feat_dim, device=device)
-        _, component_order = rand_vals.sort(dim=1)
-        selected_components = component_order[:, :n_components_to_mask]  # (n_pos, n_components)
+        if feature_type in ('categorical', 'ordinal'):
+            # Categorical and ordinal features are stored as one-hot vectors; the generator
+            # predicts class logits / CLM probabilities for the whole vector. Mask every
+            # component of the one-hot row at a selected (batch, timestep) position.
+            val_masks[feature_type][values_key][f][
+                feat_positions[:, 0], feat_positions[:, 1], :
+            ] = 1.0
+        else:
+            n_components_to_mask = max(1, int(subsample_rate * feat_dim))
 
-        # Build expanded index tensors
-        batch_idx = feat_positions[:, 0].unsqueeze(1).expand(-1, n_components_to_mask)
-        time_idx = feat_positions[:, 1].unsqueeze(1).expand(-1, n_components_to_mask)
+            # Generate component masks for all positions at once using random sorting
+            rand_vals = torch.rand(n_pos, feat_dim, device=device)
+            _, component_order = rand_vals.sort(dim=1)
+            selected_components = component_order[:, :n_components_to_mask]  # (n_pos, n_components)
 
-        # Flatten and assign
-        val_masks[feature_type][values_key][f][
-            batch_idx.reshape(-1),
-            time_idx.reshape(-1),
-            selected_components.reshape(-1)
-        ] = 1.0
+            # Build expanded index tensors
+            batch_idx = feat_positions[:, 0].unsqueeze(1).expand(-1, n_components_to_mask)
+            time_idx = feat_positions[:, 1].unsqueeze(1).expand(-1, n_components_to_mask)
+
+            # Flatten and assign
+            val_masks[feature_type][values_key][f][
+                batch_idx.reshape(-1),
+                time_idx.reshape(-1),
+                selected_components.reshape(-1)
+            ] = 1.0
 
 
 def _gen_event_assoc_feat_mask(

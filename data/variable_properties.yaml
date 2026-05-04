@@ -1,3 +1,7 @@
+# Features are listed by name in the data files to be processed.
+# `type` can be `numeric`, `categorical`, `ordinal`, or `text`.
+# `size` is the number of values for each feature (typically just one for a single text string), for example, a categorical feature with three categories would have size 3 to reflect the one-hot encoding of the feature.
+# `category_map` is a mapping from one-hot indices to the original category values, for example, a categorical feature with three categories (0, 1, 2) would have a category map of {0: 'Other', 1: 'F', 2: 'M'}.
 Diastolic arterial blood pressure:
   type: numeric
   size: 1
@@ -83,16 +87,16 @@ Fraction inspired oxygen:
   size: 1
   category_map: {}
 GCS eye opening:
-  type: categorical
-  size: 1
+  type: ordinal
+  size: 4
   category_map:
     0: 1
     1: 2
     2: 3
     3: 4
 GCS motor response:
-  type: categorical
-  size: 1
+  type: ordinal
+  size: 6
   category_map:
     0: 1
     1: 2
@@ -101,8 +105,8 @@ GCS motor response:
     4: 5
     5: 6
 GCS verbal response:
-  type: categorical
-  size: 1
+  type: ordinal
+  size: 5
   category_map:
     0: 1
     1: 2
@@ -187,7 +191,7 @@ Diagnosis Descriptions:
   category_map: {}
 Gender:
   type: categorical
-  size: 1
+  size: 3
   category_map:
     0: Other
     1: F
