@@ -495,6 +495,7 @@ class MaskedTokenGenerator(torch.nn.Module):
         numeric_dims: List[int],
         categorical_classes: List[int],
         ordinal_features: Optional[List[int]] = None,
+        multilabel_classes: Optional[List[int]] = None,
         n_text_features: int = 0,
         text_embed_dim: int = 0,
         predict_indicators: bool = False,
@@ -509,6 +510,8 @@ class MaskedTokenGenerator(torch.nn.Module):
             categorical_classes (List[int]): List of class counts for each categorical feature
             ordinal_features (List[int], optional): List of level counts for each ordinal feature. Each entry is the
                 number of ordinal levels for that feature. Defaults to None (no ordinal features).
+            multilabel_classes (List[int], optional): List of class counts for each multilabel feature. Each entry is
+                the number of classes for that feature. Defaults to None (no multilabel features).
             n_text_features (int): Number of text features. Defaults to 0. If 0, no text features will be processed or
                 predicted.
             text_embed_dim (int): Dimensionality of pre-computed text embeddings. Required when n_text_features > 0.
@@ -522,6 +525,8 @@ class MaskedTokenGenerator(torch.nn.Module):
 
         if ordinal_features is None:
             ordinal_features = []
+        if multilabel_classes is None:
+            multilabel_classes = []
 
         # In the original implementation that only considered scalar real-valued features, the output head was a single
         # linear layer that produced a tensor with n_features as the last dimension. In this implementation, there is a
@@ -543,6 +548,11 @@ class MaskedTokenGenerator(torch.nn.Module):
             CLM(num_classes=n_levels, link_function='logit') for n_levels in ordinal_features
         ])
 
+        # Multilabel features: Linear(d_model, n_classes) producing logits for sigmoid
+        self.multilabel_heads = torch.nn.ModuleList([
+            torch.nn.Linear(d_model, n_classes) for n_classes in multilabel_classes
+        ])
+
         self.text_heads = torch.nn.ModuleList([
             torch.nn.Linear(d_model, text_embed_dim) for _ in range(n_text_features)
         ])
@@ -550,6 +560,7 @@ class MaskedTokenGenerator(torch.nn.Module):
         self.predict_numeric_feats = len(self.numeric_heads) > 0
         self.predict_categorical_feats = len(self.categorical_heads) > 0
         self.predict_ordinal_feats = len(self.ordinal_heads) > 0
+        self.predict_multilabel_feats = len(self.multilabel_heads) > 0
         self.predict_text_feats = len(self.text_heads) > 0
 
         # Indicator prediction heads (optional)
@@ -562,6 +573,7 @@ class MaskedTokenGenerator(torch.nn.Module):
             self.numeric_indicator_head = torch.nn.Linear(dim_feedforward, len(numeric_dims))
             self.categorical_indicator_head = torch.nn.Linear(dim_feedforward, len(categorical_classes))
             self.ordinal_indicator_head = torch.nn.Linear(dim_feedforward, len(ordinal_features))
+            self.multilabel_indicator_head = torch.nn.Linear(dim_feedforward, len(multilabel_classes))
             self.text_indicator_head = torch.nn.Linear(dim_feedforward, n_text_features)
 
     def forward(
@@ -635,6 +647,14 @@ class MaskedTokenGenerator(torch.nn.Module):
             ordinal_vals = torch.cat(batch['ordinal']['values'], dim=2)
             masked_ordinal_vals = ordinal_vals * torch.cat(record_masks['ordinal']['values'], dim=2)
             vals_to_concat.append(masked_ordinal_vals)
+
+        if self.predict_multilabel_feats:
+            multilabel_inds = batch['multilabel']['indicators']
+            masked_multilabel_inds = multilabel_inds * record_masks['multilabel']['indicators']
+            inds_to_concat.append(masked_multilabel_inds)
+            multilabel_vals = torch.cat(batch['multilabel']['values'], dim=2)
+            masked_multilabel_vals = multilabel_vals * torch.cat(record_masks['multilabel']['values'], dim=2)
+            vals_to_concat.append(masked_multilabel_vals)
 
         # Concatenate the tensors for numeric, categorical, and ordinal features along the feature dimension
         #   masked_indicators shape: (batch_size, max_timeseries_length, n_num_feats + n_cat_feats + n_ord_feats)
@@ -716,6 +736,13 @@ class MaskedTokenGenerator(torch.nn.Module):
                 ordinal_values.append(probs)
             output['ordinal']['values'] = ordinal_values
 
+        if self.predict_multilabel_feats:
+            output['multilabel'] = {'indicators': None, 'values': []}
+            if self.predict_indicators:
+                output['multilabel']['indicators'] = self.multilabel_indicator_head(indicator_embed)
+            # Each head produces logits for independent binary classification per class
+            output['multilabel']['values'] = [head(val_embed) for head in self.multilabel_heads]
+
         if self.predict_text_feats:
             output['text'] = {'indicators': None, 'values': []}
             if self.predict_indicators:
@@ -748,6 +775,7 @@ class MaskedTokenDiscriminator(torch.nn.Module):
         n_numeric_features: int,
         n_categorical_features: int,
         n_ordinal_features: int = 0,
+        n_multilabel_features: int = 0,
         n_text_features: int = 0,
         n_static_features: int = 0,
         dim_feedforward: int = 64
@@ -786,6 +814,11 @@ class MaskedTokenDiscriminator(torch.nn.Module):
         else:
             self.ordinal_head = None
 
+        if n_multilabel_features > 0:
+            self.multilabel_head = torch.nn.Linear(dim_feedforward, n_multilabel_features)
+        else:
+            self.multilabel_head = None
+
         if n_text_features > 0:
             self.text_head = torch.nn.Linear(dim_feedforward, n_text_features)
         else:
@@ -794,6 +827,7 @@ class MaskedTokenDiscriminator(torch.nn.Module):
         self.predict_numeric_feats = (self.numeric_head is not None)
         self.predict_categorical_feats = (self.categorical_head is not None)
         self.predict_ordinal_feats = (self.ordinal_head is not None)
+        self.predict_multilabel_feats = (self.multilabel_head is not None)
         self.predict_text_feats = (self.text_head is not None)
 
     def forward(
@@ -829,6 +863,10 @@ class MaskedTokenDiscriminator(torch.nn.Module):
         if self.predict_ordinal_feats:
             inds_to_concat.append(batch['ordinal']['indicators'])
             vals_to_concat.append(torch.cat(batch['ordinal']['values'], dim=2))
+
+        if self.predict_multilabel_feats:
+            inds_to_concat.append(batch['multilabel']['indicators'])
+            vals_to_concat.append(torch.cat(batch['multilabel']['values'], dim=2))
 
         if self.predict_text_feats:
             inds_to_concat.append(batch['text']['indicators'])
@@ -874,6 +912,8 @@ class MaskedTokenDiscriminator(torch.nn.Module):
             output['categorical'] = self.categorical_head(val_embed)  # (batch_size, max_timeseries_length, n_cat_feats)
         if self.predict_ordinal_feats:
             output['ordinal'] = self.ordinal_head(val_embed)  # (batch_size, max_timeseries_length, n_ordinal_feats)
+        if self.predict_multilabel_feats:
+            output['multilabel'] = self.multilabel_head(val_embed)
         if self.predict_text_feats:
             output['text'] = self.text_head(val_embed)  # (batch_size, max_timeseries_length, n_text_feats)
 

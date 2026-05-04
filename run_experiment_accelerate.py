@@ -236,6 +236,7 @@ if __name__ == "__main__":
     numeric_feat_dims = []  # The dimension of each numeric feature
     categorical_class_cnts = []  # The number of classes for each categorical feature
     ordinal_features = []  # The number of levels for each ordinal feature
+    multilabel_class_cnts = []  # The number of classes for each multilabel feature
     for feature in VALUED_FEATS:
         tot_val_feat_dim += variable_properties[feature]['size']
         if variable_properties[feature]['type'] == 'numeric':
@@ -247,6 +248,10 @@ if __name__ == "__main__":
         elif variable_properties[feature]['type'] == 'ordinal':
             ordinal_features.append(
                 len(variable_properties[feature]['category_map'])
+            )
+        elif variable_properties[feature]['type'] == 'multilabel':
+            multilabel_class_cnts.append(
+                variable_properties[feature]['size']
             )
     if USE_TEXT:
         n_val_feats = len(VALUED_FEATS) + len(TEXT_FEATS)  # includes numeric + categorical + ordinal + text
@@ -351,6 +356,7 @@ if __name__ == "__main__":
             numeric_dims=numeric_feat_dims,
             categorical_classes=categorical_class_cnts,
             ordinal_features=ordinal_features if ordinal_features else None,
+            multilabel_classes=multilabel_class_cnts if multilabel_class_cnts else None,
             n_text_features=len(TEXT_FEATS) if USE_TEXT else 0,
             text_embed_dim=text_embed_dim,
             predict_indicators=PREDICT_INDICATORS,
@@ -362,6 +368,7 @@ if __name__ == "__main__":
             n_numeric_features=len(numeric_feat_dims),
             n_categorical_features=len(categorical_class_cnts),
             n_ordinal_features=len(ordinal_features),
+            n_multilabel_features=len(multilabel_class_cnts),
             n_text_features=len(TEXT_FEATS) if USE_TEXT else 0,
             n_static_features=len(STATIC_FEATS),
             dim_feedforward=DISCRIMINATOR_DIM_FEEDFORWARD

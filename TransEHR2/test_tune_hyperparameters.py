@@ -278,12 +278,24 @@ if __name__ == "__main__":
     tot_val_feat_dim = 0
     numeric_feat_dims = []
     categorical_class_cnts = []
+    ordinal_features = []
+    multilabel_class_cnts = []
     for feature in VALUED_FEATS:
         tot_val_feat_dim += variable_properties[feature]['size']
         if variable_properties[feature]['type'] == 'numeric':
             numeric_feat_dims.append(variable_properties[feature]['size'])
         elif variable_properties[feature]['type'] == 'categorical':
-            categorical_class_cnts.append(len(variable_properties[feature]['category_map']))
+            categorical_class_cnts.append(
+                len(variable_properties[feature]['category_map'])
+            )
+        elif variable_properties[feature]['type'] == 'ordinal':
+            ordinal_features.append(
+                len(variable_properties[feature]['category_map'])
+            )
+        elif variable_properties[feature]['type'] == 'multilabel':
+            multilabel_class_cnts.append(
+                variable_properties[feature]['size']
+            )
     # Get fold directory
     fold_name = 'fold0'
     fold_dir = os.path.join(DATA_DIR, fold_name)
@@ -430,6 +442,8 @@ if __name__ == "__main__":
                     encoder=generator_encoder, d_model=GENERATOR_D_MODEL,
                     numeric_dims=numeric_feat_dims,
                     categorical_classes=categorical_class_cnts,
+                    ordinal_features=ordinal_features if ordinal_features else None,
+                    multilabel_classes=multilabel_class_cnts if multilabel_class_cnts else None,
                     n_text_features=len(TEXT_FEATS) if USE_TEXT else 0,
                     predict_indicators=PREDICT_INDICATORS,
                     dim_feedforward=GENERATOR_DIM_FEEDFORWARD,
@@ -440,6 +454,8 @@ if __name__ == "__main__":
                     d_model=DISCRIMINATOR_ENCODER_D_MODEL,
                     n_numeric_features=len(numeric_feat_dims),
                     n_categorical_features=len(categorical_class_cnts),
+                    n_ordinal_features=len(ordinal_features),
+                    n_multilabel_features=len(multilabel_class_cnts),
                     n_text_features=len(TEXT_FEATS) if USE_TEXT else 0,
                     n_static_features=len(STATIC_FEATS),
                     dim_feedforward=DISCRIMINATOR_DIM_FEEDFORWARD

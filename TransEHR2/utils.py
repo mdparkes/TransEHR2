@@ -408,7 +408,7 @@ def generate_record_masks(
     event_masks = None
 
     # Initialize value-associated data masks
-    for feature_type in ['numeric', 'categorical', 'ordinal', 'text']:
+    for feature_type in ['numeric', 'categorical', 'ordinal', 'multilabel', 'text']:
         if feature_type in data['val_data']:
             feature_data = data['val_data'][feature_type]
             # Get number of features from first episode's first timestep
@@ -435,7 +435,7 @@ def generate_record_masks(
         event_masks = torch.zeros_like(data['event_data']['indicators'], device=batch_device)
 
     # Generate the value-associated masks
-    for feature_type in ['numeric', 'categorical', 'ordinal', 'text']:
+    for feature_type in ['numeric', 'categorical', 'ordinal', 'multilabel', 'text']:
         if feature_type in val_masks:
             _gen_val_assoc_feat_mask(
                 data, feature_type, val_masks, feature_sample_rate, obs_unobs_ratio, subsample_rate

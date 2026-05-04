@@ -67,7 +67,7 @@ class ELECTRA(torch.nn.Module):
         """
         masked_targets = {}
         
-        for feat_type in ['numeric', 'categorical', 'ordinal', 'text']:
+        for feat_type in ['numeric', 'categorical', 'ordinal', 'multilabel', 'text']:
             if feat_type not in value_data or feat_type not in record_masks:
                 continue
 
@@ -93,6 +93,13 @@ class ELECTRA(torch.nn.Module):
                     # Extract complete categorical features at masked (batch, timestep) positions
                     # Result shape: (n_masked_positions, n_classes)
                     masked_targets[feat_type]['values'].append(orig_vals[feat_mask].clone())
+
+            elif feat_type == 'multilabel':
+                # For multilabel features, extract masked value components (like numeric).
+                # Each class bit is independently masked and predicted via sigmoid + BCE.
+                for i, orig_vals in enumerate(value_data[feat_type]['values']):
+                    value_mask = record_masks[feat_type]['values'][i].bool()
+                    masked_targets[feat_type]['values'].append(orig_vals[value_mask].clone())
 
             elif feat_type == 'ordinal':
                 # For ordinal features, extract the full one-hot vectors at masked positions.
@@ -162,7 +169,7 @@ class ELECTRA(torch.nn.Module):
         Returns:
             None. The value_data dictionary is modified in-place.
         """
-        for feat_type in ['numeric', 'categorical', 'ordinal', 'text']:
+        for feat_type in ['numeric', 'categorical', 'ordinal', 'multilabel', 'text']:
             # The generator output only has keys for feature types that were used for prediction.
             # If the input batch's feature list for a type was empty, the output will not have
             # a key for that type. Text is only processed if the MaskedTokenGenerator was
@@ -209,6 +216,14 @@ class ELECTRA(torch.nn.Module):
                     )
                     dest_tensor = value_data[feat_type]['values'][i]
                     dest_tensor[value_mask] = pred_one_hot.to(dest_tensor.dtype)[value_mask]
+
+            elif feat_type == 'multilabel':
+                # Binarize generator logits via sigmoid > 0.5 threshold and replace in-place.
+                for i, pred_logits in enumerate(gen_output[feat_type]['values']):
+                    value_mask = record_masks[feat_type]['values'][i].bool()
+                    pred_binary = (torch.sigmoid(pred_logits) > 0.5).float()
+                    dest_tensor = value_data[feat_type]['values'][i]
+                    dest_tensor[value_mask] = pred_binary[value_mask].to(dest_tensor.dtype)
 
             elif feat_type == 'text':
                 # Replace masked text embeddings with generator predictions in-place
@@ -473,6 +488,13 @@ class MixedClassifier(torch.nn.Module):
                 # Extract and concatenate ordinal feature values
                 ordinal_vals = torch.cat(val_data['ordinal']['values'], dim=2)
                 vals_to_concat.append(ordinal_vals)
+
+            # Process multilabel features
+            if 'multilabel' in val_data and val_data['multilabel']['values']:
+                multilabel_inds = val_data['multilabel']['indicators']
+                inds_to_concat.append(multilabel_inds)
+                multilabel_vals = torch.cat(val_data['multilabel']['values'], dim=2)
+                vals_to_concat.append(multilabel_vals)
 
             # Process text features
             if self.use_text and 'text' in val_data and 'embedded_values' in val_data['text']:

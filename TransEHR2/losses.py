@@ -18,6 +18,7 @@ class MaskedGeneratorLoss(torch.nn.Module):
     Loss function for MaskedTokenGenerator that handles multiple output types:
     - Numeric features: Squared L2 norm of the difference between targets and predictions, averaged across samples.
     - Categorical features: Cross entropy loss with ignored padding class
+    - Multilabel features: Binary cross entropy per class (independent binary classification)
     - Text features: Cosine similarity loss (rescaled from [-1,1] to [0,1])
     
     This loss function supports two input formats for targets:
@@ -31,6 +32,7 @@ class MaskedGeneratorLoss(torch.nn.Module):
         numeric_weight: float = 1.0,
         categorical_weight: float = 1.0,
         ordinal_weight: float = 1.0,
+        multilabel_weight: float = 1.0,
         text_weight: float = 1.0,
         indicator_weight: float = 1.0,
         ordinal_features: Optional[List[int]] = None
@@ -42,6 +44,7 @@ class MaskedGeneratorLoss(torch.nn.Module):
             numeric_weight (float): Weight for numeric feature loss
             categorical_weight (float): Weight for categorical feature loss
             ordinal_weight (float): Weight for ordinal feature loss
+            multilabel_weight (float): Weight for multilabel feature loss
             text_weight (float): Weight for text feature loss
             indicator_weight (float): Weight for indicator prediction loss
             ordinal_features (List[int], optional): List of number of levels for
@@ -51,6 +54,7 @@ class MaskedGeneratorLoss(torch.nn.Module):
         self.numeric_weight = numeric_weight
         self.categorical_weight = categorical_weight
         self.ordinal_weight = ordinal_weight
+        self.multilabel_weight = multilabel_weight
         self.text_weight = text_weight
         self.indicator_weight = indicator_weight
 
@@ -240,6 +244,38 @@ class MaskedGeneratorLoss(torch.nn.Module):
                     indicator_loss, indicator_n_masked = self._calculate_indicator_loss_sparse(
                         predictions['ordinal']['indicators'],
                         masked_targets['ordinal']['indicators'],
+                        feature_masks.bool()
+                    )
+                    total_loss += self.indicator_weight * indicator_loss
+                    n_masked += indicator_n_masked
+
+        # Process multilabel features
+        if 'multilabel' in predictions and 'multilabel' in masked_targets:
+            pred_values = predictions['multilabel']['values']
+            target_values = masked_targets['multilabel']['values']
+            feature_masks = record_masks['multilabel']['indicators']
+            value_masks = record_masks['multilabel']['values']
+
+            ml_loss = 0.0
+            ml_n_masked = 0
+            for f, (pred, target) in enumerate(zip(pred_values, target_values)):
+                if target.numel() == 0:
+                    continue
+                value_mask = value_masks[f].bool()
+                pred_at_masked = pred[value_mask]
+                target_casted = target.to(pred_at_masked.dtype)
+                feature_loss = self.bce_loss(pred_at_masked, target_casted)
+                ml_loss += feature_loss.sum()
+                ml_n_masked += target.numel()
+
+            total_loss += self.multilabel_weight * ml_loss
+            n_masked += ml_n_masked
+
+            if 'indicators' in predictions['multilabel'] and predictions['multilabel']['indicators'] is not None:
+                if 'indicators' in masked_targets['multilabel']:
+                    indicator_loss, indicator_n_masked = self._calculate_indicator_loss_sparse(
+                        predictions['multilabel']['indicators'],
+                        masked_targets['multilabel']['indicators'],
                         feature_masks.bool()
                     )
                     total_loss += self.indicator_weight * indicator_loss
@@ -465,6 +501,39 @@ class MaskedGeneratorLoss(torch.nn.Module):
                 total_loss += self.indicator_weight * masked_indicator_loss
                 n_masked += indicator_n_masked
 
+        # Process multilabel features
+        if 'multilabel' in predictions and 'multilabel' in targets['val_data']:
+            pred_values = predictions['multilabel']['values']
+            target_values = targets['val_data']['multilabel']['values']
+            feature_masks = record_masks['multilabel']['indicators']
+            value_masks = record_masks['multilabel']['values']
+
+            ml_loss = 0.0
+            for f, (pred, target, value_mask) in enumerate(zip(pred_values, target_values, value_masks)):
+                feat_mask = feature_masks[:, :, f].bool()
+                if not feat_mask.any():
+                    continue
+                mask = value_mask.bool()
+                feature_loss = self.bce_loss(pred, target.float())
+                masked_loss = torch.where(mask, feature_loss, torch.zeros_like(feature_loss))
+                batch_time_mask = feat_mask.unsqueeze(-1)
+                pos_loss = masked_loss.sum(dim=-1, keepdim=True)
+                pos_loss = torch.where(batch_time_mask, pos_loss, torch.zeros_like(pos_loss))
+                ml_loss += pos_loss.sum()
+                component_counts = (mask & batch_time_mask).sum()
+                n_masked += component_counts.item()
+
+            total_loss += self.multilabel_weight * ml_loss
+
+            if 'indicators' in predictions['multilabel'] and predictions['multilabel']['indicators'] is not None:
+                pred_indicators = predictions['multilabel']['indicators']
+                target_indicators = targets['val_data']['multilabel']['indicators']
+                indicator_loss = self.bce_loss(pred_indicators, target_indicators.float())
+                masked_indicator_loss = (indicator_loss * feature_masks.bool()).sum()
+                indicator_n_masked = feature_masks.bool().sum().item()
+                total_loss += self.indicator_weight * masked_indicator_loss
+                n_masked += indicator_n_masked
+
         # Process text features
         if 'text' in predictions and 'text' in targets['val_data']:
             # Get predicted text embeddings
@@ -612,7 +681,7 @@ class MaskedDiscriminatorLoss(torch.nn.Module):
         n_predictions = 0
         
         # Process each feature type
-        for feat_type in ['numeric', 'categorical', 'ordinal', 'text']:
+        for feat_type in ['numeric', 'categorical', 'ordinal', 'multilabel', 'text']:
             if feat_type not in predictions or feat_type not in record_masks:
                 continue
             pred_logits = predictions[feat_type]  # (batch_size, max_ts_len, n_features)
