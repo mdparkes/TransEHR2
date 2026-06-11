@@ -1,19 +1,24 @@
-# TransEHR2
+# TransEHR2-IBDreadmission
 
-## About
+This repository contains code for a machine learning model that predicts personalized readmission probability distributions for patients with inflammatory bowel diseases. It uses the TransEHR2 model framework learn latent representations of longitudinal medical records from these patients, and uses those representations to predict readimission probabilities.
 
-TransEHR, originally presented by [Xu *et al.*](https://proceedings.mlr.press/v225/xu23a/xu23a.pdf), is a transformer neural network-based model that learns representations of medical record timeseries which can be used as input for downstream medical prediction tasks. Xu *et al.* used TransEHR to process medical records from the first 48 hours of patients' stays in ICU and predict their length of stay, in-hospital mortality, and International Classification of Disease (ICD) codes assigned during their stay.
+## About TransEHR2
 
-TransEHR consists of a generator network, a discriminator network, and a transformer Hawkes process network. During self-supervised pre-training, the generator learns to simulate the values of randomly masked records. The discriminator network learns to identify which records are simulated and which ones are original. The transformer Hawkes process learns the temporal dynamics of different types of features captured in the medical records. TransEHR is pretrained to minimize the sum of losses from these three networks. Finetuning is fully supervised and aims to maximize performance on a given downstream prediction task.
+TransEHR, originally presented by [Xu *et al.*](https://proceedings.mlr.press/v225/xu23a/xu23a.pdf), is a transformer neural network-based model that learns representations of medical record timeseries which can be used as input for downstream medical prediction tasks. TransEHR consists of a generator network, a discriminator network, and a transformer Hawkes process network. During self-supervised pre-training, the generator learns to simulate the values of randomly masked records. The discriminator network learns to identify which records are simulated and which ones are original. The transformer Hawkes process learns the temporal dynamics of different types of features captured in the medical records. TransEHR is pretrained to minimize the weighted sum of losses from these three networks. Finetuning is fully supervised and aims to maximize performance on a given downstream prediction task.
 
-TransEHR2 improves upon the original TransEHR model. It supports additional data types for input, namely: vector-valued features, categorical features, and text. In contrast, the original TransEHR model only supported scalar value-associated features. TransEHR2 also distinguishes between records collected before and after a reference time. For example, it can be set up to distinguish between medical records collected before and after admission to ICU. TransEHR can thus leverage information that only appears in antecedent records, such as discharge summaries from previous hospitalizations. Whereas TransEHR was originally evaluated on MIMIC-III data (among other datasets), TransEHR2 is set up to work with MIMIC-IV. TransEHR2 also corrects known errors in Xu *et al.*'s loss calculations for the transformer Hawkes process. It also supports cross-validation, which was not implemented in Xu *et al.*'s code.
+TransEHR2 improves upon the original TransEHR model. It supports additional data types for input, namely: vector-valued, categorical, ordinal, and text features. TransEHR2 also corrects known errors in Xu *et al.*'s loss calculations for the transformer Hawkes process. The loss is reformulated to express the joint conditional likelihood of the next observed event type(s) their timestamp, rather than timestamp only, under the learned model.
+
+## Data availability
+The health records used to train and evaluate the model are restricted and, in the interest of protecting patient privacy, cannot be publicly distributed. Many of the supporting resources are used under license and cannot be redistributed here.
+
+**TO DO: List sources for resources**
 
 ## Installation
 
 Clone the repository and create a virtual environment (optional but advisable).
 
 ```shell
-git clone https://github.com/mdparkes/TransEHR2.git && cd TransEHR2
+git clone https://github.com/phairlab/TransEHR2-IBDreadmission.git TransEHR2 && cd TransEHR2
 python -m venv venv/TransEHR2
 ```
 
@@ -31,6 +36,7 @@ deactivate
 If you intend to use text features, you will require authorization to use Meta's Llama model. TransEHR2 uses HuggingFace to obtain the Llama module, and the exact version is specified in `TransEHR2/constants.py`. You must have an authorization token to use the model. TransEHR2 assumes that the authorization token is stored in a .env file at the root of the local repository. You will have to create this file with your own token.
 
 ### Installing optional libraries for MIMIC-IV data
+**TO DO: Rewrite this section for IBD data with IBDdataprep**
 If you intend to use MIMIC-IV data with TransEHR2, install the MIMIC-IV data prep libraries. Create a separate virtual environment for the data prep library to avoid dependency conflicts (optional but advisable).
 
 ```shell
