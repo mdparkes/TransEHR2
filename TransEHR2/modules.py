@@ -1,3 +1,4 @@
+import os
 import torch
 
 from dlordinal.output_layers import CLM
@@ -27,8 +28,18 @@ class GradientTraceableLLM(torch.nn.Module):
         self.use_gradient_checkpointing = use_gradient_checkpointing
         # Initialize the model on CPU to avoid GPU memory issues during FSDP wrapping
         # Try to load from local files to avoid hitting rate limits on Hugging Face
-        # Explicitly use the 3.1-8B tokenizer because the 3.2-1B tokenizer is giving errors
-        tokenizer_name = 'meta-llama/Llama-3.1-8B'
+        # Use the Llama-3.1-8B tokenizer explicitly because the
+        # Llama-3.2-1B tokenizer has a broken tekken.json path that
+        # causes AttributeError in convert_slow_tokenizer. The
+        # tokenizer vocabulary is compatible across Llama 3.x models.
+        name_or_basename = model_name + '/' + os.path.basename(model_name.rstrip('/'))
+        if 'Llama-3.2-1B' in name_or_basename:
+            if os.environ.get('HF_HUB_OFFLINE', '0') == '1':
+                tokenizer_name = os.path.join(os.path.dirname(model_name), 'Llama-3.1-8B')
+            else:
+                tokenizer_name = 'meta-llama/Llama-3.1-8B'
+        else:
+            tokenizer_name = model_name
         try:
             self.tokenizer = AutoTokenizer.from_pretrained(
                 tokenizer_name, 
