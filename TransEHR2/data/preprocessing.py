@@ -1217,6 +1217,15 @@ def collate_tensorized(
             'embedded_values': val_text_embeddings,
         }
 
+    # Identifiers for mapping model outputs (e.g. XAI scores) back to the
+    # on-disk .npy rows. 'idx' is the array/row index; 'episode_id' is the
+    # patient episode ID (present only when the dataset was built with IDs).
+    result['idx'] = torch.tensor([b['idx'] for b in batch], dtype=torch.long)
+    if 'episode_id' in batch[0]:
+        result['episode_id'] = torch.tensor(
+            [b['episode_id'] for b in batch], dtype=torch.long
+        )
+
     return result
 
 
@@ -1294,6 +1303,14 @@ def load_dataset(base_path: str) -> MixedDataset:
     with open(os.path.join(base_path, 'metadata.pkl'), 'rb') as f:
         metadata = pickle.load(f)
 
+    # Row idx -> patient episode ID (sibling of the dataset dir). Absent for
+    # datasets built before IDs were threaded through; None keeps it optional.
+    episode_ids = None
+    ids_path = f'{base_path}_ids.pkl'
+    if os.path.exists(ids_path):
+        with open(ids_path, 'rb') as f:
+            episode_ids = pickle.load(f)
+
     n_num = metadata['n_numeric_feats']
     n_cat = metadata['n_categorical_feats']
     n_ord = metadata.get('n_ordinal_feats', 0)
@@ -1335,6 +1352,7 @@ def load_dataset(base_path: str) -> MixedDataset:
         phenotype=load_mmap('phenotype'),
         max_ts_len=metadata['max_ts_len'],
         text_token_len=metadata['text_token_len'],
+        episode_ids=episode_ids,
     )
 
 

@@ -109,6 +109,7 @@ class MixedDataset(Dataset):
         phenotype: np.ndarray,
         max_ts_len: int,
         text_token_len: List[int],
+        episode_ids: Optional[List[int]] = None,
     ):
         self.n_episodes = val_times.shape[0]
         self.max_ts_len = max_ts_len
@@ -138,6 +139,9 @@ class MixedDataset(Dataset):
         self.mortality = mortality
         self.length_of_stay = length_of_stay
         self.phenotype = phenotype
+        # Row idx -> patient episode ID, aligned with the on-disk .npy rows.
+        # Used to map XAI feature scores back to their source episodes.
+        self.episode_ids = episode_ids
 
     def __len__(self) -> int:
         return self.n_episodes
@@ -168,7 +172,8 @@ class MixedDataset(Dataset):
             text_embeddings_dense.append(torch.from_numpy(dense_embeds))
 
         # Return tensors (copy from mmap)
-        return {
+        item = {
+            'idx': idx,
             'val_numeric_indicators': torch.from_numpy(self.val_numeric_indicators[idx].copy()),
             'val_numeric_values': [torch.from_numpy(v[idx].copy()) for v in self.val_numeric_values],
             'val_categorical_indicators': torch.from_numpy(self.val_categorical_indicators[idx].copy()),
@@ -187,3 +192,6 @@ class MixedDataset(Dataset):
             'length_of_stay': torch.tensor(float(self.length_of_stay[idx]), dtype=torch.float32),
             'phenotype': torch.from_numpy(self.phenotype[idx].copy()),
         }
+        if self.episode_ids is not None:
+            item['episode_id'] = self.episode_ids[idx]
+        return item
