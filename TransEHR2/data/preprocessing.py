@@ -27,6 +27,39 @@ _tensorized_processor = None
 _tensorized_dims = None
 
 
+def _bucket_valued_feats(
+    valued_feats: List[str],
+    var_properties: dict
+) -> Tuple[List[str], List[str], List[str]]:
+    """Split valued features into numeric, categorical, and ordinal.
+
+    Each feature is assigned to a bucket by its 'type' in
+    variable_properties.yaml. Relative order within each bucket follows
+    the order of `valued_feats`. Both the tensor-dimension computation and
+    the DataProcessor rely on this identical logic, so the array slot for
+    a value maps back to its feature via (valued_feats order, type).
+
+    Args:
+        valued_feats: Value-associated feature names.
+        var_properties: Parsed variable_properties.yaml.
+
+    Returns:
+        Tuple of (numeric_feats, categorical_feats, ordinal_feats).
+    """
+    numeric_feats = []
+    categorical_feats = []
+    ordinal_feats = []
+    for feat in valued_feats:
+        feat_type = var_properties[feat]['type']
+        if feat_type == 'numeric':
+            numeric_feats.append(feat)
+        elif feat_type == 'categorical':
+            categorical_feats.append(feat)
+        elif feat_type == 'ordinal':
+            ordinal_feats.append(feat)
+    return numeric_feats, categorical_feats, ordinal_feats
+
+
 class LLMTextProcessor:
 
     def __init__(
@@ -146,17 +179,11 @@ class DataProcessor:
             self.var_properties = yaml.safe_load(f)
         
         # Separate valued_feats by type
-        self.numeric_feats = []
-        self.categorical_feats = []
-        self.ordinal_feats = []
-        for feat_name in valued_feats:
-            feat_type = self.var_properties[feat_name]['type']
-            if feat_type == 'numeric':
-                self.numeric_feats.append(feat_name)
-            elif feat_type == 'categorical':
-                self.categorical_feats.append(feat_name)
-            elif feat_type == 'ordinal':
-                self.ordinal_feats.append(feat_name)
+        (self.numeric_feats,
+         self.categorical_feats,
+         self.ordinal_feats) = _bucket_valued_feats(
+            valued_feats, self.var_properties
+        )
         
         self.text_feats = text_feats or []
         self.event_feats = event_feats
@@ -844,17 +871,9 @@ def _get_tensor_dimensions(
         var_properties = yaml.safe_load(f)
     
     # Separate valued_feats by type
-    numeric_feats = []
-    categorical_feats = []
-    ordinal_feats = []
-    for feat in valued_feats:
-        feat_type = var_properties[feat]['type']
-        if feat_type == 'numeric':
-            numeric_feats.append(feat)
-        elif feat_type == 'categorical':
-            categorical_feats.append(feat)
-        elif feat_type == 'ordinal':
-            ordinal_feats.append(feat)
+    numeric_feats, categorical_feats, ordinal_feats = _bucket_valued_feats(
+        valued_feats, var_properties
+    )
 
     # Get dimensions for each feature type
     numeric_feat_dims = [var_properties[f]['size'] for f in numeric_feats]
