@@ -45,7 +45,7 @@ if __name__ == "__main__":
     # In var_map, category_map is used for categorical and ordinal features. It maps integer values to category labels.
     # 'type' is 'numeric', 'categorical', 'ordinal', or 'text'. The 'numeric' type should not be confused with the
     # numeric designation of the value-associated feature table. 'type' refers to the data type of the original feature
-    # read by the MimicDataReader class's __getitem__ method during data preprocessing, and is used to determine how
+    # read by the EHRDataReader class's __getitem__ method during data preprocessing, and is used to determine how
     # the feature should be processed and what kind of loss to use during training.
     var_map = {
         # Features for numeric data tables

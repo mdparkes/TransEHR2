@@ -7,10 +7,10 @@ from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple
 
 
-class MIMICDataReader(Sequence):
-    """Base reader class for MIMIC datasets.
-    
-    Readers that extend this class will be able to read data from specific versions of the MIMIC dataset.
+class EHRDataReader(Sequence):
+    """Base reader class for EHR datasets.
+
+    Readers that extend this class will be able to read data from specific EHR datasets.
     """
 
     def __init__(

@@ -1,9 +1,9 @@
 #!/usr/bin/env python
 """
-Extract MIMIC ICU stay timeseries data from CSV files into a tensorized format optimized for 
+Extract ICU stay timeseries data from CSV files into a tensorized format optimized for
 fast data loading during model training.
 
-This function reads patient episode data using a MIMICDataReader, applies filtering criteria,
+This function reads patient episode data using an EHRDataReader, applies filtering criteria,
 processes the data into pre-allocated numpy arrays, standardizes numeric features, and saves 
 the result as a directory of memory-mappable .npy files. The output format is designed for 
 efficient multi-worker DataLoader access with minimal memory overhead.
@@ -54,8 +54,8 @@ import os
 import re
 import yaml
 
-from TransEHR2.data.datareaders import MIMICDataReader
-from TransEHR2.data.preprocessing import extract_mimic
+from TransEHR2.data.datareaders import EHRDataReader
+from TransEHR2.data.preprocessing import extract_data
 
 
 def check_for_train_test_listfiles(fold_dir: str, fold_name: str) -> None:
@@ -87,7 +87,7 @@ def skip_validation(fold_dir: str, fold_name: str) -> bool:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Extract MIMIC data directly into tensorized format for fast training"
+        description="Extract data directly into tensorized format for fast training"
     )
     parser.add_argument(
         'dataset_config',
@@ -163,7 +163,7 @@ if __name__ == "__main__":
             
             print(f"\nInitializing datareader for {fold_name}, {partition} set...")
             
-            reader = MIMICDataReader(
+            reader = EHRDataReader(
                 dataset_listfile=dataset_listfile,
                 phenotypes_listfile=phenotypes_listfile,
                 valued_feats=VALUED_FEATS,
@@ -174,7 +174,7 @@ if __name__ == "__main__":
                 n_examples=args.n_examples
             )
             
-            extract_mimic(
+            extract_data(
                 reader=reader,
                 suffix=partition,
                 output_dir=fold_dir,

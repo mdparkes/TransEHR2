@@ -18,7 +18,7 @@ from typing import Dict, Iterator, List, Optional, Tuple, Union
 
 from TransEHR2.constants import HF_API_TOKEN, LLM_NAME, MAX_TOKEN_LENGTH, TOKENIZER_PAD_TOKEN
 from TransEHR2.data.custom_types import EpisodeData, MixedTensorDataset, TensorDimensions
-from TransEHR2.data.datareaders import MIMICDataReader
+from TransEHR2.data.datareaders import EHRDataReader
 from TransEHR2.data.datasets import MixedDataset
 
 
@@ -700,7 +700,7 @@ def _init_tensorized_worker(
 
 def _process_single_episode(
     i: int,
-    reader: MIMICDataReader,
+    reader: EHRDataReader,
     max_history_len_steps: int,
     max_episode_len_steps: int,
     max_episode_len_hours: Optional[int],
@@ -715,7 +715,7 @@ def _process_single_episode(
     
     Args:
         i: Index in the reader
-        reader: MIMICDataReader instance
+        reader: EHRDataReader instance
         max_history_len_steps: Maximum historic timesteps
         max_episode_len_steps: Maximum episode timesteps
         max_episode_len_hours: Maximum hours to include
@@ -1460,8 +1460,8 @@ def get_text_counts_from_dataset_vectorized(dataset) -> np.ndarray:
     return text_counts
 
 
-def extract_mimic(
-    reader: MIMICDataReader,
+def extract_data(
+    reader: EHRDataReader,
     suffix: str,
     output_dir: str,
     var_properties_path: str,
@@ -1473,10 +1473,10 @@ def extract_mimic(
     n_workers: Optional[int] = None
 ) -> None:
     """
-    Extract MIMIC ICU stay timeseries data from CSV files into a tensorized format optimized for 
+    Extract ICU stay timeseries data from CSV files into a tensorized format optimized for
     fast data loading during model training.
 
-    This function reads patient episode data using a MIMICDataReader, applies filtering criteria,
+    This function reads patient episode data using an EHRDataReader, applies filtering criteria,
     processes the data into pre-allocated numpy arrays, standardizes numeric features, and saves 
     the result as a directory of memory-mappable .npy files. The output format is designed for 
     efficient multi-worker DataLoader access with minimal memory overhead.
@@ -1528,7 +1528,7 @@ def extract_mimic(
         using the training set statistics, which must be extracted first.
 
     Args:
-        reader (MIMICDataReader): Configured data reader for the target partition. Must have 
+        reader (EHRDataReader): Configured data reader for the target partition. Must have
             `prediction_task='all'` to include all target labels.
         suffix (str): Data partition identifier ('train', 'val', or 'test'). Determines output 
             filenames and whether to compute or load standardization statistics.
@@ -1903,8 +1903,8 @@ def prepare_dataloaders(
 ) -> List[DataLoader]:
     """Prepare training, (validation), and test DataLoaders for MixedDataset.
 
-    This function creates PyTorch DataLoader instances for `MixedDataset` objects prepared by 
-    `extract_mimic()`. The dataset uses memory-mapped numpy arrays for efficient multi-worker 
+    This function creates PyTorch DataLoader instances for `MixedDataset` objects prepared by
+    `extract_data()`. The dataset uses memory-mapped numpy arrays for efficient multi-worker
     access with minimal memory overhead. Workers share read-only memory-mapped arrays rather 
     than duplicating data in each worker process' memory space.
 
@@ -1938,7 +1938,7 @@ def prepare_dataloaders(
 
     Args:
         data_dir (str): Directory containing 'train/', 'val/', and 'test/' subdirectories. Each 
-            subdirectory should be the output of `extract_mimic()`.
+            subdirectory should be the output of `extract_data()`.
         batch_size (int): Number of samples per batch (per GPU in distributed settings).
         num_workers (int, optional): Number of worker processes for data loading. Defaults to 4.
         pin_memory (bool, optional): Whether to pin memory in DataLoader for faster GPU transfers. 
