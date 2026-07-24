@@ -101,6 +101,10 @@ class EpisodeData(NamedTuple):
         mortality: Scalar
         length_of_stay: Scalar
         phenotype: Array of shape (phenotype_dim,)
+        intime: Absolute ICU admission datetime (the index time, relative to
+            which the val_times/event_times offsets are expressed), as a
+            numpy datetime64. Saved to disk for timestamp recovery; not used
+            as model input.
     """
     idx: int
     val_len: int
@@ -122,3 +126,4 @@ class EpisodeData(NamedTuple):
     mortality: float
     length_of_stay: float
     phenotype: 'np.ndarray'
+    intime: 'np.datetime64'

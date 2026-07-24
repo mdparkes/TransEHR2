@@ -733,6 +733,15 @@ def _process_single_episode(
             ['mortality', 'length_of_stay', 'phenotype'],
             [np.array(t) for t in targets]
         ))
+
+        # Absolute index time (ICU INTIME) for this episode, for timestamp
+        # recovery. stays.csv is sorted by INTIME, so the episode number
+        # indexes it the same way targets are read (see get_stays_data).
+        stays_data = reader.get_stays_data(i)
+        episode_number = reader.episode_numbers[i]
+        intime = pd.to_datetime(
+            stays_data['INTIME'].iloc[episode_number - 1]
+        ).to_datetime64()
         
         # Apply filtering criteria
         if min_episode_len_hours is not None:
@@ -827,7 +836,8 @@ def _process_single_episode(
             static_data=static_arr,
             mortality=float(targets['mortality']),
             length_of_stay=float(los),
-            phenotype=targets['phenotype'].astype(np.float32)
+            phenotype=targets['phenotype'].astype(np.float32),
+            intime=intime
         )
         
     except Exception as e:
@@ -1682,8 +1692,10 @@ def extract_data(
     sys.stdout.flush()
     
     valid_ids = []
+    intimes = []
     for out_idx, ep in enumerate(tqdm(results, desc="Building arrays")):
         valid_ids.append(reader.patient_episode_ids[ep.idx])
+        intimes.append(ep.intime)
         val_len = ep.val_len
         val_hist = ep.val_history_len
         val_ep = val_len - val_hist
@@ -1879,14 +1891,22 @@ def extract_data(
     
     output_path = os.path.join(output_dir, f'{suffix}')
     save_dataset(dataset, output_path)
-    
+
     # Also save IDs for reference
     ids_path = os.path.join(output_dir, f'{suffix}_ids.pkl')
     with open(ids_path, 'wb') as f:
         pickle.dump(valid_ids, f)
-    
+
+    # Save absolute index times (ICU INTIME) row-aligned with the input
+    # arrays, for timestamp recovery. Not loaded by load_dataset / used as
+    # model input; absolute event times are index_times[:, None] + times * 1h.
+    index_times = np.array(intimes, dtype='datetime64[ns]')
+    index_times_path = os.path.join(output_path, 'index_times.npy')
+    np.save(index_times_path, index_times)
+
     print(f"Tensorized {suffix} data saved to {output_path}")
-    print(f"Episode IDs saved to {ids_path}\n")
+    print(f"Episode IDs saved to {ids_path}")
+    print(f"Index times saved to {index_times_path}\n")
 
 
 def prepare_dataloaders(
