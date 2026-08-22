@@ -36,6 +36,7 @@ venv.bak/
 # ======================
 # IDE / Editor
 # ======================
+.claude/
 .idea/
 .vscode/
 *.swp
