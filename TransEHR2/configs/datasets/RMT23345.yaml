@@ -1,0 +1,188 @@
+# MIMIC-IV Dataset Configuration
+# Configuration file for extracting and preprocessing MIMIC-IV data
+
+# Data directory containing fold subdirectories with CSV listfiles
+DATA_DIR: "/uhome/pr3/projects/p60290_2/TransEHR2-IBDreadmission/data"
+
+# Path to variable properties YAML file
+VARIABLE_PROPERTIES_PATH: "/uhome/pr3/projects/p60290_2/TransEHR2-IBDreadmission/data/variable_properties.yaml"
+
+# Feature definitions
+VALUED_FEATS:
+  - TRIAGECODE
+  - INST
+  - INSTFROM
+  - INSTTO
+  - INST_ZONE
+  - INSTFROM_ZONE
+  - INSTTO_ZONE
+  - ADMITBYAMB
+  - ABSTRACT_TYPE
+  - ADMITCAT
+  - ACUTE_DAYS
+  - CMG
+  - RIW
+  - ACR
+  - AGAP
+  - ALB
+  - ALP
+  - ALT
+  - AST
+  - ATTG
+  - B12
+  - BA
+  - "BA#"
+  - BILD
+  - BILI
+  - BILUR
+  - BILT
+  - BLDUA
+  - CA
+  - CAI
+  - CBIL
+  - CHDLR
+  - CHOL
+  - CK
+  - CL
+  - CMVABG
+  - CO2
+  - COHB
+  - CREA
+  - CREUR
+  - CRP
+  - CRPHS
+  - CRPQN
+  - EBVCG
+  - EO
+  - "EO#"
+  - ESR
+  - FAST
+  - FERR
+  - FOL
+  - GFRE
+  - GGT
+  - GLUF
+  - GLUR
+  - GLUUA
+  - GRIMM
+  - "GRIMM#"
+  - HAVG
+  - HAVM
+  - HBA1C
+  - HBCABM
+  - HBCABT
+  - HBDNA
+  - HBSAB
+  - HBSAG
+  - HCT
+  - HCVAB
+  - HCVRNA
+  - HDL
+  - HGB
+  - HIVSR
+  - HPC
+  - IGA
+  - IGRA
+  - INR
+  - IRON
+  - K
+  - KETOUA
+  - LD
+  - LDL
+  - LEUKUA
+  - LIPA
+  - LPTT
+  - LY
+  - "LY#"
+  - MCH
+  - MCHC
+  - MCV
+  - METHG
+  - MG
+  - MO
+  - "MO#"
+  - MPABG
+  - MSABG
+  - MYE
+  - "MYE#"
+  - "NA"
+  - NE
+  - "NE#"
+  - NITUA
+  - NRBC
+  - OCB
+  - PGLU
+  - PHOS
+  - PHUA
+  - PLT
+  - PLTE
+  - PROTUA
+  - PSA
+  - RABG
+  - RBC
+  - RDW
+  - SATN
+  - SGUA
+  - SSIGG
+  - T4F
+  - TIBC
+  - TP
+  - TRIG
+  - TROP
+  - TSAT
+  - TSH
+  - UASC
+  - UBAC
+  - UCLAR
+  - UCOLR
+  - UEPI
+  - UIBC
+  - URA
+  - URBC
+  - UREA
+  - UROUA
+  - UWBC
+  - VITA
+  - VITD25
+  - VZABG
+  - WBBE
+  - WBC
+  - DRUG_INDUCTION_MAINTENANCE
+  - DRUG_STRD_FLARE_DOSE
+  - AGE
+  - SCU
+  - SEX
+  - Rural
+  - ZONE_NAME
+  - QUINTMAT
+  - QUINTSOC
+
+EVENT_FEATS:
+  - ADMIT_DAD
+
+TEXT_FEATS:
+  - TEXT_SUPERFEATURE
+
+# N.B. DRUG_FEATS is reserved for the drug embedding features because it requires special handling in the data preprocessing pipeline. Other drug-related features, such as DRUG_INDUCTION_MAINTENANCE and DRUG_STRD_FLARE_DOSE, are handled as VALUED_FEATS.
+DRUG_FEATS:
+  - DRUG
+
+STATIC_FEATS: []
+
+
+# Data preprocessing parameters
+# Maximum number of timesteps per episode
+MAX_EPISODE_LEN_STEPS: 500
+
+# Maximum number of timesteps in patient history
+MAX_HISTORY_LEN_STEPS: 500
+
+# Minimum episode length in timesteps for inclusion
+MIN_EPISODE_LEN_STEPS: 1
+
+# Minimum episode length in hours for inclusion
+MIN_EPISODE_LEN_HOURS: 48
+
+# Maximum episode length in hours for inclusion
+MAX_EPISODE_LEN_HOURS: 48
+
