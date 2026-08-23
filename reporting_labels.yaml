@@ -1,0 +1,26 @@
+# Column headings for the manuscript tables, keyed by experiment number.
+#
+# Headings are written in sentence case, as JMIR requires, with acronyms
+# and model sizes left capitalised. Override with --labels PATH.
+#
+# Experiment descriptions (see experiment_descriptions.md):
+#   1  History, no text, full dataset
+#   2  History, text, full dataset, 1B LLM
+#   3  No history, full dataset, 1B LLM (control 1)
+#   4  History, no text, discharge summary subset
+#   5  History, text, discharge summary subset, 1B LLM
+#   6  No history, discharge summary subset
+#   7  History, text, full dataset, 70B LLM
+#   8  History, text, full dataset, 70B LLM, bigger encoders (not used)
+#   9  History only, text, full dataset, 1B LLM (control 2)
+
+columns:
+  1: "Historical + in-stay records, no text features, 1B parameter LLM"
+  2: "Historical + in-stay records, text features, 1B parameter LLM"
+  3: "In-stay records only, 1B parameter LLM"
+  4: "Historical + in-stay records, no text features, 1B parameter LLM"
+  5: "Historical + in-stay records, text features, 1B parameter LLM"
+  6: "In-stay records only, 1B parameter LLM"
+  7: "Historical + in-stay records, text features, 70B parameter LLM"
+  8: "Historical + in-stay records, text features, 70B parameter LLM, larger encoders"
+  9: "Historical records only, text features, 1B parameter LLM"
