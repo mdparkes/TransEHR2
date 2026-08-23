@@ -103,6 +103,9 @@ misc/
 # Development notes
 notes.md
 
+# Claude Code local settings, skills, and worktrees
+.claude/
+
 # PyTorch / Training artifacts
 *.pt
 *.pth
