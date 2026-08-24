@@ -1,104 +1,117 @@
 #!/usr/bin/env python
-"""
-Extract ICU stay timeseries data from CSV files into a tensorized format optimized for
-fast data loading during model training.
+"""Extract the cohort's episodes into ``data/extracted/`` (section 4).
 
-This function reads patient episode data using an EHRDataReader, applies filtering criteria,
-processes the data into pre-allocated numpy arrays, standardizes numeric features, and saves 
-the result as a directory of memory-mappable .npy files. The output format is designed for 
-efficient multi-worker DataLoader access with minimal memory overhead.
+Runs **once for the cohort**, not once per fold and not once per
+partition. The row order is ``labels.csv``'s -- patient directories
+lexicographically, then ``STAY_INDEX`` -- and section 3's folds are
+``int64`` row indices into the arrays this writes, so the row count is
+fixed by ``labels.csv`` and no episode may be filtered out.
 
-The extraction pipeline operates in two passes:
-    1. **Filtering pass**: Episodes are processed in parallel to apply inclusion criteria 
-        (minimum length, minimum timesteps) and extract raw data.
-    2. **Insertion pass**: Surviving episodes are inserted into pre-allocated arrays and 
-        text features are converted to sparse storage format.
+Inputs, all named by the dataset config:
 
-Output Structure:
-    The function creates a directory at `{output_dir}/{suffix}/` containing:
-    
-    * Dense arrays (one .npy file each):
-        - `val_times.npy`: (n_episodes, max_ts_len) float32 - Timestamps in hours
-        - `val_masks.npy`: (n_episodes, max_ts_len) float32 - Valid timestep indicators
-        - `val_numeric_indicators.npy`: (n_episodes, max_ts_len, n_numeric_feats) float32
-        - `val_categorical_indicators.npy`: (n_episodes, max_ts_len, n_cat_feats) float32
-        - `val_text_indicators.npy`: (n_episodes, max_ts_len, n_text_feats) float32
-        - `event_times.npy`: (n_episodes, max_ts_len) float32
-        - `event_masks.npy`: (n_episodes, max_ts_len) float32
-        - `event_indicators.npy`: (n_episodes, max_ts_len, n_event_feats) float32
-        - `static_data.npy`: (n_episodes, static_total_dim) float32
-        - `mortality.npy`: (n_episodes,) float32
-        - `length_of_stay.npy`: (n_episodes,) float32
-        - `phenotype.npy`: (n_episodes, n_phenotypes) float32
-    
-    * Per-feature arrays:
-        - `val_numeric_values_{i}.npy`: (n_episodes, max_ts_len, feat_dim) float32
-        - `val_categorical_values_{i}.npy`: (n_episodes, max_ts_len, feat_dim) int64
-    
-    * Sparse text arrays (CSR-style storage for memory efficiency):
-        - `val_text_offsets_{i}.npy`: (n_episodes + 1,) int64 - CSR row pointers
-        - `val_text_values_{i}.npy`: (n_non_empty, token_len) int64 - Token IDs
-        - `val_text_masks_{i}.npy`: (n_non_empty, token_len) float32 - Attention masks
-        - `val_text_timesteps_{i}.npy`: (n_non_empty,) int32 - Original timestep indices
-    
-    * Metadata:
-        - `metadata.pkl`: Dictionary containing dimension information for reconstruction
-    
-    Additionally creates:
-        - `{suffix}_ids.pkl`: List of patient episode IDs that passed filtering
-        - `summary_statistics_train.npz`: (train only) Standardization parameters.
+    {DATA_DIR}/root/{PATID}/{stays,timeseries,drugs}.csv   Stage B
+    {DATA_DIR}/labels.csv                                  Stage B'
+    {DATA_DIR}/fold{i}/fold{i}_train_rows.npy              split.py
+    VARIABLE_PROPERTIES_PATH, CLINVEC_PATH
+
+Output is ``{DATA_DIR}/extracted/``, whose contract is section 4.4:
+
+    Dense, per episode (n episodes, T = MAX_EPISODE_LEN_STEPS):
+        val_times.npy                (n, T)      int32, minutes <= 0
+        val_masks.npy                (n, T)      float32
+        val_numeric_indicators.npy   (n, T, 94)  float32
+        val_numeric_values_{i}.npy   (n, T, 1)   float32
+        val_categorical_indicators.npy (n, T, 37) float32
+        val_categorical_values_{i}.npy (n, T)    int16 index, -1 sentinel
+        val_ordinal_indicators.npy   (n, T, 16)  float32
+        val_ordinal_values_{i}.npy   (n, T)      int16 index
+        val_text_indicators.npy      (n, T, 1)   float32
+        val_drug_indicators.npy      (n, T, 1)   float32
+        event_indicators.npy         (n, T, 1)   float32
+        event_times.npy              (n, T)      int32
+        event_masks.npy              (n, T)      float32
+        index_times.npy              (n,)        datetime64[ns]
+        time_to_event.npy            (n,)        float32
+        event_type.npy               (n,)        int8
+
+    Sparse text and drugs, CSR over the non-empty timesteps:
+        text_offsets_{i}.npy   (n+1,)          int64
+        text_timesteps_{i}.npy (n_nonempty,)   int32
+        text_values_{i}.npy    (n_nonempty,)   int32 row in the table
+        drug_offsets_{i}.npy   (n+1,)          int64
+        drug_timesteps_{i}.npy (n_nonempty,)   int32
+        drug_values_{i}.npy    (n_nonempty,30) int32, right-padded with V
+        drug_doses_{i}.npy     (n_nonempty,30) float32, 0 on pad
+        drug_masks_{i}.npy     (n_nonempty,30) float32, 1 real 0 pad
+
+    Metadata:
+        metadata.pkl, episode_ids.pkl, text_strings.pkl,
+        summary_statistics_fold{i}.npz
+
+There is **no** ``static_data.npy``: ``STATIC_FEATS`` is empty under
+section A.3, so the array would be ``(n, 0)``.
+
+``text_strings.pkl`` is the unique-string table's key order, assigned here
+because section 9 makes neither C1 nor C4 depend on the other; C4's
+``embed_text.py`` embeds that list *in that order*, which is what makes
+``text_values`` valid indices into ``text_embeddings.npy``.
 """
 
 import argparse
+import numpy as np
 import os
 import re
+import sys
 import yaml
 
 from TransEHR2.data.datareaders import EHRDataReader
-from TransEHR2.data.preprocessing import extract_data
+from TransEHR2.data.preprocessing import (
+    _bucket_valued_feats, check_feature_contract, extract_data
+)
 
 
-def check_for_train_test_listfiles(fold_dir: str, fold_name: str) -> None:
-    """Verify that required listfiles exist for a fold."""
-    for partition in ['train', 'test']:
-        dataset_listfile = os.path.join(fold_dir, f'{fold_name}_{partition}.csv')
-        phenotypes_listfile = os.path.join(fold_dir, f'phenotyping_{partition}_listfile.csv')
-        if not os.path.exists(dataset_listfile):
-            raise FileNotFoundError(f"Missing listfile {dataset_listfile}")
-        if not os.path.exists(phenotypes_listfile):
-            raise FileNotFoundError(f"Missing listfile {phenotypes_listfile}")
+def find_fold_train_rows(data_dir: str) -> dict:
+    """Collect ``fold{i}_train_rows.npy`` from each ``fold{i}/``.
+
+    One set of standardization statistics per fold, computed over that
+    fold's *training* rows alone -- statistics over the whole cohort would
+    leak val and test into the scaling (section 5).
+    """
+    fold_train_rows = {}
+    if not os.path.isdir(data_dir):
+        return fold_train_rows
+    for item in sorted(os.listdir(data_dir)):
+        if not re.fullmatch(r'fold\d+', item):
+            continue
+        rows_path = os.path.join(data_dir, item, f'{item}_train_rows.npy')
+        if os.path.exists(rows_path):
+            fold_train_rows[item] = np.load(rows_path)
+        else:
+            print(f"  {item}/ has no {item}_train_rows.npy; no "
+                  f"summary_statistics_{item}.npz will be written.")
+    return fold_train_rows
 
 
-def skip_validation(fold_dir: str, fold_name: str) -> bool:
-    """Check if validation listfiles are missing (validation is optional)."""
-    dataset_listfile = os.path.join(fold_dir, f'{fold_name}_val.csv')
-    phenotypes_listfile = os.path.join(fold_dir, f'phenotyping_val_listfile.csv')
-    skip = False
-    if not os.path.exists(dataset_listfile):
-        print(f"  Missing validation dataset listfile {dataset_listfile}.")
-        skip = True
-    if not os.path.exists(phenotypes_listfile):
-        print(f"  Missing validation phenotypes listfile {phenotypes_listfile}.")
-        skip = True
-    if skip:
-        print("  Skipping validation set.\n")
-    return skip
-
-
-if __name__ == "__main__":
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
-        description="Extract data directly into tensorized format for fast training"
+        description="Extract the cohort into data/extracted/ (section 4)"
     )
     parser.add_argument(
         'dataset_config',
         type=str,
-        help="YAML file specifying dataset parameters (e.g., mimic4.yaml)"
+        help="YAML file specifying dataset parameters (RMT23345.yaml)"
+    )
+    parser.add_argument(
+        '--data_dir', '-d',
+        type=str,
+        default=None,
+        help="Override the config's DATA_DIR, e.g. to run over a fixture"
     )
     parser.add_argument(
         '--n_examples', '-n',
         type=int,
         default=None,
-        help="Number of examples to process per partition (for debugging)"
+        help="Extract only the first N rows of labels.csv (debugging)"
     )
     parser.add_argument(
         '--n_workers', '-w',
@@ -106,87 +119,93 @@ if __name__ == "__main__":
         default=1,
         help="Number of parallel worker processes (default: 1)"
     )
-    parser.add_argument(
-        '--folds',
-        type=str,
-        nargs='*',
-        default=None,
-        help="Specific folds to process (default: all folds)"
-    )
-    args = parser.parse_args()
-    
-    # Load dataset configuration
+    args = parser.parse_args(argv)
+
     with open(args.dataset_config, 'r') as f:
         config = yaml.safe_load(f)
-    
-    DATA_DIR = config['DATA_DIR']
+
+    DATA_DIR = args.data_dir or config['DATA_DIR']
     VAR_PROPERTIES_PATH = config['VARIABLE_PROPERTIES_PATH']
+    CLINVEC_PATH = config.get('CLINVEC_PATH')
     VALUED_FEATS = config['VALUED_FEATS']
     EVENT_FEATS = config['EVENT_FEATS']
-    TEXT_FEATS = config.get('TEXT_FEATS', None)
-    STATIC_FEATS = config['STATIC_FEATS']
+    TEXT_FEATS = config.get('TEXT_FEATS') or []
+    DRUG_FEATS = config.get('DRUG_FEATS') or []
+    STATIC_FEATS = config.get('STATIC_FEATS') or []
     MAX_EPISODE_LEN_STEPS = config.get('MAX_EPISODE_LEN_STEPS', 500)
-    MAX_HISTORY_LEN_STEPS = config.get('MAX_HISTORY_LEN_STEPS', 0)
-    MIN_EPISODE_LEN_STEPS = config.get('MIN_EPISODE_LEN_STEPS', 10)
-    MIN_EPISODE_LEN_HOURS = config.get('MIN_EPISODE_LEN_HOURS', 48)
-    MAX_EPISODE_LEN_HOURS = config.get('MAX_EPISODE_LEN_HOURS', 48)
-    
-    # Find fold directories
-    if args.folds:
-        fold_names = args.folds
+    MIN_EPISODE_LEN_STEPS = config.get('MIN_EPISODE_LEN_STEPS', 1)
+
+    with open(VAR_PROPERTIES_PATH, 'r') as f:
+        var_properties = yaml.safe_load(f)
+
+    # Invariant 12, before a single patient file is opened (section 6).
+    # The category_map clause used to fire mid-extraction, on real data,
+    # hours in (section A.3).
+    failures = check_feature_contract(config, var_properties)
+    if failures:
+        print("FAIL -- the feature contract does not hold (invariant 12):")
+        for failure in failures:
+            print(f"  {failure}")
+        return 1
+
+    numeric_feats, categorical_feats, ordinal_feats, _ = (
+        _bucket_valued_feats(
+            VALUED_FEATS, TEXT_FEATS + DRUG_FEATS, var_properties
+        )
+    )
+    print(f"Feature contract holds: {len(numeric_feats)} numeric, "
+          f"{len(categorical_feats)} categorical, "
+          f"{len(ordinal_feats)} ordinal.")
+
+    # Every categorical, ordinal and text column is read as a string.
+    # category_map is keyed on the YAML's values and BLDUA's levels are
+    # numeric-looking strings, so a column pandas typed as numeric would
+    # miss every one of them, silently and per patient (section 5).
+    string_feats = categorical_feats + ordinal_feats + TEXT_FEATS
+
+    labels_path = os.path.join(DATA_DIR, 'labels.csv')
+    root_dir = os.path.join(DATA_DIR, 'root')
+    for path in (labels_path, root_dir):
+        if not os.path.exists(path):
+            print(f"{path} not found. Run IBDdataprep's build_root.py and "
+                  f"build_labels.py first.")
+            return 1
+
+    reader = EHRDataReader(
+        labels_path=labels_path,
+        root_dir=root_dir,
+        valued_feats=VALUED_FEATS,
+        event_feats=EVENT_FEATS,
+        text_feats=TEXT_FEATS,
+        drug_feats=DRUG_FEATS,
+        static_feats=STATIC_FEATS,
+        string_feats=string_feats,
+        n_examples=args.n_examples
+    )
+
+    fold_train_rows = find_fold_train_rows(DATA_DIR)
+    if fold_train_rows:
+        print(f"Standardization statistics for: "
+              f"{sorted(fold_train_rows)}")
     else:
-        fold_names = []
-        for item in os.listdir(DATA_DIR):
-            if re.match(r'fold\d+', item) and os.path.isdir(os.path.join(DATA_DIR, item)):
-                fold_names.append(item)
-        fold_names.sort()
-    
-    print(f"Found {len(fold_names)} fold(s) to process: {fold_names}")
-    print(f"Using {args.n_workers} worker(s)\n")
-    
-    # Process each fold
-    for fold_name in fold_names:
-        fold_dir = os.path.join(DATA_DIR, fold_name)
-        
-        print(f"{'='*60}")
-        print(f"Processing {fold_name}")
-        print(f"{'='*60}")
-        
-        check_for_train_test_listfiles(fold_dir, fold_name)
-        
-        for partition in ['train', 'test', 'val']:
-            if partition == 'val' and skip_validation(fold_dir, fold_name):
-                continue
-            
-            dataset_listfile = os.path.join(fold_dir, f'{fold_name}_{partition}.csv')
-            phenotypes_listfile = os.path.join(fold_dir, f'phenotyping_{partition}_listfile.csv')
-            
-            print(f"\nInitializing datareader for {fold_name}, {partition} set...")
-            
-            reader = EHRDataReader(
-                dataset_listfile=dataset_listfile,
-                phenotypes_listfile=phenotypes_listfile,
-                valued_feats=VALUED_FEATS,
-                event_feats=EVENT_FEATS,
-                static_feats=STATIC_FEATS,
-                text_feats=TEXT_FEATS,
-                prediction_task='all',
-                n_examples=args.n_examples
-            )
-            
-            extract_data(
-                reader=reader,
-                suffix=partition,
-                output_dir=fold_dir,
-                var_properties_path=VAR_PROPERTIES_PATH,
-                max_episode_len_steps=MAX_EPISODE_LEN_STEPS,
-                max_history_len_steps=MAX_HISTORY_LEN_STEPS,
-                min_episode_len_steps=MIN_EPISODE_LEN_STEPS,
-                min_episode_len_hours=MIN_EPISODE_LEN_HOURS,
-                max_episode_len_hours=MAX_EPISODE_LEN_HOURS,
-                n_workers=args.n_workers
-            )
-    
-    print(f"\n{'='*60}")
-    print("Extraction complete!")
-    print(f"{'='*60}")
+        print("No fold{i}/fold{i}_train_rows.npy found; no "
+              "standardization statistics will be written.")
+    sys.stdout.flush()
+
+    extract_data(
+        reader=reader,
+        output_dir=DATA_DIR,
+        var_properties_path=VAR_PROPERTIES_PATH,
+        max_episode_len_steps=MAX_EPISODE_LEN_STEPS,
+        clinvec_path=CLINVEC_PATH,
+        min_episode_len_steps=MIN_EPISODE_LEN_STEPS,
+        n_workers=args.n_workers,
+        fold_train_rows=fold_train_rows
+    )
+
+    print("\nExtraction complete.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

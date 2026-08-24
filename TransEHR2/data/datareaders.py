@@ -1,246 +1,314 @@
+"""Reads the per-patient artifacts Stage B writes (sections 2.5-2.7, 5).
+
+Readings this module commits to
+-------------------------------
+
+* **The reader is indexed by patient, not by episode** (section 4.1). One
+  ``timeseries.csv`` read and parse serves every episode of that patient,
+  and a patient's episodes differ only in where their window ends. The
+  insertion pass puts the results back in ``labels.csv`` order, so the
+  canonical order survives the reordering that parallelism imposes.
+* **``labels.csv`` supplies the row order and the targets; ``stays.csv``
+  supplies ``INDEX_TIME``** (section 3, B4). The file's own row order is
+  canonical -- patient directories lexicographically, then ``STAY_INDEX``
+  -- so ``time_to_event.npy``, ``event_type.npy`` and ``episode_ids.pkl``
+  are columns of it rather than a second derivation. ``INDEX_TIME`` is the
+  one thing section 3 leaves out of ``labels.csv``, so it is looked up in
+  ``stays.csv`` on ``(PATID, STAY_INDEX)`` -- in labels order, never in
+  stays order.
+* **Categorical, ordinal and text columns are read as strings** (section
+  5's dtype trap). ``category_map`` is keyed on the YAML's values, and
+  ``BLDUA``'s declared levels are numeric-looking *strings* (``"0"``,
+  ``"1-24"``, ...). A patient whose ``BLDUA`` column happens to hold only
+  ``0`` and blanks is read by pandas as a numeric column, and
+  ``0.0 in {"0": 0, ...}`` is ``False`` -- a data-dependent, per-patient,
+  silent miss. Forcing the dtype is half the fix; ``str(value)`` at the
+  lookup is the other half (see ``preprocessing``).
+* **The empty string is the only missing marker.** Stage B writes every
+  CSV with ``na_rep=""``, so ``keep_default_na`` is switched off and
+  ``na_values`` is ``['']``. Pandas' default NA strings include ``'None'``,
+  which is ``UBAC``'s declared level 0 -- urine bacteria, none seen --
+  so under the defaults that level is unobservable, its indicator 0 on
+  every timestep it was actually measured. It is the same family as the
+  ``BLDUA`` trap above and the only declared level currently exposed:
+  scanning every ``categorical`` and ``ordinal`` ``category_map`` against
+  ``pandas._libs.parsers.STR_NA_VALUES`` returns ``UBAC`` alone.
+* **Rows are not dropped from the value stream.** Section 2.6 writes one
+  row per distinct minute, and a row carrying only text or only a
+  dispensation is still a timestep -- section 2.7 says so explicitly, and
+  invariant 4 requires every ``drugs.csv`` timestamp to name a
+  ``timeseries.csv`` row. Only the *event* stream is thinned to the rows
+  that carry an event, which is what makes it a separate stream.
+* **``DRUG_FEATS`` has no timeseries column** (section 2.6), so drugs reach
+  the extractor through ``drugs.csv`` alone, joined on ``TIMESTAMP``. The
+  reader therefore hands back text columns and drug rows separately even
+  though section 4.3 stores them as one family; the asymmetry is in the
+  source, not in the storage.
+"""
+
+import numpy as np
 import os
 import pandas as pd
 import re
 
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Callable, List, Optional, Tuple
+from typing import List, Optional, Tuple
+
+# Written by IBDdataprep's build_labels.py (section 3).
+LABELS_COLUMNS = ('PATID', 'STAY_INDEX', 'TIME_TO_EVENT', 'EVENT_TYPE')
+
+TIMESTAMP_COLUMN = 'TIMESTAMP'
+STAYS_FILE = 'stays.csv'
+TIMESERIES_FILE = 'timeseries.csv'
+DRUGS_FILE = 'drugs.csv'
 
 
 class EHRDataReader(Sequence):
-    """Base reader class for EHR datasets.
+    """Reads ``{root_dir}/{PATID}/`` for one patient at a time.
 
-    Readers that extend this class will be able to read data from specific EHR datasets.
+    Indexing the reader yields everything needed to extract every episode
+    of one patient: the episode rows in canonical order, the patient's
+    whole timeseries, and their dispensations.
     """
 
     def __init__(
         self,
-        dataset_listfile: str,
+        labels_path: str,
+        root_dir: str,
         valued_feats: List[str],
         event_feats: List[str],
-        static_feats: List[str],
         text_feats: Optional[List[str]] = None,
-        prediction_task: Optional[str] = 'all',
-        phenotypes_listfile: Optional[str] = None,
-        get_target_data: Optional[Callable] = None,
+        drug_feats: Optional[List[str]] = None,
+        static_feats: Optional[List[str]] = None,
+        string_feats: Optional[List[str]] = None,
         n_examples: Optional[int] = None
     ):
-        """Initialize the reader class.
-        
-        During initialization, the reader will read episode information from the dataset listfile and verify that all 
-        patient IDs are present in the data directory. Patient-episode IDs are constructed as {pt_id}xxx, where xxx is 
-        the episode number left-padded with zeros (max 3 digits).
+        """Initialize the reader.
 
         Args:
-            dataset_listfile (str): Path to a CSV file containing episode file paths, patient IDs, and episode numbers.
-            valued_feats (List[str]): A list of names of value-associated feature to extract from patient records.
-            event_feats (List[str]): A list of names of event-associated features to extract from patient records.
-            static_feats (List[str]): A list of names of static features to extract from patient records.
-            prediction_task (Optional[str]): The prediction task the dataset will be used for. If the task is 
-                'mortality', 'length_of_stay', or 'phenotype', the target data will be extracted using the appropriate 
-                method. Otherwise, the user-defined method `self.get_target_data` will be called.
-            get_target_data (Optional[Callable]): A user-defined method for extracting target data. This method should
-                take an index as input and return the target data for that index. If `prediction_task` is not None, this
-                method will be ignored.
-            phenotypes_listfile (Optional[str]): Path to a CSV file containing phenotype data for patients. This file is
-                created by running the `create_phenotypes.py`. If this file is not provided and `prediction_task` is 
-                'phenotype' or 'all', an exception will be raised.
+            labels_path: ``labels.csv`` from ``build_labels.py``. Its row
+                order is the canonical episode order (section 3).
+            root_dir: Directory holding one subdirectory per ``PATID``.
+            valued_feats: Value-associated feature names.
+            event_feats: Event-associated feature names.
+            text_feats: Text feature names (may be None or empty).
+            drug_feats: Drug feature names. Carried for the lookup family
+                (section 4.3), not used to select columns: section 2.6
+                gives ``DRUG_FEATS`` no ``timeseries.csv`` column, so the
+                data comes from ``drugs.csv``.
+            static_feats: Static feature names. ``STATIC_FEATS`` is empty
+                under section A.3; the path is kept, not exercised.
+            string_feats: Feature names whose column must be read as
+                strings -- every categorical and ordinal feature, plus the
+                text features. See the dtype trap above.
+            n_examples: Read only the first N rows of ``labels.csv``, for
+                debugging. Episodes, not patients: the patient set follows
+                from the rows kept.
         """
 
         super().__init__()
 
-        if prediction_task in ['phenotype', 'all']:
-            if phenotypes_listfile is None:
-                raise ValueError("phenotypes_listfile must be provided if prediction_task is 'phenotype' or 'all'.")
-            if not os.path.exists(phenotypes_listfile):
-                raise FileNotFoundError(f"Phenotypes listfile not found: {phenotypes_listfile}")
-            self.phenotypes_listfile = phenotypes_listfile
-        else:
-            self.phenotypes_listfile = None
-        
-        self.dataset_listfile = dataset_listfile
-        self.episode_file_paths = []
-        self.patient_ids = []
-        self.episode_numbers = []
-        self.patient_episode_ids = []
-        # Load the dataset file in a single operation
-        if n_examples is not None:
-            dataset_df = pd.read_csv(dataset_listfile, nrows=n_examples)
-        else:
-            dataset_df = pd.read_csv(dataset_listfile)
-        self.episode_file_paths = dataset_df.iloc[:, 0].tolist()  # First column: file paths
-        self.patient_ids = dataset_df.iloc[:, 1].astype(int).tolist()  # Second column: patient IDs
-        self.episode_numbers = dataset_df.iloc[:, 2].astype(int).tolist()  # Third column: episode numbers
-        # Calculate patient_episode_ids using vectorized operations
-        self.patient_episode_ids = [pid * 1000 + enum for pid, enum in zip(self.patient_ids, self.episode_numbers)]
-        self.data_root_path = os.path.commonpath(self.episode_file_paths)
+        self.labels_path = labels_path
+        self.root_dir = str(root_dir)
         self.valued_feats = valued_feats
         self.event_feats = event_feats
-        self.static_feats = static_feats
-        self.text_feats = text_feats
-        self.prediction_task = prediction_task
-        if get_target_data is not None:
-            self.get_target_data = get_target_data
-        
-        self._validate_patient_ids()  # Verify that all patient_ids are in data_root_path
+        self.text_feats = text_feats or []
+        self.drug_feats = drug_feats or []
+        self.static_feats = static_feats or []
+        self.string_feats = string_feats or []
 
-    @staticmethod
-    def get_pt_id_from_episode_id(episode_id: int) -> int:
-        """Return the patient ID from a patient-episode ID."""
-        return int(episode_id // 1e3)
+        labels = pd.read_csv(
+            labels_path,
+            nrows=n_examples,
+            dtype={'PATID': int, 'STAY_INDEX': int, 'EVENT_TYPE': int},
+        )
+        missing = [c for c in LABELS_COLUMNS if c not in labels.columns]
+        if missing:
+            raise ValueError(
+                f"{labels_path} is missing column(s) {missing}; it should "
+                f"be the output of IBDdataprep's build_labels.py"
+            )
+        # The row number *is* the output row. Recorded now, because the
+        # per-patient grouping below reorders nothing but must not be
+        # mistaken for the canonical order.
+        labels = labels.reset_index(drop=True)
+        labels['ROW'] = np.arange(len(labels), dtype=np.int64)
+        self.labels = labels
 
-    def get_stays_data(self, index: int) -> pd.DataFrame:
-        """Load the patient's stay.csv data sorted by ICU INTIME"""
-        pt_id = self.patient_ids[index]
-        stay_data_path = Path(self.data_root_path) / str(pt_id) / 'stays.csv'
-        stays_data = pd.read_csv(stay_data_path)
-        stays_data = stays_data.sort_values('INTIME', ascending=True).reset_index(drop=True)
-        return stays_data
+        # First-appearance order, which is lexicographic by construction of
+        # labels.csv. Used only to schedule work; output order is 'ROW'.
+        self.patient_ids = list(dict.fromkeys(labels['PATID'].tolist()))
+        self._episodes_by_patient = {
+            patid: frame for patid, frame in labels.groupby('PATID')
+        }
 
-    def get_mortality_target_data(self, index: int) -> int:
-        """Get the in-hospital mortality status for a patient episode. If 1, patient died in hospital."""
-        stays_data = self.get_stays_data(index)
-        i = self.episode_numbers[index]
-        mortality_status = stays_data['MORTALITY_INHOSPITAL'].iloc[i - 1]
-        return mortality_status
+        self._validate_patient_ids()
 
-    def get_length_of_stay_target_data(self, index: int) -> float:
-        """Get the length of stay in hours for a patient episode."""
-        stays_data = self.get_stays_data(index)
-        i = self.episode_numbers[index]
-        length_of_stay = stays_data['LOS'].iloc[i - 1] * 24  # Convert days to hours
-        return length_of_stay
+    def __len__(self) -> int:
+        """Return the number of patients."""
+        return len(self.patient_ids)
 
-    def get_phenotype_target_data(self, index: int) -> List[int]:
-        """Get the phenotype target data for a patient episode."""
+    @property
+    def n_episodes(self) -> int:
+        """Number of rows in ``labels.csv``, i.e. output rows."""
+        return len(self.labels)
 
-        pheno_data = pd.read_csv(self.phenotypes_listfile, index_col=0)
-        pheno_data = pheno_data.drop(columns=['period_length'])  # Length of stay is not needed for phenotyping
-        
-        pt_id =self.patient_ids[index]
-        i = self.episode_numbers[index]
+    def patient_dir(self, patid: int) -> Path:
+        return Path(self.root_dir) / str(patid)
 
-        for file_path in pheno_data.index:
-            if str(pt_id) in file_path and f'episode{i}' in file_path:
-                return pheno_data.loc[file_path].astype(int).tolist()
-        
-        raise ValueError(f"Phenotype data not found for patient ID {pt_id} and episode number {i}.")
+    def get_episodes(self, patid: int) -> pd.DataFrame:
+        """Episode rows for one patient, with ``INDEX_TIME`` joined on.
 
-    def get_feature_data(self, index: int) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        """Get the feature data for a patient episode.
-        
-        Features are read from a single timeseries CSV file specified in the dataset listfile. Static features are read
-        from stays.csv. Numeric and event features are extracted from the timeseries file based on self.numeric_feats
-        and self.event_feats. Rows and columns containing only missing values are dropped from the feature dataframes.
-
-        Args:
-            index (int): The index of the patient episode ID in `self.patient_episode_ids`.
-        
-        Returns:
-            Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]: Static features, value-associated features, and 
-                event-associated features for the patient episode.
+        Returns the ``labels.csv`` rows for the patient -- in labels order,
+        carrying ``ROW`` -- with ``INDEX_TIME`` taken from ``stays.csv`` on
+        ``STAY_INDEX``. A labels row naming a stay the patient does not
+        have is an error rather than a dropped episode: the fold row
+        indices are positions in this file, so the row count cannot move.
         """
-        
-        episode_file_path = self.episode_file_paths[index]
-        episode_ts_file_path = re.sub(r'.csv', '_timeseries.csv', episode_file_path)
+        episodes = self._episodes_by_patient[patid]
+        stays = pd.read_csv(
+            self.patient_dir(patid) / STAYS_FILE,
+            usecols=['STAY_INDEX', 'INDEX_TIME'],
+            dtype={'STAY_INDEX': int},
+        )
+        index_times = pd.to_datetime(
+            stays['INDEX_TIME'], utc=True, format='ISO8601'
+        )
+        lookup = dict(zip(stays['STAY_INDEX'], index_times))
+
+        missing = sorted(set(episodes['STAY_INDEX']) - set(lookup))
+        if missing:
+            raise ValueError(
+                f"patient {patid}: {STAYS_FILE} has no STAY_INDEX "
+                f"{missing}, which labels.csv names"
+            )
+        episodes = episodes.copy()
+        episodes['INDEX_TIME'] = [lookup[i] for i in episodes['STAY_INDEX']]
+        return episodes
+
+    def get_feature_data(
+        self, patid: int
+    ) -> Tuple[Optional[pd.Series], pd.DataFrame, pd.DataFrame,
+               pd.DataFrame, pd.DataFrame]:
+        """Read one patient's whole record.
+
+        Returns:
+            ``(static_data, val_data, event_data, text_data, drug_data)``.
+            The three timeseries frames are indexed by absolute UTC
+            timestamp; ``drug_data`` carries ``TIMESTAMP`` as a column
+            because it has several rows per timestamp (one per slot).
+        """
+
+        ts_path = self.patient_dir(patid) / TIMESERIES_FILE
+        header = pd.read_csv(ts_path, nrows=0).columns.tolist()
+        dtypes = {
+            col: str for col in header
+            if col in set(self.string_feats)
+        }
+        # The empty string is the *only* missing marker Stage B writes
+        # (``to_csv(..., na_rep="")``), so pandas' default NA strings are
+        # switched off: 'None' is UBAC's declared level 0 and would
+        # otherwise be read as missing, making that level unobservable.
+        timeseries = pd.read_csv(
+            ts_path, dtype=dtypes, keep_default_na=False, na_values=['']
+        )
+        timeseries[TIMESTAMP_COLUMN] = pd.to_datetime(
+            timeseries[TIMESTAMP_COLUMN], utc=True, format='ISO8601'
+        )
+        timeseries = timeseries.set_index(TIMESTAMP_COLUMN).sort_index()
+
+        val_cols = self._get_feature_column_names(
+            self.valued_feats, timeseries
+        )
+        val_data = timeseries.loc[:, val_cols]
+
+        event_cols = self._get_feature_column_names(
+            self.event_feats, timeseries
+        )
+        event_data = timeseries.loc[:, event_cols].dropna(how='all')
+
+        text_cols = self._get_feature_column_names(
+            self.text_feats, timeseries
+        )
+        text_data = timeseries.loc[:, text_cols]
+
+        drug_data = self._read_drugs(patid)
 
         if self.static_feats:
-            episode_df = pd.read_csv(episode_file_path)
-            feat_cols = self._get_feature_column_names(self.static_feats, episode_df)
-            static_data = episode_df.loc[:, feat_cols].iloc[0]
+            stays = pd.read_csv(self.patient_dir(patid) / STAYS_FILE)
+            static_cols = self._get_feature_column_names(
+                self.static_feats, stays
+            )
+            static_data = stays.loc[:, static_cols].iloc[0]
         else:
             static_data = None
-            
-        episode_ts_df = pd.read_csv(episode_ts_file_path, index_col='Hours')
-        episode_ts_df.index = pd.to_timedelta(episode_ts_df.index, unit='h')
-        
 
-        if self.valued_feats:
-            feat_cols = self._get_feature_column_names(self.valued_feats, episode_ts_df)
-            val_data = episode_ts_df.loc[:, feat_cols]
-            val_data = val_data.dropna(how='all')
-        else:
-            val_data = None
+        return static_data, val_data, event_data, text_data, drug_data
 
-        if self.event_feats:
-            feat_cols = self._get_feature_column_names(self.event_feats, episode_ts_df)
-            event_data = episode_ts_df.loc[:, feat_cols]
-            event_data = event_data.dropna(how='all')
-        else:
-            event_data = None
+    def _read_drugs(self, patid: int) -> pd.DataFrame:
+        """Read ``drugs.csv``, dropping the over-cap rows.
 
-        if self.text_feats:
-            feat_cols = self._get_feature_column_names(self.text_feats, episode_ts_df)
-            text_data = episode_ts_df.loc[:, feat_cols]
-            text_data = text_data.dropna(how='all')
-        else:
-            text_data = None
-        
-        return static_data, val_data, event_data, text_data
+        Section 2.7 keeps rows the 30-slot cap dropped, marked
+        ``SLOT = -1``, so the webapp can show them; the extractor ignores
+        them. An absent file means the patient was dispensed nothing.
+        """
+        path = self.patient_dir(patid) / DRUGS_FILE
+        columns = ['TIMESTAMP', 'SLOT', 'CLINVEC_INDEX', 'REL_DAILY_QTY']
+        if not path.exists():
+            return pd.DataFrame(
+                {c: pd.Series(dtype='float64') for c in columns}
+            )
+        drugs = pd.read_csv(path, usecols=columns)
+        drugs = drugs.loc[drugs['SLOT'] >= 0]
+        drugs['TIMESTAMP'] = pd.to_datetime(
+            drugs['TIMESTAMP'], utc=True, format='ISO8601'
+        )
+        return drugs
 
-    def _get_target_method(self) -> Callable:
-        if self.prediction_task is None:
-            return self.get_target_data  # User-defined target method
-        elif self.prediction_task == 'mortality':
-            return self.get_mortality_target_data
-        elif self.prediction_task == 'length_of_stay':
-            return self.get_length_of_stay_target_data
-        elif self.prediction_task == 'phenotype':
-            return self.get_phenotype_target_data
-        elif self.prediction_task == 'all':
-            return (self.get_mortality_target_data, self.get_length_of_stay_target_data, self.get_phenotype_target_data)
-        else:  # self.prediction_task is None
-            t = self.prediction_task
-            raise ValueError(f"prediction_task must be 'mortality', 'length_of_stay', 'phenotype', or None, got {t}.")
-        
-    def _get_feature_column_names(self, feature_names: List[str], df: pd.DataFrame) -> List[str]:
-        """Get feature names from a DataFrame based on the provided base feature names.
-        
-        This method finds columns in the DataFrame that start with any of the base feature names. It is assumed that vector-valued features have one column per vector dimension, and the column names of vector-valued features are the base feature name followed by an underscore and the dimension index (e.g., 'feature_0', 'feature_1', etc.). Scalar features' column names are simply the base feature name without any suffix.
+    def _get_feature_column_names(
+        self, feature_names: List[str], df: pd.DataFrame
+    ) -> List[str]:
+        """Get the columns of ``df`` belonging to the named features.
 
-        Args:
-            feature_names (List[str]): A list of base feature names to search for in the DataFrame.
-            df (pd.DataFrame): The DataFrame to search for feature columns.
-        
-        Returns:
-            List[str]: A list of column names in the DataFrame that match the base feature names.
+        A vector-valued feature has one column per dimension, named
+        ``feature_0``, ``feature_1``, ...; a scalar feature's column is the
+        feature name alone.
         """
 
         feature_columns = []
         for base_name in feature_names:
-            # Find columns that start with the base feature name
-            matching_columns = [col for col in df.columns if re.search(f'^{re.escape(base_name)}(_\d+)?$', col)]
+            matching_columns = [
+                col for col in df.columns
+                if re.search(rf'^{re.escape(base_name)}(_\d+)?$', col)
+            ]
             if matching_columns:
                 feature_columns.extend(matching_columns)
         return feature_columns
-    
+
     def _validate_patient_ids(self) -> None:
-        """Check that patient IDs are present in the root data directory."""
-        dirs = os.listdir(self.data_root_path)
-        for pt_id in self.patient_ids:
-            if str(pt_id) not in dirs:
-                raise ValueError(f"Patient ID {pt_id} not found in data directory.")
+        """Check that every patient in ``labels.csv`` has a directory."""
+        missing = [
+            patid for patid in self.patient_ids
+            if not os.path.isdir(os.path.join(self.root_dir, str(patid)))
+        ]
+        if missing:
+            raise ValueError(
+                f"{len(missing)} patient(s) named in {self.labels_path} "
+                f"have no directory under {self.root_dir}: "
+                f"{missing[:10]}"
+            )
 
-    def _convert_string_to_decimal_time(self, values: pd.Series) -> pd.Series:
-        """Convert time values in HH:MM format to decimal format."""
-        return values.str.split(':').apply(lambda t: float(t[0]) + float(t[1]) / 60)
+    def __getitem__(self, index: int):
+        """Return one patient's episodes and record.
 
-    def __len__(self) -> int:
-        """Return the number of episodes in the dataset."""
-        return len(self.patient_episode_ids)
-
-    def __getitem__(self, index: int) -> Tuple[int, pd.DataFrame, pd.DataFrame, pd.DataFrame, Any]:
-        record_id = self.patient_episode_ids[index]
-        static_data, val_assoc_data, event_assoc_data, text_data = self.get_feature_data(index)
-        if self.prediction_task != 'all':
-            # Return one of mortality, length of stay, phenotype data, or a custom target
-            targets = self._get_target_method()(index)
-        else:
-            # Return a list of (mortality status, length of stay, phenotypes) as targets
-            targets = [fn(index) for fn in self._get_target_method()]
-        return record_id, static_data, val_assoc_data, event_assoc_data, text_data, targets
-    
-    def index(self, patient_episode_id: int) -> int:
-        """Get the index of a patient episode in the dataset."""
-        return self.patient_episode_ids.index(patient_episode_id)
-    
+        Returns:
+            ``(patid, episodes, static_data, val_data, event_data,
+            text_data, drug_data)``.
+        """
+        patid = self.patient_ids[index]
+        episodes = self.get_episodes(patid)
+        (static_data, val_data, event_data,
+         text_data, drug_data) = self.get_feature_data(patid)
+        return (patid, episodes, static_data, val_data, event_data,
+                text_data, drug_data)
