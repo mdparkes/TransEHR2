@@ -74,7 +74,7 @@ STATIC_FEATS:
 # limits you intend to study, then sweep downwards from the experiment config.
 
 # Maximum number of timesteps per episode (default: 500)
-MAX_EPISODE_LEN_STEPS: 50
+MAX_EPISODE_LEN_STEPS: 50 
 
 # Maximum number of timesteps in patient history (default: 5000)
 MAX_HISTORY_LEN_STEPS: 500
