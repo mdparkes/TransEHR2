@@ -1163,7 +1163,7 @@ def filter_timeseries_records(
 def collate_tensorized(
     batch: MixedDataset,
     use_historical_records: bool = True,
-    max_history_len_steps: int = 0
+    history_len_steps: int = 0
 ) -> MixedTensorDataset:
     """Collate function for MixedDataset.
 
@@ -1176,10 +1176,12 @@ def collate_tensorized(
     Args:
         batch: List of episode dicts from MixedDataset.__getitem__.
         use_historical_records: If False, zero out masks for the
-            history region [0, max_history_len_steps) so the model
+            history region [0, history_len_steps) so the model
             ignores pre-admission data. Defaults to True.
-        max_history_len_steps: Number of timestep indices reserved
-            for historical records. Only used when
+        history_len_steps: Number of leading timestep indices in the
+            incoming tensors that hold historical records. This is the
+            post-crop history length (see MixedDataset), not necessarily
+            the extraction-time MAX_HISTORY_LEN_STEPS. Only used when
             use_historical_records is False.
     """
 
@@ -1190,9 +1192,9 @@ def collate_tensorized(
     event_masks = torch.stack([b['event_masks'] for b in batch], dim=0)
 
     # Mask out history region when historical records are disabled
-    if not use_historical_records and max_history_len_steps > 0:
-        val_masks[:, :max_history_len_steps] = 0.0
-        event_masks[:, :max_history_len_steps] = 0.0
+    if not use_historical_records and history_len_steps > 0:
+        val_masks[:, :history_len_steps] = 0.0
+        event_masks[:, :history_len_steps] = 0.0
     static_data = torch.stack([b['static_data'] for b in batch], dim=0)
 
     # Stack indicator tensors
@@ -1336,6 +1338,10 @@ def save_dataset(dataset: MixedDataset, base_path: str) -> None:
     # Metadata
     metadata = {
         'max_ts_len': dataset.max_ts_len,
+        # Recording the history/episode split makes the extracted layout self-describing, so
+        # runtime sequence-length cropping does not have to trust the dataset config to still
+        # match the data on disk.
+        'max_history_len_steps': dataset.max_history_len_steps,
         'text_token_len': dataset.text_token_len,
         'text_embed_dim': dataset.text_embed_dim,
         'n_numeric_feats': len(dataset.val_numeric_values),
@@ -1350,9 +1356,29 @@ def save_dataset(dataset: MixedDataset, base_path: str) -> None:
     print(f"Saved tensorized dataset to {base_path}/")
 
 
-def load_dataset(base_path: str) -> MixedDataset:
+def load_dataset(
+    base_path: str,
+    history_len_steps: Optional[int] = None,
+    episode_len_steps: Optional[int] = None,
+    extracted_history_len_steps: Optional[int] = None
+) -> MixedDataset:
     """
     Load tensorized dataset with memory-mapped arrays.
+
+    Args:
+        base_path: Directory written by `save_dataset()`.
+        history_len_steps: Runtime cap on historical timesteps. None (default) uses all
+            extracted history. See `MixedDataset` for why cropping is equivalent to
+            re-extracting at the shorter limit.
+        episode_len_steps: Runtime cap on in-stay timesteps. None (default) uses all
+            extracted episode steps.
+        extracted_history_len_steps: Size of the history region in the extracted arrays. Only
+            needed for datasets written before the layout was recorded in metadata.pkl; when
+            metadata carries the value, this argument is ignored.
+
+    Raises:
+        ValueError: If a crop is requested but the extracted history/episode split is unknown,
+            or if a requested length exceeds what was extracted.
 
     Backward-compatible: if pre-computed embedding files are not present
     (old datasets created before the pre-embedding overhaul), empty lists
@@ -1365,6 +1391,26 @@ def load_dataset(base_path: str) -> MixedDataset:
 
     with open(os.path.join(base_path, 'metadata.pkl'), 'rb') as f:
         metadata = pickle.load(f)
+
+    max_history_len_steps = metadata.get('max_history_len_steps')
+    if max_history_len_steps is None:
+        # Pre-dating self-describing metadata: fall back to the caller's config value.
+        if extracted_history_len_steps is None:
+            if history_len_steps is not None or episode_len_steps is not None:
+                raise ValueError(
+                    f'{base_path}/metadata.pkl does not record max_history_len_steps, so the '
+                    f'history/episode split of the extracted arrays is unknown and they cannot '
+                    f'be cropped safely. Pass extracted_history_len_steps (the '
+                    f'MAX_HISTORY_LEN_STEPS the data was extracted with) or re-extract.'
+                )
+            max_history_len_steps = 0
+        else:
+            max_history_len_steps = extracted_history_len_steps
+        if max_history_len_steps > metadata['max_ts_len']:
+            raise ValueError(
+                f'extracted_history_len_steps={max_history_len_steps} exceeds the stored '
+                f"timestep axis of {metadata['max_ts_len']} in {base_path}."
+            )
 
     n_num = metadata['n_numeric_feats']
     n_cat = metadata['n_categorical_feats']
@@ -1410,6 +1456,9 @@ def load_dataset(base_path: str) -> MixedDataset:
         phenotype=load_mmap('phenotype'),
         max_ts_len=metadata['max_ts_len'],
         text_token_len=metadata['text_token_len'],
+        max_history_len_steps=max_history_len_steps,
+        history_len_steps=history_len_steps,
+        episode_len_steps=episode_len_steps,
     )
 
 
@@ -1493,7 +1542,19 @@ def get_text_counts_from_dataset_vectorized(dataset) -> np.ndarray:
     
     for f in range(dataset.n_text_feats):
         offsets = np.asarray(dataset.val_text_offsets[f])
-        text_counts += (offsets[1:] - offsets[:-1]).astype(np.int32)
+        if getattr(dataset, 'is_cropped', False):
+            # Entries outside the crop window are dropped by __getitem__, so counting them
+            # would misreport how much text each episode actually contributes to a batch.
+            timesteps = np.asarray(dataset.val_text_timesteps[f])
+            in_window = (
+                (timesteps >= dataset.ts_start) & (timesteps < dataset.ts_end)
+            ).astype(np.int32)
+            cumulative = np.concatenate(([0], np.cumsum(in_window)))
+            text_counts += (
+                cumulative[offsets[1:]] - cumulative[offsets[:-1]]
+            ).astype(np.int32)
+        else:
+            text_counts += (offsets[1:] - offsets[:-1]).astype(np.int32)
     
     return text_counts
 
@@ -1932,6 +1993,7 @@ def extract_mimic(
         phenotype=arrays['phenotype'],
         # Metadata
         max_ts_len=dims.max_ts_len_val,
+        max_history_len_steps=max_history_len_steps,
         text_token_len=dims.text_feat_dims,
     )
     
@@ -1957,7 +2019,9 @@ def prepare_dataloaders(
     world_size: Optional[int] = None,
     rank: Optional[int] = None,
     use_historical_records: bool = True,
-    max_history_len_steps: int = 0
+    history_len_steps: Optional[int] = None,
+    episode_len_steps: Optional[int] = None,
+    extracted_history_len_steps: Optional[int] = None
 ) -> List[DataLoader]:
     """Prepare training, (validation), and test DataLoaders for MixedDataset.
 
@@ -2014,10 +2078,19 @@ def prepare_dataloaders(
         rank (int, optional): Current process rank. Required if balance_text=True. Can be obtained
             from accelerator.process_index.
         use_historical_records (bool, optional): If False, zero out masks for the history region
-            [0, max_history_len_steps) so the model ignores pre-admission data. Defaults to True.
-        max_history_len_steps (int, optional): Number of timestep indices reserved for historical
-            records in the extracted arrays. Only used when use_historical_records is False.
-            Defaults to 0.
+            so the model ignores pre-admission data. Defaults to True. Note that this masks
+            history in place, leaving the sequence length unchanged; `history_len_steps=0`
+            instead removes those timesteps entirely, which is cheaper.
+        history_len_steps (int, optional): Runtime cap on historical timesteps per episode.
+            Sequences are cropped at load time, which is equivalent to re-extracting with a
+            smaller MAX_HISTORY_LEN_STEPS (see `MixedDataset`). Must not exceed the extracted
+            history length. Defaults to None (use all extracted history).
+        episode_len_steps (int, optional): Runtime cap on in-stay timesteps per episode, applied
+            the same way. Must not exceed the extracted episode length. Defaults to None (use
+            all extracted episode steps).
+        extracted_history_len_steps (int, optional): Size of the history region in the extracted
+            arrays, i.e. the MAX_HISTORY_LEN_STEPS used at extraction time. Only needed for
+            datasets extracted before that value was recorded in metadata.pkl. Defaults to None.
 
     Returns:
         List[DataLoader]: List of DataLoaders in order: [train_loader, val_loader (if available), 
@@ -2052,7 +2125,12 @@ def prepare_dataloaders(
             else:
                 raise FileNotFoundError(f'{partition}/ not found in {data_dir}')
         
-        dataset = load_dataset(dataset_path)
+        dataset = load_dataset(
+            dataset_path,
+            history_len_steps=history_len_steps,
+            episode_len_steps=episode_len_steps,
+            extracted_history_len_steps=extracted_history_len_steps,
+        )
         
         # Determine sampler and shuffle behavior
         sampler = None
@@ -2075,7 +2153,9 @@ def prepare_dataloaders(
         collate_fn = partial(
             collate_tensorized,
             use_historical_records=use_historical_records,
-            max_history_len_steps=max_history_len_steps,
+            # Post-crop history length: masking must target the history region of the tensors
+            # that __getitem__ actually returns, not the extraction-time region.
+            history_len_steps=dataset.history_len_steps,
         )
 
         loader = DataLoader(

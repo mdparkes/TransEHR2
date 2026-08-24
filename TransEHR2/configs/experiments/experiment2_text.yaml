@@ -12,6 +12,15 @@ USE_TEXT: True
 # episode data. Requires data extracted with left-padded history layout.
 USE_HISTORICAL_RECORDS: True
 
+# Runtime sequence-length caps, applied by cropping the extracted arrays at load time.
+# `null` uses every timestep that was extracted. Setting a smaller value is equivalent to
+# re-extracting with a smaller MAX_HISTORY_LEN_STEPS / MAX_EPISODE_LEN_STEPS in the dataset
+# config, but needs no re-extraction; values larger than what was extracted are rejected.
+# Numeric standardization statistics are computed at extraction time over the full window, so
+# they stay constant across a sequence-length sweep.
+HISTORY_LEN_STEPS: null
+EPISODE_LEN_STEPS: null
+
 # Whether to let the generator and discriminator predict feature presence indicators as well as values
 PREDICT_INDICATORS: False
 
