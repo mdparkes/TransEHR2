@@ -91,6 +91,8 @@ TransEHR2/configs/**/test*.yaml
 
 # Test scripts
 tests/
+# ...but not the package's own suite, which is a deliverable
+!TransEHR2/tests/
 analyze_timestep_counts.py
 analyze_dataload_times.py
 test_run_experiment_accelerate.py
