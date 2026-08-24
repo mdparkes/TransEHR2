@@ -39,7 +39,6 @@ from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 from typing import Dict, List, Optional, Tuple
 
-from functools import partial
 from TransEHR2.data.preprocessing import load_dataset, collate_tensorized
 from TransEHR2.models import MixedClassifier
 from TransEHR2.modules import EventDataEncoder, ValueDataEncoder
@@ -170,8 +169,6 @@ def create_inference_loader(
     batch_size: int,
     num_workers: int,
     pin_memory: bool,
-    use_historical_records: bool = True,
-    max_history_len_steps: int = 0,
     world_size: int = 1,
     rank: int = 0
 ) -> Tuple[Optional[DataLoader], int]:
@@ -187,10 +184,6 @@ def create_inference_loader(
         batch_size: Number of samples per batch.
         num_workers: Number of DataLoader worker processes.
         pin_memory: Whether to use pinned memory for CUDA transfers.
-        use_historical_records: If False, zero out masks for the
-            history region so the model ignores pre-admission data.
-        max_history_len_steps: Number of timestep indices reserved
-            for historical records.
         world_size: Total number of distributed processes.
         rank: Index of the current process.
 
@@ -219,11 +212,7 @@ def create_inference_loader(
 
     subset = Subset(dataset, indices) if world_size > 1 else dataset
 
-    collate_fn = partial(
-        collate_tensorized,
-        use_historical_records=use_historical_records,
-        max_history_len_steps=max_history_len_steps,
-    )
+    collate_fn = collate_tensorized
     loader = DataLoader(
         subset,
         batch_size=batch_size,
@@ -610,12 +599,8 @@ if __name__ == '__main__':
     EVENT_FEATS = dataset_config['EVENT_FEATS']
     TEXT_FEATS = dataset_config['TEXT_FEATS']
     STATIC_FEATS = dataset_config['STATIC_FEATS']
-    MAX_HISTORY_LEN_STEPS = dataset_config.get('MAX_HISTORY_LEN_STEPS', 0)
 
     USE_TEXT = experiment_config['USE_TEXT']
-    USE_HISTORICAL_RECORDS = experiment_config.get(
-        'USE_HISTORICAL_RECORDS', True
-    )
     BATCH_SIZE = args.batch_size or experiment_config['BATCH_SIZE']
     MODEL_DIR = args.model_dir
     EXPERIMENT_NAME = args.experiment_name
@@ -689,8 +674,6 @@ if __name__ == '__main__':
             loader, total = create_inference_loader(
                 fold_dir, split, BATCH_SIZE,
                 args.num_workers, pin_memory,
-                use_historical_records=USE_HISTORICAL_RECORDS,
-                max_history_len_steps=MAX_HISTORY_LEN_STEPS,
                 world_size=accelerator.num_processes,
                 rank=accelerator.process_index
             )

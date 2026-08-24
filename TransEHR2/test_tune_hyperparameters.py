@@ -207,7 +207,6 @@ if __name__ == "__main__":
     EVENT_FEATS = dataset_config['EVENT_FEATS']
     TEXT_FEATS = dataset_config['TEXT_FEATS']
     STATIC_FEATS = dataset_config['STATIC_FEATS']
-    MAX_HISTORY_LEN_STEPS = dataset_config.get('MAX_HISTORY_LEN_STEPS', 0)
 
     # Get experiment config parameters
     with open(args['experiment_config'], 'r') as f_in:
@@ -261,7 +260,6 @@ if __name__ == "__main__":
     FINETUNE_LEARNING_RATE = experiment_config.get('FINETUNE_LEARNING_RATE', 2e-4)
     FINETUNE_TOTAL_EPOCH = experiment_config.get('FINETUNE_TOTAL_EPOCH', 500)
     FINETUNE_LEARNING_RATE_DECAY = experiment_config.get('FINETUNE_LEARNING_RATE_DECAY', 0.8)
-    USE_HISTORICAL_RECORDS = experiment_config.get('USE_HISTORICAL_RECORDS', True)
 
 
     # Create timer
@@ -335,9 +333,7 @@ if __name__ == "__main__":
         prefetch_factor=2 if num_workers > 0 else 1,
         balance_text=USE_TEXT,
         world_size=_world_size,
-        rank=_rank,
-        use_historical_records=USE_HISTORICAL_RECORDS,
-        max_history_len_steps=MAX_HISTORY_LEN_STEPS
+        rank=_rank
     )
     # For HP tuning, we use train and test loaders only (test is used for model selection)
     if len(dataloader_list) == 3:
