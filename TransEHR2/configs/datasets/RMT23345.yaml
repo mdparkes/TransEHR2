@@ -1,11 +1,21 @@
-# MIMIC-IV Dataset Configuration
-# Configuration file for extracting and preprocessing MIMIC-IV data
+# RMT23345 Dataset Configuration
+# Configuration file for extracting and preprocessing the RMT23345 IBD
+# readmission data. Together with variable_properties.yaml this is the
+# single source of truth for feature names, types and dimensions: the
+# array widths of blueprint section 4.4 are derived from the two files and
+# never declared (section A.3).
 
-# Data directory containing fold subdirectories with CSV listfiles
+# Holds root/ (Stage B), labels.csv (Stage B'), fold{i}/ (split.py) and
+# extracted/ (extract_data.py)
 DATA_DIR: "/uhome/pr3/projects/p60290_2/TransEHR2-IBDreadmission/data"
 
 # Path to variable properties YAML file
-VARIABLE_PROPERTIES_PATH: "/uhome/pr3/projects/p60290_2/TransEHR2-IBDreadmission/data/variable_properties.yaml"
+VARIABLE_PROPERTIES_PATH: "/uhome/pr3/projects/p60290_2/TransEHR2-IBDreadmission/data/ibd/variable_properties.yaml"
+
+# ClinVec ATC vocabulary. CLINVEC_INDEX is a row of this file, so its row
+# count is the pad index V of section 4.4 and drug_embeddings.npy is
+# (V+1, 128). Read at extraction; the embeddings themselves are C4's.
+CLINVEC_PATH: "/uhome/pr3/projects/p60290_2/TransEHR2-IBDreadmission/data/resources/ClinVec_atc.csv"
 
 # Feature definitions
 VALUED_FEATS:
@@ -171,18 +181,13 @@ STATIC_FEATS: []
 
 
 # Data preprocessing parameters
-# Maximum number of timesteps per episode
+# Timesteps per episode: the most recent MAX_EPISODE_LEN_STEPS records at
+# or before INDEX_TIME (section 4.1). This is T in section 4.4's shapes.
 MAX_EPISODE_LEN_STEPS: 500
 
-# Maximum number of timesteps in patient history
-MAX_HISTORY_LEN_STEPS: 500
-
-# Minimum episode length in timesteps for inclusion
+# Minimum episode length in timesteps. Section 3 sets no minimum, and
+# invariant 4 makes every INDEX_TIME name a timeseries.csv row, so this is
+# a reported count rather than a filter: extraction cannot drop an episode
+# without shifting the fold row indices that index into its output.
 MIN_EPISODE_LEN_STEPS: 1
-
-# Minimum episode length in hours for inclusion
-MIN_EPISODE_LEN_HOURS: 48
-
-# Maximum episode length in hours for inclusion
-MAX_EPISODE_LEN_HOURS: 48
 
