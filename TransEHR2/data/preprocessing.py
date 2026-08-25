@@ -739,7 +739,11 @@ def _process_single_episode(
         max_history_len_steps: Maximum historic timesteps
         max_episode_len_steps: Maximum episode timesteps
         max_episode_len_hours: Maximum hours to include
-        min_episode_len_steps: Minimum required timesteps
+        min_episode_len_steps: Minimum number of in-stay timesteps
+            the extracted episode must contain after resampling and
+            truncation. Counts value-associated timesteps (merged
+            with text timesteps when text features are in use); the
+            event stream is not subject to a minimum.
         min_episode_len_hours: Minimum required hours
         
     Returns:
@@ -759,7 +763,18 @@ def _process_single_episode(
             if targets['length_of_stay'] < min_episode_len_hours:
                 return None
         
-        # Check minimum timesteps
+        # Pre-filter on minimum timesteps.
+        #
+        # This is a cheap early-out on the RAW records, not the
+        # authoritative check: the hourly resample below collapses
+        # multiple records falling in the same hour into a single
+        # timestep, and filter_timeseries_records() truncates to
+        # max_episode_len_steps, so the number of in-stay timesteps
+        # that actually get stored is generally lower than the raw
+        # count measured here. The authoritative check on the stored
+        # timesteps is applied after filtering, further down. This
+        # pre-filter only exists to avoid paying for the resample and
+        # the filter on episodes that cannot possibly pass.
         if min_episode_len_steps is not None:
             min_ts = np.timedelta64(0, 'h')
             max_ts = np.timedelta64(max_episode_len_hours, 'h') if max_episode_len_hours else None
@@ -800,6 +815,21 @@ def _process_single_episode(
                 col.rsplit('_', 1)[0] if col.endswith(('_left', '_right')) else col
                 for col in val_data.columns
             ]
+        
+        # Authoritative check on minimum timesteps.
+        #
+        # val_data now holds exactly the timesteps that will be
+        # written to disk, history first and then the current stay.
+        # val_history_len is the number of pre-admission timesteps
+        # retained by filter_timeseries_records(); in the text branch
+        # that function filters the merged text+numeric frame and
+        # returns the merged frame's history length, and the merge
+        # above reconstructs that same frame, so the subtraction is
+        # correct in both branches.
+        if min_episode_len_steps is not None:
+            n_current_steps = len(val_data) - val_history_len
+            if n_current_steps < min_episode_len_steps:
+                return None
         
         # Process into numpy arrays
         (val_times, num_ind, num_vals, cat_ind, cat_vals,
