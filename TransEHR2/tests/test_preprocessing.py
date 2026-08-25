@@ -494,7 +494,80 @@ def test_contract_fails_when_size_and_category_map_disagree():
     assert any("keys must run 0..size-1" in f for f in failures)
 
 
+def test_contract_reports_a_non_integer_map_key_rather_than_raising():
+    """Regression. ``sorted(int(k) for k in cat_map)`` used to raise
+    straight out of the checker on a hand-edited map, so the caller's
+    per-failure report -- the whole point of checking up front -- never
+    ran and nothing named the offending feature."""
+    config = {'VALUED_FEATS': ['A'], 'EVENT_FEATS': [], 'TEXT_FEATS': [],
+              'DRUG_FEATS': [], 'STATIC_FEATS': []}
+    props = {'A': {'type': 'categorical', 'size': 2,
+                   'category_map': {'x': 'L', 'y': 'U'}}}
+    failures = check_feature_contract(config, props)
+    assert any("'A'" in f and 'are not integers' in f
+               for f in failures), failures
+
+
 def test_extraction_refuses_to_start_on_a_broken_contract(one_patient):
     one_patient.var_properties['ORPHAN'] = {'type': 'numeric', 'size': 1}
     assert run(one_patient) == 1
     assert not one_patient.extracted.exists()
+
+
+# --- re-running into a used directory (sections 4.3, 5.1) ------------
+
+def test_a_rerun_clears_artifacts_of_a_removed_feature(one_patient):
+    """Regression. Section 5.1's regression gate re-runs with
+    ``DRUG_FEATS: []``; the previous run's drug arrays used to survive
+    beside a metadata.pkl that no longer mentions them, and section 4.3
+    has the webapp finding drugs by filename."""
+    assert run(one_patient) == 0
+    drug_files = {p.name for p in one_patient.extracted.iterdir()
+                  if p.name.startswith(('drug_', 'val_drug_'))}
+    assert drug_files, "the first run writes drug artifacts"
+
+    # Same DATA_DIR, drug feature removed.
+    one_patient.config['DRUG_FEATS'] = []
+    del one_patient.var_properties['DRG']
+    assert run(one_patient) == 0
+    left = {p.name for p in one_patient.extracted.iterdir()
+            if p.name.startswith(('drug_', 'val_drug_'))}
+    assert not left, f"stale drug artifacts survived the re-run: {left}"
+
+
+def test_a_rerun_keeps_the_directory_consistent_with_metadata(one_patient):
+    """Every .npy left on disk must be one this run wrote."""
+    one_patient.config['MAX_EPISODE_LEN_STEPS'] = 4
+    assert run(one_patient) == 0
+    (one_patient.extracted / 'val_numeric_values_99.npy').write_bytes(b'x')
+    assert run(one_patient) == 0
+    assert not (one_patient.extracted /
+                'val_numeric_values_99.npy').exists()
+
+
+# --- fold rows must address this cohort (section 3) ------------------
+
+def test_fold_rows_past_the_end_of_the_cohort_are_refused(one_patient):
+    """Section 3's fold arrays are positions in labels.csv. A stale fold
+    directory used to surface as an IndexError from standardize_feats
+    *after* the whole output directory had been written."""
+    fold_dir = one_patient.data_dir / 'fold0'
+    fold_dir.mkdir(parents=True)
+    np.save(fold_dir / 'fold0_train_rows.npy', np.array([0, 7]))
+    with pytest.raises(ValueError, match='indexes rows'):
+        run(one_patient)
+    assert not one_patient.extracted.exists(), "refused before writing"
+
+
+def test_truncated_runs_skip_fold_statistics(one_patient, capsys):
+    """``--n_examples`` yields a prefix of labels.csv, which the fold row
+    indices do not address; statistics over it would mean nothing. The
+    run used to write the whole directory and then die with an
+    IndexError."""
+    fold_dir = one_patient.data_dir / 'fold0'
+    fold_dir.mkdir(parents=True)
+    np.save(fold_dir / 'fold0_train_rows.npy', np.array([0]))
+    config_path = one_patient.finish()
+    assert extract_main([str(config_path), '-n', '1']) == 0
+    assert not list(one_patient.extracted.glob('summary_statistics_*'))
+    assert '--n_examples' in capsys.readouterr().out

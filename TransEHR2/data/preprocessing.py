@@ -142,6 +142,15 @@ def _bucket_valued_feats(
     return numeric_feats, categorical_feats, ordinal_feats, lookup
 
 
+def _is_index(key) -> bool:
+    """Whether a category_map key can serve as a 0-based index."""
+    try:
+        int(key)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
 def check_feature_contract(config: dict, var_properties: dict) -> List[str]:
     """Invariant 12, checked before any patient data is read (section 6).
 
@@ -180,7 +189,18 @@ def check_feature_contract(config: dict, var_properties: dict) -> List[str]:
             continue
         cat_map = entry.get('category_map') or {}
         size = entry.get('size')
-        keys = sorted(int(k) for k in cat_map)
+        try:
+            keys = sorted(int(k) for k in cat_map)
+        except (TypeError, ValueError):
+            # Reported, not raised: this function exists so that a
+            # malformed YAML fails here with a name attached rather than
+            # part-way through a multi-hour run (section A.3).
+            bad = sorted(str(k) for k in cat_map if not _is_index(k))
+            failures.append(
+                f"feature '{feat}': category_map key(s) {bad} are not "
+                f"integers; keys must run 0..size-1"
+            )
+            continue
         if len(cat_map) != size or keys != list(range(size)):
             failures.append(
                 f"feature '{feat}': size {size} but category_map keys "
@@ -1415,6 +1435,19 @@ def save_extracted(
     """
     os.makedirs(base_path, exist_ok=True)
 
+    # Clear this directory's own artifacts first. Feature counts and
+    # families come from the config, so a re-run with one feature removed
+    # would otherwise leave the previous run's files beside a
+    # metadata.pkl that no longer mentions them -- section 5.1's
+    # regression gate does exactly that, re-running with DRUG_FEATS: [],
+    # and section 4.3 says the webapp finds drugs by filename. Only the
+    # three extensions this function and extract_data write are removed,
+    # and only at the top level, so nothing outside our own output is
+    # touched.
+    for stale in os.listdir(base_path):
+        if stale.endswith(('.npy', '.pkl', '.npz')):
+            os.remove(os.path.join(base_path, stale))
+
     def save_array(name: str, arr: np.ndarray):
         np.save(os.path.join(base_path, f'{name}.npy'), arr)
 
@@ -1647,6 +1680,21 @@ def extract_data(
     n_patients = len(reader)
     n_episodes = reader.n_episodes
     lookup_feats = list(reader.text_feats) + list(reader.drug_feats)
+
+    # Fold rows are positions in labels.csv (section 3), so a fold that
+    # indexes past this cohort is either a stale fold directory or a
+    # truncated run. Checked before any work, because the failure used to
+    # surface as an IndexError from standardize_feats *after* the whole
+    # output directory had been written.
+    for fold_name, rows in (fold_train_rows or {}).items():
+        rows = np.asarray(rows)
+        if rows.size and (rows.min() < 0 or rows.max() >= n_episodes):
+            raise ValueError(
+                f"{fold_name} indexes rows [{rows.min()}, {rows.max()}] "
+                f"but this cohort has {n_episodes} episode(s). Fold rows "
+                f"are positions in labels.csv; rebuild the folds against "
+                f"the current labels.csv, or drop --n_examples."
+            )
 
     print(f"Processing {n_episodes} episodes over {n_patients} patients "
           f"using {n_workers} worker(s)...")

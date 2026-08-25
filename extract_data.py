@@ -183,13 +183,24 @@ def main(argv=None) -> int:
         n_examples=args.n_examples
     )
 
-    fold_train_rows = find_fold_train_rows(DATA_DIR)
-    if fold_train_rows:
-        print(f"Standardization statistics for: "
-              f"{sorted(fold_train_rows)}")
+    if args.n_examples is not None:
+        # A truncated run is a smoke test, not a cohort: its rows are a
+        # prefix of labels.csv, so the fold row indices do not address it
+        # and statistics over it would mean nothing. Skipped rather than
+        # refused, so that -n stays usable once folds exist.
+        fold_train_rows = {}
+        print(f"--n_examples {args.n_examples}: extracting a truncated "
+              f"cohort, so no standardization statistics are written.")
+        print(f"  NOTE this overwrites {DATA_DIR}/extracted with a "
+              f"{args.n_examples}-episode directory.")
     else:
-        print("No fold{i}/fold{i}_train_rows.npy found; no "
-              "standardization statistics will be written.")
+        fold_train_rows = find_fold_train_rows(DATA_DIR)
+        if fold_train_rows:
+            print(f"Standardization statistics for: "
+                  f"{sorted(fold_train_rows)}")
+        else:
+            print("No fold{i}/fold{i}_train_rows.npy found; no "
+                  "standardization statistics will be written.")
     sys.stdout.flush()
 
     extract_data(
