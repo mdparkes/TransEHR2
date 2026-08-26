@@ -464,20 +464,18 @@ class ValueDataEncoder(torch.nn.Module):
         # Add time-dependent positional embeddings
         embedding = self.position_encoding_layer(embedding, timestamps, timestep_masks)
 
-        # Permute the embedding tensor to match the expected input shape for the transformer encoder
-        # The transformer expects the input in the shape (seq_length, batch_size, d_model)
-        embedding = embedding.permute(1, 0, 2)
-        
-        # Perform the forward pass through the transformer encoder
-        # NOTE padding mask logic is reversed to comply with MultiHeadAttention, TransformerEncoderLayer
-        # Expects 0/False for tokens that are not masked, 1/True for padding tokens that are masked
-        inverted_timestep_masks = ~timestep_masks.bool().T  # Shape: (seq_length, batch_size)
-        embedding = self.transformer_encoder(embedding, src_key_padding_mask=inverted_timestep_masks)  
+        # The encoder layer is constructed with batch_first=True, so it takes
+        # (batch_size, seq_length, d_model) directly and no permute is needed. Permuting to
+        # (seq_length, batch_size, d_model) made the encoder read the time axis as the batch
+        # axis: attention ran across the episodes that happened to share a batch, and never
+        # across time. The transposed key padding mask matched that misreading, which is why
+        # the shapes lined up and nothing raised.
+        # NOTE padding mask logic is reversed to comply with MultiheadAttention:
+        # False for tokens that are attended to, True for padding tokens that are masked out.
+        inverted_timestep_masks = ~timestep_masks.bool()  # Shape: (batch_size, seq_length)
+        embedding = self.transformer_encoder(embedding, src_key_padding_mask=inverted_timestep_masks)
         embedding = self.activation(embedding)
         embedding = self.dropout(embedding)
-        
-        # Return to original dim order, (batch_size, seq_length, d_model)
-        embedding = embedding.permute(1, 0, 2) 
 
         return embedding
 
