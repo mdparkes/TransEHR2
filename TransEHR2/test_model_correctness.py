@@ -178,6 +178,79 @@ def test_every_parameter_receives_gradient():
     assert not unused, f'{len(unused)} parameter(s) never received a gradient: {unused[:6]}'
 
 
+# --------------------------------------------------------------------------------------------
+# Fix 02 -- generator mask polarity
+# --------------------------------------------------------------------------------------------
+
+class _CapturingEncoder(torch.nn.Module):
+    """Stands in for the value encoder and records exactly what the generator handed it."""
+
+    def __init__(self, d_model: int = D_MODEL):
+        super().__init__()
+        self.d_model = d_model
+        self.seen = {}
+
+    def forward(self, indicators, values, timestamps, timestep_masks):
+        self.seen['indicators'] = indicators.detach().clone()
+        self.seen['values'] = values.detach().clone()
+        return torch.zeros(values.size(0), values.size(1), self.d_model)
+
+
+def test_generator_input_is_masked_not_revealed():
+    """The generator must see zeros where components are masked, and the data everywhere else.
+
+    ``generate_record_masks`` marks masked components with ones. Multiplying the data by that
+    mask therefore kept precisely the components the generator is asked to reconstruct and
+    zeroed all of its context -- the reconstruction target was fed in as input. The loss still
+    fell, which is why this never surfaced.
+    """
+    from TransEHR2.modules import MaskedTokenGenerator
+
+    torch.manual_seed(0)
+    batch_size, seq_len, dims = 3, 5, [2, 3]
+    capture = _CapturingEncoder()
+    generator = MaskedTokenGenerator(
+        encoder=capture,
+        d_model=D_MODEL,
+        numeric_dims=dims,
+        categorical_classes=[],
+    )
+    generator.eval()
+
+    generator_ = torch.Generator().manual_seed(7)
+    values = [torch.randn(batch_size, seq_len, d, generator=generator_) + 5.0 for d in dims]
+    indicators = torch.ones(batch_size, seq_len, len(dims))
+    value_masks = [
+        (torch.rand(batch_size, seq_len, d, generator=generator_) > 0.5).float() for d in dims
+    ]
+    indicator_masks = (torch.rand(batch_size, seq_len, len(dims), generator=generator_) > 0.5).float()
+
+    batch = {
+        'numeric': {'indicators': indicators, 'values': values},
+        'times': torch.arange(seq_len, dtype=torch.float32).expand(batch_size, seq_len).clone(),
+        'masks': torch.ones(batch_size, seq_len),
+    }
+    record_masks = {'numeric': {'indicators': indicator_masks, 'values': value_masks}}
+
+    with torch.no_grad():
+        generator(batch, record_masks)
+
+    original = torch.cat(values, dim=2)
+    mask = torch.cat(value_masks, dim=2)
+    seen = capture.seen['values']
+
+    revealed = seen[mask.bool()].abs().max().item()
+    assert revealed == 0.0, (
+        f'generator was shown {int(mask.sum().item())} masked components it is meant to predict '
+        f'(max magnitude {revealed:.3f})'
+    )
+
+    context_delta = (seen[~mask.bool()] - original[~mask.bool()]).abs().max().item()
+    assert context_delta < 1e-6, (
+        f'generator context was altered where it should be intact (max delta {context_delta:.3e})'
+    )
+
+
 if __name__ == '__main__':
     failures = 0
     for name, fn in sorted(globals().items()):

@@ -630,39 +630,39 @@ class MaskedTokenGenerator(torch.nn.Module):
         if self.predict_numeric_feats:
             # Extract and mask numeric feature indicators
             numeric_inds = batch['numeric']['indicators']
-            masked_numeric_inds = numeric_inds * record_masks['numeric']['indicators']
+            masked_numeric_inds = numeric_inds * (1 - record_masks['numeric']['indicators'])
             inds_to_concat.append(masked_numeric_inds)
             # Extract and mask numeric feature values
             numeric_vals = torch.cat(batch['numeric']['values'], dim=2)
-            masked_numeric_vals = numeric_vals * torch.cat(record_masks['numeric']['values'], dim=2)
+            masked_numeric_vals = numeric_vals * (1 - torch.cat(record_masks['numeric']['values'], dim=2))
             vals_to_concat.append(masked_numeric_vals)
 
         if self.predict_categorical_feats:
             # Extract and mask categorical feature indicators
             categorical_inds = batch['categorical']['indicators']
-            masked_categorical_inds = categorical_inds * record_masks['categorical']['indicators']
+            masked_categorical_inds = categorical_inds * (1 - record_masks['categorical']['indicators'])
             inds_to_concat.append(masked_categorical_inds)
             # Extract and mask categorical feature values
             categorical_vals = torch.cat(batch['categorical']['values'], dim=2)
-            masked_categorical_vals = categorical_vals * torch.cat(record_masks['categorical']['values'], dim=2)
+            masked_categorical_vals = categorical_vals * (1 - torch.cat(record_masks['categorical']['values'], dim=2))
             vals_to_concat.append(masked_categorical_vals)
 
         if self.predict_ordinal_feats:
             # Extract and mask ordinal feature indicators
             ordinal_inds = batch['ordinal']['indicators']
-            masked_ordinal_inds = ordinal_inds * record_masks['ordinal']['indicators']
+            masked_ordinal_inds = ordinal_inds * (1 - record_masks['ordinal']['indicators'])
             inds_to_concat.append(masked_ordinal_inds)
             # Extract and mask ordinal feature values
             ordinal_vals = torch.cat(batch['ordinal']['values'], dim=2)
-            masked_ordinal_vals = ordinal_vals * torch.cat(record_masks['ordinal']['values'], dim=2)
+            masked_ordinal_vals = ordinal_vals * (1 - torch.cat(record_masks['ordinal']['values'], dim=2))
             vals_to_concat.append(masked_ordinal_vals)
 
         if self.predict_multilabel_feats:
             multilabel_inds = batch['multilabel']['indicators']
-            masked_multilabel_inds = multilabel_inds * record_masks['multilabel']['indicators']
+            masked_multilabel_inds = multilabel_inds * (1 - record_masks['multilabel']['indicators'])
             inds_to_concat.append(masked_multilabel_inds)
             multilabel_vals = torch.cat(batch['multilabel']['values'], dim=2)
-            masked_multilabel_vals = multilabel_vals * torch.cat(record_masks['multilabel']['values'], dim=2)
+            masked_multilabel_vals = multilabel_vals * (1 - torch.cat(record_masks['multilabel']['values'], dim=2))
             vals_to_concat.append(masked_multilabel_vals)
 
         # Concatenate the tensors for numeric, categorical, and ordinal features along the feature dimension
@@ -681,8 +681,8 @@ class MaskedTokenGenerator(torch.nn.Module):
             text_indicators = batch['text']['indicators']
             text_embeddings = batch['text']['embedded_values']
             # Zero out masked text feature embedding components
-            masked_text_indicators = text_indicators * record_masks['text']['indicators']
-            masked_text_embeddings = text_embeddings * torch.stack(record_masks['text']['embedded_values'], dim=2)
+            masked_text_indicators = text_indicators * (1 - record_masks['text']['indicators'])
+            masked_text_embeddings = text_embeddings * (1 - torch.stack(record_masks['text']['embedded_values'], dim=2))
             # Combine the numeric, categorical, and text data into a single tensor for input to the encoder
             #   masked_indicators shape: (batch_size, max_timeseries_length, n_num_feats + n_cat_feats + n_text_feats)
             #   masked_values shape: (batch_size, max_timeseries_length, total_feat_dim)
