@@ -397,8 +397,19 @@ class ValueDataEncoder(torch.nn.Module):
         # dropout will also be applied to the position encoding of the event-associated data encoder in this 
         # implementation.
         self.position_encoding_layer = TemporalPositionEncoding(d_model=d_model, dropout=0.1)
-        self.encoder_layer = self._get_encoder_layer(norm, activation, dropout)
-        self.transformer_encoder = torch.nn.TransformerEncoder(self.encoder_layer, n_encoder_blocks)
+        # nn.TransformerEncoder clones its prototype layer with copy.deepcopy, which has two
+        # consequences we do not want. Every block would start from identical weights, so a
+        # deeper stack behaves differently from a freshly constructed one; and the prototype
+        # stays registered as a submodule that forward never calls, leaving its parameters in
+        # the state dict, in the optimizer, and in DDP's reduction set without ever receiving a
+        # gradient. Build the blocks independently and install them directly instead.
+        encoder_layers = [
+            self._get_encoder_layer(norm, activation, dropout) for _ in range(n_encoder_blocks)
+        ]
+        self.transformer_encoder = torch.nn.TransformerEncoder(
+            encoder_layers[0], n_encoder_blocks, enable_nested_tensor=False
+        )
+        self.transformer_encoder.layers = torch.nn.ModuleList(encoder_layers)
         self.activation = self._get_activation_layer(activation)
         self.dropout = torch.nn.Dropout(dropout)
 

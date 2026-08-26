@@ -137,6 +137,47 @@ def test_padding_does_not_change_observed_positions():
     assert delta < 1e-5, f'padding width changed observed-position encodings (max delta {delta:.3e})'
 
 
+# --------------------------------------------------------------------------------------------
+# Encoder stack construction
+# --------------------------------------------------------------------------------------------
+
+def test_encoder_blocks_are_independently_initialized():
+    """Stacked blocks must not start life as copies of one another.
+
+    ``nn.TransformerEncoder`` clones a single initialized prototype with ``copy.deepcopy``, so
+    every block starts from identical weights. That is a torch quirk rather than a deliberate
+    choice here, and it makes a deep stack behave differently from a freshly constructed one.
+    """
+    encoder = _build_value_encoder(n_blocks=3)
+    layers = list(encoder.transformer_encoder.layers)
+    assert len(layers) == 3
+
+    first = layers[0].state_dict()
+    for index, layer in enumerate(layers[1:], start=1):
+        other = layer.state_dict()
+        identical = all(torch.equal(first[key], other[key]) for key in first)
+        assert not identical, (
+            f'block {index} is a copy of block 0; stacked blocks share an initialization'
+        )
+
+
+def test_every_parameter_receives_gradient():
+    """No parameter may be registered but never used.
+
+    Unused parameters are wasted optimizer state and checkpoint weight, and under DDP they raise
+    at the reduction step unless find_unused_parameters is set. This is the general guard; it
+    caught the prototype layer that nn.TransformerEncoder leaves behind after cloning.
+    """
+    encoder = _build_value_encoder(n_blocks=2)
+    encoder.train()
+    indicators, values, timestamps, masks = _synthetic_batch()
+
+    encoder(indicators, values, timestamps, masks).sum().backward()
+
+    unused = [name for name, p in encoder.named_parameters() if p.requires_grad and p.grad is None]
+    assert not unused, f'{len(unused)} parameter(s) never received a gradient: {unused[:6]}'
+
+
 if __name__ == '__main__':
     failures = 0
     for name, fn in sorted(globals().items()):
