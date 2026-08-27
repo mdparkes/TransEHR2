@@ -8,6 +8,49 @@ from typing import Optional, Tuple
 from TransEHR2.constants import PAD
 
 
+def build_key_padding_attention_mask(non_padding_mask: Tensor) -> Tensor:
+    r"""Turn a per-timestep padding mask into a self-attention mask.
+
+    Args:
+        non_padding_mask (Tensor): A [batch_size, seq_len] tensor that is 1/True at observed
+            timesteps and 0/False at padding.
+
+    Returns:
+        Tensor: A boolean [batch_size, 1, seq_len] tensor that is True where the *key* position is
+            padding, matching the polarity `MultiHeadAttention` expects (True means "do not
+            attend"). Query rows are not masked here; padded query rows are zeroed by
+            `EncoderLayer` via `non_padding_mask` instead.
+
+    Note:
+        The query axis is left at size 1 to broadcast rather than expanded to `seq_len`. Every
+        query row of a bidirectional encoder masks the same keys, so the square form carries no
+        extra information and would cost a [batch_size, seq_len, seq_len] bool -- 60 MB at batch
+        200 and 550 timesteps -- once the attention inverts it. The event encoder's mask is
+        genuinely two-dimensional because it also carries the causal triangle, and is built
+        separately.
+    """
+    return non_padding_mask.eq(PAD).unsqueeze(1).to(torch.bool)
+
+
+def get_activation_module(activation: str) -> torch.nn.Module:
+    r"""Return the activation module named by `activation`.
+
+    Args:
+        activation (str): Either 'relu' or 'gelu'.
+
+    Returns:
+        torch.nn.Module: The corresponding activation module.
+
+    Raises:
+        ValueError: If `activation` is neither 'relu' nor 'gelu'.
+    """
+    if activation == 'relu':
+        return torch.nn.ReLU()
+    if activation == 'gelu':
+        return torch.nn.GELU()
+    raise ValueError(f'activation: expected "relu" or "gelu", got {activation}')
+
+
 class EncoderLayer(torch.nn.Module):
     r"""
     Encoder layer composed of a multi-head attention mechanism and a position-wise feed-forward network.
@@ -25,7 +68,9 @@ class EncoderLayer(torch.nn.Module):
         d_k: int, 
         d_v: int, 
         dropout: float = 0.1, 
-        normalize_before: bool = False
+        normalize_before: bool = False,
+        activation: str = 'gelu',
+        query_key_transform: Optional[torch.nn.Module] = None
     ):
         r"""Initialize an instance
         
@@ -38,41 +83,62 @@ class EncoderLayer(torch.nn.Module):
             dropout (float, optional): The dropout rate. Defaults to 0.1.
             normalize_before (bool, optional): Whether to apply layer normalization before the attention and
                 feed-forward layers. If False, layer normalization is applied *after* each. Defaults to False.
+            activation (str, optional): The activation used in the feed-forward network, either 'relu' or 'gelu'.
+                Defaults to 'gelu', which is what this layer applied unconditionally before the argument existed.
+            query_key_transform (torch.nn.Module, optional): A position-dependent transform applied to the query
+                and key tensors after projection and head-splitting. See `MultiHeadAttention` for the contract.
+                Defaults to None, which leaves the attention unchanged.
         """
         super().__init__()
         self.self_attention = MultiHeadAttention(
-            n_head, d_model, d_k, d_v, dropout=dropout, normalize_before=normalize_before)
+            n_head, d_model, d_k, d_v, dropout=dropout, normalize_before=normalize_before,
+            query_key_transform=query_key_transform)
         self.pos_ffn = PositionwiseFeedForward(
-            d_model, d_inner, dropout=dropout, normalize_before=normalize_before)
+            d_model, d_inner, dropout=dropout, normalize_before=normalize_before, activation=activation)
 
     def forward(
         self, 
         x: Tensor, 
         non_padding_mask: Optional[Tensor] = None,
-        self_attention_mask: Optional[Tensor] = None
-    ) -> Tuple[Tensor, Tensor]:
+        self_attention_mask: Optional[Tensor] = None,
+        positions: Optional[Tensor] = None,
+        need_weights: bool = False
+    ) -> Tuple[Tensor, Optional[Tensor]]:
         r"""Performs a forward pass through the encoder layer.
 
         Args:
-            enc_input (Tensor): The input tensor to the encoder layer.
-            non_pad_mask (Tensor, optional): The mask tensor indicating non-padding positions. Defaults to None.
-            slf_attn_mask (Tensor, optional): The mask tensor for self-attention. Defaults to None.
+            x (Tensor): The input tensor to the encoder layer, [batch_size, seq_len, d_model].
+            non_padding_mask (Tensor, optional): The mask tensor indicating non-padding positions, either
+                [batch_size, seq_len] or [batch_size, seq_len, 1]. Padded positions are zeroed after
+                attention and again after the feed-forward network. Defaults to None.
+            self_attention_mask (Tensor, optional): A boolean mask that is True at key positions that must
+                not be attended to, broadcastable to [batch_size, seq_len, seq_len]. A key-padding mask
+                whose query axis is 1 broadcasts and costs nothing to invert; see
+                `build_key_padding_attention_mask`. Defaults to None.
+            positions (Tensor, optional): A [batch_size, seq_len] tensor of positions -- timestamps in this
+                model -- forwarded to `query_key_transform`. Ignored when no transform is installed.
+                Defaults to None.
+            need_weights (bool, optional): Whether to return the explicit attention weight matrix. Materializing
+                it costs a [batch_size, n_head, seq_len, seq_len] tensor, so it is off by default and the
+                returned weights are then None. Defaults to False.
 
         Returns:
-            Tuple[Tensor, Tensor]: The output tensor from the encoder layer and the self-attention weights.
+            Tuple[Tensor, Optional[Tensor]]: The output tensor from the encoder layer and, if `need_weights`,
+                the self-attention weights.
         """
 
-        x, attn = self.self_attention(x, x, x, mask=self_attention_mask)
-
-        if non_padding_mask.dim() == 2:
-            non_padding_mask = non_padding_mask.unsqueeze(-1)
+        x, attn = self.self_attention(
+            x, x, x, mask=self_attention_mask, positions=positions, need_weights=need_weights
+        )
 
         if non_padding_mask is not None:
-            x *= non_padding_mask
+            if non_padding_mask.dim() == 2:
+                non_padding_mask = non_padding_mask.unsqueeze(-1)
+            x = x * non_padding_mask
 
         x = self.pos_ffn(x)
         if non_padding_mask is not None:
-            x *= non_padding_mask
+            x = x * non_padding_mask
 
         return x, attn
 
@@ -96,7 +162,8 @@ class MultiHeadAttention(torch.nn.Module):
         d_k: int,
         d_v: int, 
         dropout: float = 0.1, 
-        normalize_before: bool = True
+        normalize_before: bool = True,
+        query_key_transform: Optional[torch.nn.Module] = None
     ):
         r"""Initialize an instance.
 
@@ -108,6 +175,15 @@ class MultiHeadAttention(torch.nn.Module):
             dropout (float, optional): Dropout rate. Defaults to 0.1.
             normalize_before (bool, optional): Whether to apply layer normalization before self-attention. If
                 False, layer normalization is applied after residual self-attention. Defaults to True.
+            query_key_transform (torch.nn.Module, optional): A position-dependent transform applied to the
+                query and key tensors *after* the W_q/W_k projections and the split into heads, and before the
+                dot product. It is called as `query_key_transform(q, k, positions)` with `q` shaped
+                [batch_size, n_head, len_q, d_k], `k` shaped [batch_size, n_head, len_k, d_k] and `positions`
+                shaped [batch_size, seq_len], and must return a `(q, k)` pair of the same shapes. This is the
+                seam a rotary encoding occupies: a rotation applied here makes the attention score a function
+                of the position *difference*, which is not achievable by transforming the layer input. A shared
+                instance may be passed to several layers, so a transform must be stateless across calls.
+                Defaults to None, which leaves the attention unchanged.
         """
 
         super().__init__()
@@ -116,6 +192,7 @@ class MultiHeadAttention(torch.nn.Module):
         self.n_head = n_head
         self.d_k = d_k
         self.d_v = d_v
+        self.query_key_transform = query_key_transform
 
         self.w_qs = torch.nn.Linear(d_model, n_head * d_k, bias=False)
         self.w_ks = torch.nn.Linear(d_model, n_head * d_k, bias=False)
@@ -130,7 +207,15 @@ class MultiHeadAttention(torch.nn.Module):
         self.layer_norm = torch.nn.LayerNorm(d_model, eps=1e-6)
         self.dropout = torch.nn.Dropout(dropout)
 
-    def forward(self, q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
+    def forward(
+        self, 
+        q: Tensor, 
+        k: Tensor, 
+        v: Tensor, 
+        mask: Optional[Tensor] = None,
+        positions: Optional[Tensor] = None,
+        need_weights: bool = False
+    ) -> Tuple[Tensor, Optional[Tensor]]:
         r"""Perform a forward pass through the multi-head attention layer.
 
         Args:
@@ -139,9 +224,13 @@ class MultiHeadAttention(torch.nn.Module):
             v (Tensor): The value `Tensor` with shape [batch size, sequence length, d_model]
             mask (Tensor, optional): Boolean mask `Tensor` preventing attention at the indicated positions
                 in the input sequence. Defaults to None.
+            positions (Tensor, optional): A [batch size, sequence length] tensor of positions passed to
+                `self.query_key_transform`. Ignored when no transform is installed. Defaults to None.
+            need_weights (bool, optional): Whether to return the explicit attention weight matrix. Defaults
+                to False, in which case the returned weights are None.
 
         Returns:
-            Tuple[Tensor, Tensor]: The output `Tensor` and the attention weights.
+            Tuple[Tensor, Optional[Tensor]]: The output `Tensor` and, if `need_weights`, the attention weights.
         """
 
         d_k, d_v, n_head = self.d_k, self.d_v, self.n_head
@@ -160,10 +249,15 @@ class MultiHeadAttention(torch.nn.Module):
         # Transpose to batch size x n heads x seq length x dim for attention dot product
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
 
+        # The rotary seam. q and k are past W_q/W_k and split into heads, which is the only place a
+        # rotation by position yields a score that depends on the position difference alone.
+        if self.query_key_transform is not None:
+            q, k = self.query_key_transform(q, k, positions)
+
         if mask is not None:
             mask = mask.unsqueeze(1)  # For head axis broadcasting.
 
-        output, attn = self.attention(q, k, v, mask=mask)
+        output, attn = self.attention(q, k, v, mask=mask, need_weights=need_weights)
 
         # Transpose to move the head dimension back: b x lq x n x dv
         # Combine the last two dimensions to concatenate all the heads together: b x lq x (n*dv)
@@ -188,7 +282,14 @@ class PositionwiseFeedForward(torch.nn.Module):
         dropout (torch.nn.Dropout): The dropout layer.
     """
 
-    def __init__(self, d_in: int, d_hid: int, dropout: float = 0.1, normalize_before: bool = True):
+    def __init__(
+        self, 
+        d_in: int, 
+        d_hid: int, 
+        dropout: float = 0.1, 
+        normalize_before: bool = True, 
+        activation: str = 'gelu'
+    ):
         r"""Initialize an instance.
         
         Args:
@@ -197,6 +298,9 @@ class PositionwiseFeedForward(torch.nn.Module):
             dropout (float, optional): The dropout rate. Defaults to 0.1.
             normalize_before (bool, optional): Whether to apply layer normalization before the feed-forward network. If
                 False, layer normalization is applied *after* the feed-forward network. Defaults to True.
+            activation (str, optional): The activation applied after the first linear layer, either 'relu' or
+                'gelu'. Defaults to 'gelu', which is what this layer applied unconditionally before the argument
+                existed.
         """
         super().__init__()
 
@@ -204,6 +308,7 @@ class PositionwiseFeedForward(torch.nn.Module):
 
         self.w_1 = torch.nn.Linear(d_in, d_hid)
         self.w_2 = torch.nn.Linear(d_hid, d_in)
+        self.activation = get_activation_module(activation)
 
         self.layer_norm = torch.nn.LayerNorm(d_in, eps=1e-6)
         self.dropout = torch.nn.Dropout(dropout)
@@ -222,7 +327,7 @@ class PositionwiseFeedForward(torch.nn.Module):
         if self.normalize_before:
             x = self.layer_norm(x)
 
-        x = torch.nn.functional.gelu(self.w_1(x))
+        x = self.activation(self.w_1(x))
         x = self.dropout(x)
         x = self.w_2(x)
         x = self.dropout(x)
@@ -282,30 +387,78 @@ class ScaledDotProductAttention(torch.nn.Module):
         super().__init__()
 
         self.temperature = temperature
+        self.attn_dropout = attn_dropout
         self.dropout = torch.nn.Dropout(attn_dropout)
 
-    def forward(self, q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
+    def forward(
+        self, 
+        q: Tensor, 
+        k: Tensor, 
+        v: Tensor, 
+        mask: Optional[Tensor] = None, 
+        need_weights: bool = False
+    ) -> Tuple[Tensor, Optional[Tensor]]:
         r"""Perform a forward pass through the layer
         
         Args:
-            q (Tensor): The query tensor.
-            k (Tensor): The key tensor.
-            v (Tensor): The value tensor.
-            mask (Tensor, optional): The mask tensor. Defaults to None.
+            q (Tensor): The query tensor, [batch_size, n_head, len_q, d_k].
+            k (Tensor): The key tensor, [batch_size, n_head, len_k, d_k].
+            v (Tensor): The value tensor, [batch_size, n_head, len_k, d_v].
+            mask (Tensor, optional): A boolean mask that is True at key positions that must not be attended
+                to, broadcastable to [batch_size, n_head, len_q, len_k]. Defaults to None.
+            need_weights (bool, optional): Whether to build the attention weight matrix explicitly and return
+                it. Defaults to False.
         
         Returns:
-            Tuple[Tensor, Tensor]: The output tensor and the attention weights.
+            Tuple[Tensor, Optional[Tensor]]: The output tensor and, if `need_weights`, the attention weights.
+
+        Note:
+            The default path delegates to `torch.nn.functional.scaled_dot_product_attention`, which never
+            materializes the [batch_size, n_head, len_q, len_k] score matrix. The `need_weights` path is the
+            original explicit implementation, kept because it is the reference the fused path is checked
+            against and because callers that want the weights have no other way to get them.
+
+            The two paths agree to floating-point tolerance everywhere except at a query row whose keys are
+            *all* masked. The explicit path fills those scores with -1e9, so the softmax comes back uniform
+            and the row returns the mean of `v`; the fused path would return NaN, so such rows are given the
+            zero vector instead. Every fully-masked row in this model is a padding row -- a padded timestep in
+            the value encoder, or a leading padded timestep under the event encoder's causal mask -- and
+            `EncoderLayer` multiplies padding rows by zero on the way out, so both paths deliver zero there.
+            Zero, unlike NaN, survives that multiplication.
         """
 
-        attn = torch.matmul(q / self.temperature, k.transpose(2, 3))
+        if need_weights:
+            attn = torch.matmul(q / self.temperature, k.transpose(2, 3))
 
+            if mask is not None:
+                attn = attn.masked_fill(mask, -1e9)
+
+            attn = self.dropout(torch.nn.functional.softmax(attn, dim=-1))
+            output = torch.matmul(attn, v)
+
+            return output, attn
+
+        attend_mask, fully_masked = None, None
         if mask is not None:
-            attn = attn.masked_fill(mask, -1e9)
+            fully_masked = mask.all(dim=-1, keepdim=True)
+            # scaled_dot_product_attention reads a boolean mask as True == "attend here", the opposite of
+            # this layer's convention. Rows that are masked everywhere are released before inverting so the
+            # softmax has something to normalize over, then zeroed afterwards.
+            attend_mask = ~(mask & ~fully_masked)
 
-        attn = self.dropout(torch.nn.functional.softmax(attn, dim=-1))
-        output = torch.matmul(attn, v)
+        output = torch.nn.functional.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attend_mask,
+            dropout_p=self.attn_dropout if self.training else 0.0,
+            scale=1.0 / self.temperature,
+        )
 
-        return output, attn
+        if fully_masked is not None:
+            output = output.masked_fill(fully_masked, 0.0)
+
+        return output, None
 
 
 class TemporalPositionEncoding(torch.nn.Module):
