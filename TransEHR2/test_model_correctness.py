@@ -423,3 +423,81 @@ def test_in_stay_gaps_are_on_the_resample_grid():
     gaps = (times[:, 1:] - times[:, :-1]) * both_valid
     assert gaps.max().item() <= 1.0, f'inter-event gap of {gaps.max().item()} h survived'
 
+
+# --------------------------------------------------------------------------------------------
+# Fix 04 -- max readout is padding-invariant
+# --------------------------------------------------------------------------------------------
+
+class _FixedEncoder(torch.nn.Module):
+    """Returns an encoding determined by the timestamp, so padding cannot change observed rows."""
+
+    def forward(self, indicators, times, masks):
+        # Every observed position gets a strictly negative encoding: -(1 + t).
+        return -(1.0 + times)[..., None].expand(-1, -1, D_MODEL).contiguous()
+
+
+def _max_readout(masks, times):
+    """Run MixedClassifier with aggr='max' and capture what reaches the output head."""
+    from TransEHR2.models import MixedClassifier
+
+    model = MixedClassifier(
+        event_encoder=_FixedEncoder(),
+        val_encoder=_FixedEncoder(),
+        d_event_enc=D_MODEL,
+        d_val_enc=0,
+        d_statics=0,
+        num_classes=2,
+        aggr='max',
+    )
+    captured = {}
+
+    def _capture(module, inputs, output):
+        # Must return None: a forward hook's return value replaces the module's output.
+        captured['x'] = inputs[0].detach()
+
+    model.linear.register_forward_hook(_capture)
+    batch = {
+        'event_data': {
+            'indicators': torch.zeros(masks.shape[0], masks.shape[1], N_EVENT_FEATS),
+            'times': times,
+            'masks': masks,
+        }
+    }
+    model(batch)
+    return captured['x']
+
+
+def test_max_readout_never_returns_a_value_no_record_produced():
+    """With every observed encoding negative, a zeroed-padding max returns 0 -- from nothing."""
+
+    masks = torch.tensor([[1.0, 1.0, 1.0, 0.0]])
+    times = torch.tensor([[1.0, 2.0, 3.0, 0.0]])
+
+    readout = _max_readout(masks, times)
+    # Observed encodings are -2, -3, -4; the max over observed records is -2.
+    assert torch.allclose(readout, torch.full_like(readout, -2.0)), (
+        f'max readout returned {readout.flatten()[0].item()}, expected -2.0 '
+        '(0.0 means padding won the max)'
+    )
+
+
+def test_max_readout_is_invariant_to_padding_width():
+    """The same observed records must give the same readout however much padding follows."""
+
+    short = _max_readout(
+        torch.tensor([[1.0, 1.0, 1.0, 0.0]]),
+        torch.tensor([[1.0, 2.0, 3.0, 0.0]]),
+    )
+    long = _max_readout(
+        torch.tensor([[1.0, 1.0, 1.0, 0.0, 0.0, 0.0]]),
+        torch.tensor([[1.0, 2.0, 3.0, 0.0, 0.0, 0.0]]),
+    )
+    assert torch.allclose(short, long)
+
+
+def test_max_readout_gives_all_padding_rows_the_zero_vector():
+    """An episode with no observed records must not come back as -inf."""
+
+    readout = _max_readout(torch.zeros(1, 4), torch.zeros(1, 4))
+    assert torch.all(torch.isfinite(readout)), 'all-padding row leaked -inf'
+    assert torch.allclose(readout, torch.zeros_like(readout))
