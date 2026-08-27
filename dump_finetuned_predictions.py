@@ -284,7 +284,10 @@ def build_classifier(
         dropout=experiment_config['DISCRIMINATOR_ENCODER_DROPOUT'],
         activation=experiment_config['DISCRIMINATOR_ENCODER_ACTIVATION'],
         norm=experiment_config['DISCRIMINATOR_ENCODER_NORM'],
-        normalize_before=experiment_config.get('DISCRIMINATOR_ENCODER_NORM_FIRST', True)
+        normalize_before=experiment_config.get('DISCRIMINATOR_ENCODER_NORM_FIRST', True),
+        position_encoding=experiment_config.get('POSITION_ENCODING', 'additive'),
+        ladder_p_min=experiment_config.get('VALUE_LADDER_P_MIN', None),
+        ladder_p_max=experiment_config.get('VALUE_LADDER_P_MAX', None)
     )
     event_encoder = EventDataEncoder(
         num_types=n_event_types,
@@ -295,7 +298,10 @@ def build_classifier(
         d_k=experiment_config['THP_ENCODER_D_K'],
         d_v=experiment_config['THP_ENCODER_D_V'],
         dropout=experiment_config['THP_ENCODER_DROPOUT'],
-        normalize_before=experiment_config.get('THP_ENCODER_NORM_FIRST', True)
+        normalize_before=experiment_config.get('THP_ENCODER_NORM_FIRST', True),
+        position_encoding=experiment_config.get('POSITION_ENCODING', 'additive'),
+        ladder_p_min=experiment_config.get('EVENT_LADDER_P_MIN', None),
+        ladder_p_max=experiment_config.get('EVENT_LADDER_P_MAX', None)
     )
     return MixedClassifier(
         event_encoder=event_encoder,

@@ -243,6 +243,11 @@ if __name__ == "__main__":
     THP_ENCODER_D_V = experiment_config['THP_ENCODER_D_V']
     THP_ENCODER_DROPOUT = experiment_config['THP_ENCODER_DROPOUT']
     THP_ENCODER_NORM_FIRST = experiment_config.get('THP_ENCODER_NORM_FIRST', False)
+    POSITION_ENCODING = experiment_config.get('POSITION_ENCODING', 'additive')
+    VALUE_LADDER_P_MIN = experiment_config.get('VALUE_LADDER_P_MIN', None)
+    VALUE_LADDER_P_MAX = experiment_config.get('VALUE_LADDER_P_MAX', None)
+    EVENT_LADDER_P_MIN = experiment_config.get('EVENT_LADDER_P_MIN', None)
+    EVENT_LADDER_P_MAX = experiment_config.get('EVENT_LADDER_P_MAX', None)
     GENERATOR_D_MODEL = experiment_config['GENERATOR_D_MODEL']
     GENERATOR_DIM_FEEDFORWARD = experiment_config['GENERATOR_DIM_FEEDFORWARD']
     DISCRIMINATOR_DIM_FEEDFORWARD = experiment_config['DISCRIMINATOR_DIM_FEEDFORWARD']
@@ -469,7 +474,10 @@ if __name__ == "__main__":
                     dropout=GENERATOR_ENCODER_DROPOUT,
                     activation=GENERATOR_ENCODER_ACTIVATION,
                     norm=GENERATOR_ENCODER_NORM,
-                    normalize_before=GENERATOR_ENCODER_NORM_FIRST
+                    normalize_before=GENERATOR_ENCODER_NORM_FIRST,
+                    position_encoding=POSITION_ENCODING,
+                    ladder_p_min=VALUE_LADDER_P_MIN,
+                    ladder_p_max=VALUE_LADDER_P_MAX
                 )
                 discriminator_encoder = ValueDataEncoder(
                     n_features=n_val_feats, feat_dim=tot_val_feat_dim,
@@ -479,14 +487,20 @@ if __name__ == "__main__":
                     dropout=DISCRIMINATOR_ENCODER_DROPOUT,
                     activation=DISCRIMINATOR_ENCODER_ACTIVATION,
                     norm=DISCRIMINATOR_ENCODER_NORM,
-                    normalize_before=DISCRIMINATOR_ENCODER_NORM_FIRST
+                    normalize_before=DISCRIMINATOR_ENCODER_NORM_FIRST,
+                    position_encoding=POSITION_ENCODING,
+                    ladder_p_min=VALUE_LADDER_P_MIN,
+                    ladder_p_max=VALUE_LADDER_P_MAX
                 )
                 thp_encoder = EventDataEncoder(
                     num_types=n_event_types, d_model=THP_ENCODER_D_MODEL,
                     d_inner=THP_ENCODER_D_INNER, n_layers=THP_ENCODER_N_LAYERS,
                     n_head=THP_ENCODER_N_HEADS, d_k=THP_ENCODER_D_K,
                     d_v=THP_ENCODER_D_V, dropout=THP_ENCODER_DROPOUT,
-                    normalize_before=THP_ENCODER_NORM_FIRST
+                    normalize_before=THP_ENCODER_NORM_FIRST,
+                    position_encoding=POSITION_ENCODING,
+                    ladder_p_min=EVENT_LADDER_P_MIN,
+                    ladder_p_max=EVENT_LADDER_P_MAX
                 )
                 generator = MaskedTokenGenerator(
                     encoder=generator_encoder, d_model=GENERATOR_D_MODEL,

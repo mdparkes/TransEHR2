@@ -485,6 +485,107 @@ def test_the_rotary_arm_holds_its_phase_at_production_scale():
     assert delta / scale < 1e-3, f'phase was lost at production timestamps ({delta:.3e})'
 
 
+
+
+
+# --------------------------------------------------------------------------------------------
+# Config threading
+# --------------------------------------------------------------------------------------------
+
+ENTRY_POINTS = (
+    'run_experiment_accelerate.py',
+    'tune_hyperparameters_accelerate.py',
+    'dump_finetuned_predictions.py',
+    'TransEHR2/test_tune_hyperparameters.py',
+)
+LADDER_KEYS = ('POSITION_ENCODING', 'VALUE_LADDER_P_MIN', 'VALUE_LADDER_P_MAX',
+               'EVENT_LADDER_P_MIN', 'EVENT_LADDER_P_MAX')
+
+
+def _encoder_call_sites():
+    """Every ValueDataEncoder/EventDataEncoder construction in the entry-point scripts.
+
+    Parsed rather than imported: these modules pull in tensorboard and accelerate, so importing
+    them to check a keyword would make this probe depend on the training environment.
+    """
+    import ast
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    for name in ENTRY_POINTS:
+        path = root / name
+        if not path.exists():
+            continue
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+                continue
+            if node.func.id in ('ValueDataEncoder', 'EventDataEncoder'):
+                yield name, node
+
+
+def test_every_construction_site_takes_the_encoding_arm():
+    """A site that misses the arm silently runs the additive encoding inside a rotary experiment.
+
+    There are more of these than the plan counted -- the two predictor encoders are rebuilt twice
+    in run_experiment_accelerate.py, and the tuner exists in two copies -- which is the reason to
+    check by parsing rather than by remembering.
+    """
+    import ast
+
+    sites = list(_encoder_call_sites())
+    assert len(sites) >= 12, f'only found {len(sites)} construction sites; the scan is not working'
+
+    missing = []
+    mismatched = []
+    for filename, node in sites:
+        keywords = {keyword.arg: ast.unparse(keyword.value) for keyword in node.keywords}
+        for required in ('position_encoding', 'ladder_p_min', 'ladder_p_max'):
+            if required not in keywords:
+                missing.append(f'{filename}:{node.lineno} {node.func.id} lacks {required}')
+
+        # The value stream sees history; the event stream is in-stay only post fix 03. They have
+        # different gap ranges, so they must not share a ladder.
+        wanted = 'VALUE_LADDER' if node.func.id == 'ValueDataEncoder' else 'EVENT_LADDER'
+        bounds = keywords.get('ladder_p_min', '')
+        if 'LADDER' in bounds and wanted not in bounds:
+            mismatched.append(f'{filename}:{node.lineno} {node.func.id} is given {bounds}')
+
+    assert not missing, '\n'.join(missing)
+    assert not mismatched, '\n'.join(mismatched)
+    print(f'  {len(sites)} construction sites, all threaded')
+
+
+def test_the_shipped_tuning_config_parses_to_numbers():
+    """YAML 1.1 reads `7.9e6` as a string -- the exponent needs an explicit sign.
+
+    A string reaches `build_frequency_ladder` and compares against a float, so the failure is a
+    TypeError inside model construction with nothing pointing at the config file.
+    """
+    import pathlib
+
+    import yaml
+
+    path = (
+        pathlib.Path(__file__).resolve().parent
+        / 'configs' / 'experiments' / 'tune_hyperparameters.yaml'
+    )
+    config = yaml.safe_load(path.read_text())
+
+    assert config['POSITION_ENCODING'] in ('additive', 'rope')
+    for key in LADDER_KEYS[1:]:
+        assert isinstance(config[key], float), (
+            f'{key} parsed as {type(config[key]).__name__} ({config[key]!r}); '
+            'yaml 1.1 needs a decimal point and a signed exponent'
+        )
+    assert config['VALUE_LADDER_P_MAX'] > config['EVENT_LADDER_P_MAX'], (
+        'the value stream spans history and must reach further than the in-stay event stream'
+    )
+    # And the bounds actually build, which is the only check that exercises both together.
+    build_frequency_ladder(D_MODEL // 2, config['VALUE_LADDER_P_MIN'], config['VALUE_LADDER_P_MAX'])
+    build_frequency_ladder(D_MODEL // 2, config['EVENT_LADDER_P_MIN'], config['EVENT_LADDER_P_MAX'])
+
+
 if __name__ == '__main__':
     failures = 0
     for name, fn in sorted(globals().items()):

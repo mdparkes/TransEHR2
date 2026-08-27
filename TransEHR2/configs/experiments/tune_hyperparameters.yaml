@@ -48,6 +48,22 @@ EPISODE_LEN_STEPS: null
 # Whether to let the generator and discriminator predict feature presence indicators as well as values
 PREDICT_INDICATORS: False
 
+# Temporal encoding arm, applied to the value and event encoders alike.
+#   'additive' -- TemporalPositionEncoding added to the embedding, as submitted.
+#   'rope'     -- the same ladder rotated into q and k instead, so the score depends on the gap.
+# Both arms run the same frozen ladder, spaced log-uniformly in period between P_MIN and P_MAX.
+# The bounds follow the informative-band criterion 0.1 <= gap/lambda <= pi, which in periods is
+# P_MIN = 2 * gap_min and P_MAX ~ 63 * gap_max.
+#   Value stream: gaps 1 - 125,073 h (history included).  Event stream: 1 - 48 h, in-stay only.
+# CONFIRM VALUE_LADDER_P_MAX against the re-extracted arrays -- 125,073 h is a measured maximum
+# from the pre-re-extraction data, not the 500-step cap. Omitting all four keys keeps the
+# inherited 1e4 ladder, which leaves no band coherent past ~1e5 h and should not be run.
+POSITION_ENCODING: 'additive'
+VALUE_LADDER_P_MIN: 2.0
+VALUE_LADDER_P_MAX: 7.9e+6   # yaml 1.1 needs the sign, or this parses as a string
+EVENT_LADDER_P_MIN: 2.0
+EVENT_LADDER_P_MAX: 3000.0
+
 GENERATOR_ENCODER_D_MODEL: 256
 GENERATOR_ENCODER_N_HEADS: 2
 GENERATOR_ENCODER_N_ENCODER_BLOCKS: 1
