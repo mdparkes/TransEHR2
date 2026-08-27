@@ -386,7 +386,9 @@ def _collated():
 
     # A full history window, a partial one, and none at all -- the last two carry leading padding.
     batch = [_episode(HIST_LEN), _episode(2), _episode(0)]
-    return collate_tensorized(batch, max_history_len_steps=HIST_LEN)
+    # Passed positionally: the history-length argument is named max_history_len_steps on main and
+    # history_len_steps on the sequence-length branches, and this probe has to run on both.
+    return collate_tensorized(batch, True, HIST_LEN)
 
 
 def test_event_stream_drops_the_history_region():
