@@ -107,6 +107,20 @@ misc/
 # Development notes
 notes.md
 
+# Working documents that are mine rather than the project's. Ignored so that no `git add -A` can
+# pull them back in, and so they survive branch switches, `git checkout`, `git reset --hard` and
+# `git clean -fd`. The revision plan lives in development/resources/.
+# NOTE `git clean -fdx` deletes ignored files too -- that is the one operation this does not
+# protect against, so do not run it in this repository.
+development/
+
+# Manuscript tables, generated from the reporting scripts
+tables/
+
+# Reporting script for the historic-diagnosis audit. Its input, audit_historic_diagnoses.py, IS
+# tracked; this one is kept local at Michael's request.
+report_historic_diagnosis_audit.py
+
 # Claude Code local settings, skills, and worktrees
 .claude/
 
