@@ -62,8 +62,19 @@ STATIC_FEATS:
   - "Gender"
 
 # Data preprocessing parameters
+#
+# MAX_EPISODE_LEN_STEPS and MAX_HISTORY_LEN_STEPS set the *extraction-time capacity* of the
+# timestep axis: extracted arrays are MAX_HISTORY_LEN_STEPS + MAX_EPISODE_LEN_STEPS wide, with
+# history right-justified in the leading region and in-stay data starting at index
+# MAX_HISTORY_LEN_STEPS. Changing either value requires re-extracting the data.
+#
+# To train or tune with *shorter* limits, do not touch these. Set HISTORY_LEN_STEPS and/or
+# EPISODE_LEN_STEPS in the experiment config instead: those crop the extracted arrays at load
+# time, which is equivalent to re-extracting at the shorter limit. Extract once at the largest
+# limits you intend to study, then sweep downwards from the experiment config.
+
 # Maximum number of timesteps per episode (default: 500)
-MAX_EPISODE_LEN_STEPS: 50
+MAX_EPISODE_LEN_STEPS: 50 
 
 # Maximum number of timesteps in patient history (default: 5000)
 MAX_HISTORY_LEN_STEPS: 500

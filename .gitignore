@@ -67,6 +67,9 @@ Thumbs.db
 
 .cache/
 
+# SLURM script directory
+SLURM/
+
 # mimic4dataprep library
 mimic4dataprep/
 
@@ -102,6 +105,9 @@ misc/
 
 # Development notes
 notes.md
+
+# Claude Code local settings, skills, and worktrees
+.claude/
 
 # PyTorch / Training artifacts
 *.pt
