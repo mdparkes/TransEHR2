@@ -92,7 +92,8 @@ checkpoints/
 TransEHR2/configs/**/test*.yaml
 
 # Test scripts
-tests/
+# tests/ is tracked: the fix verification probes have to travel with the commits they defend,
+# including to the IBD fork, which takes them by cherry-pick.
 analyze_timestep_counts.py
 analyze_dataload_times.py
 test_run_experiment_accelerate.py
@@ -113,3 +114,4 @@ notes.md
 *.pt
 *.pth
 *.ckpt
+tests/__pycache__/
