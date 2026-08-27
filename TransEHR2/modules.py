@@ -6,7 +6,14 @@ from torch import Tensor
 from transformers import AutoTokenizer, AutoModel
 from typing import Dict, List, Optional, Tuple
 
-from TransEHR2.constants import HF_API_TOKEN, LLM_NAME, MAX_TOKEN_LENGTH, PAD, TOKENIZER_PAD_TOKEN
+from TransEHR2.constants import (
+    HF_API_TOKEN,
+    LLM_NAME,
+    MAX_TOKEN_LENGTH,
+    PAD,
+    TEXT_POOLING,
+    TOKENIZER_PAD_TOKEN,
+)
 from TransEHR2.data.custom_types import EventAssociatedTensorData, ValueAssociatedTensorData
 from TransEHR2.layers import (
     EncoderLayer,
@@ -27,10 +34,30 @@ class GradientTraceableLLM(torch.nn.Module):
         max_length: int = MAX_TOKEN_LENGTH,
         use_gradient_checkpointing: bool = True,
         device_map: str = 'cpu',
-        torch_dtype=None,
+        dtype=None,
+        pooling: str = TEXT_POOLING,
     ):
+        """Initialize an instance.
+
+        Args:
+            model_name (str): The model to load, a Hugging Face repository id or a local path.
+            max_length (int): The token sequence length the tokenizer pads and truncates to.
+            use_gradient_checkpointing (bool, optional): Whether to enable gradient checkpointing.
+                Defaults to True.
+            device_map (str, optional): Passed to `from_pretrained`. Defaults to 'cpu'.
+            dtype (optional): Passed to `from_pretrained`. Named for the transformers v5 argument;
+                `torch_dtype` is deprecated there and warns on every load. Defaults to None.
+            pooling (str, optional): How a token sequence is reduced to one embedding, 'cls' or
+                'mean'. Defaults to `TEXT_POOLING`.
+
+        Raises:
+            ValueError: If `pooling` is neither 'cls' nor 'mean'.
+        """
 
         super().__init__()
+        if pooling not in ('cls', 'mean'):
+            raise ValueError(f"pooling: expected 'cls' or 'mean', got {pooling}.")
+        self.pooling = pooling
         self.use_gradient_checkpointing = use_gradient_checkpointing
         # Initialize the model on CPU to avoid GPU memory issues during FSDP wrapping
         # Try to load from local files to avoid hitting rate limits on Hugging Face
@@ -59,16 +86,23 @@ class GradientTraceableLLM(torch.nn.Module):
                 token=HF_API_TOKEN,
                 device_map='cpu',
             )
-        # Using add_special_tokens so that pad_token_id is set automatically
-        self.tokenizer.add_special_tokens({'pad_token': TOKENIZER_PAD_TOKEN})
+        # Llama ships without a padding token, so one has to be invented. Encoder models
+        # generally have one already -- bge-m3 uses '<pad>' -- and adding a second would both grow
+        # the vocabulary by a row the checkpoint never trained and move padding off the token the
+        # model was trained to ignore. Only add one when it is missing.
+        if self.tokenizer.pad_token is None:
+            # Using add_special_tokens so that pad_token_id is set automatically
+            self.tokenizer.add_special_tokens({'pad_token': TOKENIZER_PAD_TOKEN})
         self.model = AutoModel.from_pretrained(
             model_name,
             token=HF_API_TOKEN,
             device_map=device_map,
-            torch_dtype=torch_dtype,
+            dtype=dtype,
         )
-        # Resize to account for padding token
-        self.model.resize_token_embeddings(len(self.tokenizer))
+        # Resize only when the tokenizer actually grew. Unconditionally resizing a 250k-row
+        # embedding matrix rebuilds 256M parameters to change nothing.
+        if self.model.get_input_embeddings().weight.size(0) != len(self.tokenizer):
+            self.model.resize_token_embeddings(len(self.tokenizer))
         self.max_length = max_length
 
         # Freeze the LLM parameters to prevent them from being updated during training
@@ -111,13 +145,21 @@ class GradientTraceableLLM(torch.nn.Module):
         with torch.set_grad_enabled(trace_grads):  # Only trace gradients if trace_grads is True
             outputs = self.model(token_ids, attention_mask=attention_mask)
             embeddings = outputs.last_hidden_state  # (N, max_token_length, embed_dim)
-            # Mean-pool the non-padding token embeddings of each sequence
-            #   embeddings shape after mean-pooling: (N, embed_dim)
-            if attention_mask is not None:
-                mask_expanded = attention_mask.unsqueeze(-1).float()
-                embeddings = (embeddings * mask_expanded).sum(dim=1) / mask_expanded.sum(dim=1).clamp(min=1)
+            #   embeddings shape after pooling: (N, embed_dim)
+            if self.pooling == 'cls':
+                # Position 0 is the sequence representation an encoder model was trained to
+                # produce, and it is what bge-m3's contrastive objective optimized. This assumes
+                # right padding, which LLMTextProcessor asserts at tokenization time -- with left
+                # padding position 0 is a pad token and the embedding is content-free.
+                embeddings = embeddings[:, 0]
             else:
-                embeddings = embeddings.mean(dim=1)
+                # Mean-pool the non-padding token embeddings of each sequence. Correct for a
+                # decoder, whose position 0 carries only a BOS token.
+                if attention_mask is not None:
+                    mask_expanded = attention_mask.unsqueeze(-1).float()
+                    embeddings = (embeddings * mask_expanded).sum(dim=1) / mask_expanded.sum(dim=1).clamp(min=1)
+                else:
+                    embeddings = embeddings.mean(dim=1)
             
             # Add a hook to save gradients during the backward pass, but only if we're tracing gradients
             if trace_grads and embeddings.requires_grad:

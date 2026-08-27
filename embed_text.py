@@ -357,7 +357,7 @@ def main():
     llm = GradientTraceableLLM(
         use_gradient_checkpointing=False,
         device_map='auto',
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         **llm_kwargs,
     )
     llm.eval()

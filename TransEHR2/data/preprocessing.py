@@ -65,9 +65,20 @@ class LLMTextProcessor:
                 tokenizer_name,
                 token=HF_API_TOKEN,
             )
-        self.tokenizer.add_special_tokens(
-            {'pad_token': TOKENIZER_PAD_TOKEN}
-        )
+        # Only invent a padding token when the tokenizer lacks one; see GradientTraceableLLM
+        # for why adding a second is worse than reusing the model's own.
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.add_special_tokens(
+                {'pad_token': TOKENIZER_PAD_TOKEN}
+            )
+        # CLS pooling reads position 0, so padding has to go on the right. Every tokenizer in play
+        # defaults to that, but a left-padding one would silently make every text embedding the
+        # embedding of a pad token -- no error, no shape change, and nothing downstream to notice.
+        if getattr(self.tokenizer, 'padding_side', 'right') != 'right':
+            raise ValueError(
+                f'{model_name} tokenizes with padding_side='
+                f'{self.tokenizer.padding_side!r}; CLS pooling needs right padding.'
+            )
         self.max_length = max_length
 
     
