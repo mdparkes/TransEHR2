@@ -150,9 +150,11 @@ def test_encoder_blocks_are_independently_initialized():
     ``nn.TransformerEncoder`` clones a single initialized prototype with ``copy.deepcopy``, so
     every block starts from identical weights. That is a torch quirk rather than a deliberate
     choice here, and it makes a deep stack behave differently from a freshly constructed one.
+    The wrapper is gone now and the blocks are built directly, but the guard stays: it is the
+    property that matters, not the mechanism that used to break it.
     """
     encoder = _build_value_encoder(n_blocks=3)
-    layers = list(encoder.transformer_encoder.layers)
+    layers = list(encoder.layer_stack)
     assert len(layers) == 3
 
     first = layers[0].state_dict()
@@ -267,7 +269,7 @@ def test_batchnorm_encoder_builds_and_runs():
     nothing exercised it.
     """
     encoder = _build_value_encoder(norm='BatchNorm')
-    layers = list(encoder.transformer_encoder.layers)
+    layers = list(encoder.layer_stack)
     assert all(isinstance(layer, TransformerBatchNormEncoderLayer) for layer in layers)
 
     indicators, values, timestamps, masks = _synthetic_batch()
