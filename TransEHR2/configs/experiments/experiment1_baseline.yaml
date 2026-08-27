@@ -46,7 +46,8 @@ THP_ENCODER_D_MODEL: 256
 THP_ENCODER_D_INNER: 256
 THP_ENCODER_N_LAYERS: 1
 THP_ENCODER_N_HEADS: 2
-THP_ENCODER_D_K: 64
+THP_ENCODER_D_K: 128  # = d_model/2, so RoPE gets n_head*d_k/2 = 128 bands, matching TPE
+                      # d_v stays 64: only q and k are rotated, so only their width sets the ladder
 THP_ENCODER_D_V: 64
 THP_ENCODER_DROPOUT: 0.1
 THP_ENCODER_NORM_FIRST: True
