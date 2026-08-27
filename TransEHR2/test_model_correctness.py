@@ -323,3 +323,103 @@ if __name__ == '__main__':
         else:
             print(f'PASS {name}')
     raise SystemExit(1 if failures else 0)
+
+
+# --------------------------------------------------------------------------------------------
+# Fix 03 -- THP restricted to in-stay records
+# --------------------------------------------------------------------------------------------
+
+HIST_LEN = 6
+EPISODE_LEN = 4
+N_EVENT_FEATS = 3
+
+
+def _episode(n_hist_records: int):
+    """One episode dict in the stored extraction layout.
+
+    History is right-justified in ``[0, HIST_LEN)`` and in-stay data is left-justified from
+    ``HIST_LEN``, so an episode holding fewer than ``HIST_LEN`` historical records carries a run
+    of leading padding -- the case the THP indexing bug turns on.
+    """
+    ts = HIST_LEN + EPISODE_LEN
+    masks = torch.zeros(ts)
+    times = torch.zeros(ts)
+
+    if n_hist_records:
+        lo = HIST_LEN - n_hist_records
+        masks[lo:HIST_LEN] = 1.0
+        # Historical records sit far in the past, on no particular grid.
+        times[lo:HIST_LEN] = torch.linspace(-5000.0, -100.0, n_hist_records)
+
+    # In-stay records are left-justified from HIST_LEN and lie on the 1 h resample grid.
+    masks[HIST_LEN:] = 1.0
+    times[HIST_LEN:] = torch.arange(float(EPISODE_LEN))
+
+    event_ind = torch.zeros(ts, N_EVENT_FEATS)
+    event_ind[masks.bool()] = 1.0
+
+    return {
+        'val_numeric_indicators': torch.zeros(ts, 1),
+        'val_numeric_values': [torch.zeros(ts, 1)],
+        'val_categorical_indicators': torch.zeros(ts, 0),
+        'val_categorical_values': [],
+        'val_ordinal_indicators': torch.empty(0),
+        'val_ordinal_values': [],
+        'val_multilabel_indicators': torch.empty(0),
+        'val_multilabel_values': [],
+        'val_text_indicators': torch.zeros(ts, 0),
+        'val_text_embeddings': [],
+        'val_times': times.clone(),
+        'val_masks': masks.clone(),
+        'event_indicators': event_ind,
+        'event_times': times.clone(),
+        'event_masks': masks.clone(),
+        'static_data': torch.zeros(2),
+        'mortality': torch.tensor(0.0),
+        'length_of_stay': torch.tensor(1.0),
+        'phenotype': torch.zeros(3),
+    }
+
+
+def _collated():
+    from TransEHR2.data.preprocessing import collate_tensorized
+
+    # A full history window, a partial one, and none at all -- the last two carry leading padding.
+    batch = [_episode(HIST_LEN), _episode(2), _episode(0)]
+    return collate_tensorized(batch, max_history_len_steps=HIST_LEN)
+
+
+def test_event_stream_drops_the_history_region():
+    """The event stream the THP sees must be in-stay records only."""
+
+    out = _collated()
+    for key in ('indicators', 'times', 'masks'):
+        assert out['event_data'][key].shape[1] == EPISODE_LEN, (
+            f"event_data['{key}'] is {out['event_data'][key].shape[1]} wide, "
+            f'expected {EPISODE_LEN}'
+        )
+    # History still reaches the value encoder.
+    assert out['val_data']['masks'].shape[1] == HIST_LEN + EPISODE_LEN
+
+
+def test_first_event_index_is_observed_for_every_episode():
+    """The THP gates its base intensity on index 0, so index 0 must never be padding.
+
+    This is what fails on the unfixed code: an episode with fewer than HIST_LEN historical
+    records has padding at index 0, so `initial_non_event_ll` is multiplied by zero and the
+    base-intensity term silently vanishes.
+    """
+
+    first = _collated()['event_data']['masks'][:, 0]
+    assert torch.all(first == 1.0), f'padding at event index 0 for some episode: {first}'
+
+
+def test_in_stay_gaps_are_on_the_resample_grid():
+    """Restricting to in-stay records removes the history/in-stay boundary delta."""
+
+    out = _collated()
+    times, masks = out['event_data']['times'], out['event_data']['masks']
+    both_valid = masks[:, 1:] * masks[:, :-1]
+    gaps = (times[:, 1:] - times[:, :-1]) * both_valid
+    assert gaps.max().item() <= 1.0, f'inter-event gap of {gaps.max().item()} h survived'
+
