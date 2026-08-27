@@ -364,6 +364,17 @@ class TransformerBatchNormEncoderLayer(torch.nn.Module):
     It differs from TransformerEncoderLayer in torch/nn/modules/transformer.py in that it replaces LayerNorm
     with BatchNorm.
 
+    The layer is batch-first unconditionally: it builds its `MultiheadAttention` with
+    `batch_first=True` and expects `(batch_size, seq_len, d_model)` input. Unlike
+    `torch.nn.TransformerEncoderLayer` it takes no `batch_first` argument, so callers that
+    build either layer from a shared set of keyword arguments must not pass one.
+
+    Note:
+        `src_key_padding_mask` gates attention but not normalization: padded timesteps still
+        contribute to the BatchNorm statistics. This matches the upstream mvts_transformer
+        layer this derives from, and biases the running statistics toward whatever padding
+        embeds to as the padded fraction of a batch grows.
+
     Attributes:
         self_attn (torch.nn.modules.MultiheadAttention): A multi-head attention mechanism
         linear1 (torch.nn.modules.Linear): The first linear transformation in the feedforward network
@@ -437,7 +448,8 @@ class TransformerBatchNormEncoderLayer(torch.nn.Module):
         self, 
         src: Tensor, 
         src_mask: Optional[Tensor] = None,
-        src_key_padding_mask: Optional[Tensor] = None
+        src_key_padding_mask: Optional[Tensor] = None,
+        is_causal: bool = False
     ) -> Tensor:
         r"""Pass the input through the encoder layer.
 
@@ -452,41 +464,56 @@ class TransformerBatchNormEncoderLayer(torch.nn.Module):
         it is shorter than a predefined length, and the padding mask would indicate which elements are padding.
 
         Args:
-            src (Tensor): the sequence to the encoder layer.
+            src (Tensor): the sequence to the encoder layer, shaped
+                `[batch_size, seq_len, d_model]`.
             src_mask (Tensor, optional): the mask for the src sequence.
             src_key_padding_mask (Tensor, optional): the mask for the src keys per batch.
+            is_causal (bool, optional): a hint that `src_mask` is the causal mask, forwarded to
+                the attention. `torch.nn.TransformerEncoder` passes this to every layer it calls,
+                so the parameter has to be accepted. Defaults to False.
         Returns:
             Tensor: The result of a forward pass through the self-attention and feedforward layers. The shape of the
-                output is `[seq_len, batch_size, d_model]`, where `seq_len` is the length of the input token sequence
-                and `d_model` is the model's embedding dimensionality.
+                output matches the input, `[batch_size, seq_len, d_model]`, where `seq_len` is the length of the input
+                token sequence and `d_model` is the model's embedding dimensionality.
         """
+        # BatchNorm1d(d_model) needs the feature axis second. permute(1, 2, 0) moves the last
+        # axis into that slot and permute(2, 0, 1) is its exact inverse, so the pair round-trips
+        # whatever layout it is given. BatchNorm pools over both non-channel axes, making the
+        # statistics one mean/variance per feature over every (episode, timestep) position --
+        # the same element set either way. Both are therefore still correct now that the encoder
+        # feeds (batch_size, seq_len, d_model) rather than the transposed layout these permutes
+        # were originally written for.
         if self.norm_first:
             # Pre-LN: normalize before attention and feedforward
             # Self-attention with pre-normalization
-            src_normalized = src.permute(1, 2, 0)  # (batch_size, d_model, seq_len)
+            src_normalized = src.permute(1, 2, 0)  # BatchNorm wants channels second, (seq_len, d_model, batch_size)
             src_normalized = self.norm1(src_normalized)
-            src_normalized = src_normalized.permute(2, 0, 1)  # (seq_len, batch_size, d_model)
+            src_normalized = src_normalized.permute(2, 0, 1)  # Restore, (batch_size, seq_len, d_model)
             src2 = self.self_attn(src_normalized, src_normalized, src_normalized, 
-                                  attn_mask=src_mask, key_padding_mask=src_key_padding_mask)[0]
+                                  attn_mask=src_mask, key_padding_mask=src_key_padding_mask,
+                                  is_causal=is_causal)[0]
             src = src + self.dropout1(src2)  # Residual connection
             # Feedforward with pre-normalization
-            src_normalized = src.permute(1, 2, 0)  # (batch_size, d_model, seq_len)
+            src_normalized = src.permute(1, 2, 0)  # BatchNorm wants channels second, (seq_len, d_model, batch_size)
             src_normalized = self.norm2(src_normalized)
-            src_normalized = src_normalized.permute(2, 0, 1)  # (seq_len, batch_size, d_model)
+            src_normalized = src_normalized.permute(2, 0, 1)  # Restore, (batch_size, seq_len, d_model)
             src2 = self.linear2(self.dropout(self.activation(self.linear1(src_normalized))))
             src = src + self.dropout2(src2)  # Residual connection
         else:
             # Post-LN: normalize after attention and feedforward (original behaviour)
             # Self-attention
-            src2 = self.self_attn(src, src, src, attn_mask=src_mask, key_padding_mask=src_key_padding_mask)[0]
-            src = src + self.dropout1(src2)  # Residual connection, (seq_len, batch_size, d_model)
-            src = src.permute(1, 2, 0)  # Reshape for BatchNorm, (batch_size, d_model, seq_len)
+            src2 = self.self_attn(
+                src, src, src, attn_mask=src_mask, key_padding_mask=src_key_padding_mask,
+                is_causal=is_causal
+            )[0]
+            src = src + self.dropout1(src2)  # Residual connection, (batch_size, seq_len, d_model)
+            src = src.permute(1, 2, 0)  # Reshape for BatchNorm, (seq_len, d_model, batch_size)
             src = self.norm1(src)  # Perform batch normalization
-            src = src.permute(2, 0, 1)  # Restore original shape, (seq_len, batch_size, d_model)
+            src = src.permute(2, 0, 1)  # Restore original shape, (batch_size, seq_len, d_model)
             # Feedforward network
             src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
-            src = src + self.dropout2(src2)  # (seq_len, batch_size, d_model)
-            src = src.permute(1, 2, 0)  # Reshape for BatchNorm, (batch_size, d_model, seq_len)
+            src = src + self.dropout2(src2)  # (batch_size, seq_len, d_model)
+            src = src.permute(1, 2, 0)  # Reshape for BatchNorm, (seq_len, d_model, batch_size)
             src = self.norm2(src)  # Perform batch normalization
-            src = src.permute(2, 0, 1)  # Restore original shape, (seq_len, batch_size, d_model)
+            src = src.permute(2, 0, 1)  # Restore original shape, (batch_size, seq_len, d_model)
         return src

@@ -1215,7 +1215,9 @@ def collate_tensorized(
         history_len_steps: Number of leading timestep indices in the
             incoming tensors that hold historical records. This is the
             post-crop history length (see MixedDataset), not necessarily
-            the extraction-time MAX_HISTORY_LEN_STEPS. Only used when
+            the extraction-time MAX_HISTORY_LEN_STEPS. The event stream is
+            always sliced at this index so the THP sees in-stay records
+            only; it additionally masks the value history when
             use_historical_records is False.
     """
 
@@ -1228,7 +1230,6 @@ def collate_tensorized(
     # Mask out history region when historical records are disabled
     if not use_historical_records and history_len_steps > 0:
         val_masks[:, :history_len_steps] = 0.0
-        event_masks[:, :history_len_steps] = 0.0
     static_data = torch.stack([b['static_data'] for b in batch], dim=0)
 
     # Stack indicator tensors
@@ -1238,6 +1239,27 @@ def collate_tensorized(
     val_multilabel_ind = torch.stack([b['val_multilabel_indicators'] for b in batch], dim=0)
     val_text_ind = torch.stack([b['val_text_indicators'] for b in batch], dim=0)
     event_ind = torch.stack([b['event_indicators'] for b in batch], dim=0)
+
+    # Restrict the event stream to in-stay records.
+    #
+    # The THP gates its base-intensity term on tensor index 0 (`initial_non_event_ll` keys off
+    # `non_pad_mask[:, 0]`) and shifts its type and time losses by one index. History is
+    # right-justified in the leading history region, so every episode holding less than the full
+    # history capacity carries a run of leading padding -- which silently drops the base intensity
+    # and misaligns the shifted targets. Slicing the history region away makes index 0 the first
+    # in-stay record for every episode: episode data is left-justified from history_len_steps and
+    # MIN_EPISODE_LEN_STEPS guarantees the slot is filled. history_len_steps is the post-crop
+    # length, so this tracks HISTORY_LEN_STEPS as the sequence-length sweep moves it.
+    #
+    # It also collapses the inter-event gaps the THP models. The delta across the history/in-stay
+    # boundary spans the whole pre-admission interval, where in-stay records sit on the ~1 h
+    # resample grid, so the time-prediction targets stop spanning orders of magnitude.
+    #
+    # History still reaches the value encoder; only the event stream is restricted.
+    if history_len_steps > 0:
+        event_times = event_times[:, history_len_steps:].contiguous()
+        event_masks = event_masks[:, history_len_steps:].contiguous()
+        event_ind = event_ind[:, history_len_steps:].contiguous()
 
     # Stack per-feature value tensors
     n_numeric_feats = len(batch[0]['val_numeric_values'])

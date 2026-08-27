@@ -408,8 +408,19 @@ class ValueDataEncoder(torch.nn.Module):
         # dropout will also be applied to the position encoding of the event-associated data encoder in this 
         # implementation.
         self.position_encoding_layer = TemporalPositionEncoding(d_model=d_model, dropout=0.1)
-        self.encoder_layer = self._get_encoder_layer(norm, activation, dropout)
-        self.transformer_encoder = torch.nn.TransformerEncoder(self.encoder_layer, n_encoder_blocks)
+        # nn.TransformerEncoder clones its prototype layer with copy.deepcopy, which has two
+        # consequences we do not want. Every block would start from identical weights, so a
+        # deeper stack behaves differently from a freshly constructed one; and the prototype
+        # stays registered as a submodule that forward never calls, leaving its parameters in
+        # the state dict, in the optimizer, and in DDP's reduction set without ever receiving a
+        # gradient. Build the blocks independently and install them directly instead.
+        encoder_layers = [
+            self._get_encoder_layer(norm, activation, dropout) for _ in range(n_encoder_blocks)
+        ]
+        self.transformer_encoder = torch.nn.TransformerEncoder(
+            encoder_layers[0], n_encoder_blocks, enable_nested_tensor=False
+        )
+        self.transformer_encoder.layers = torch.nn.ModuleList(encoder_layers)
         self.activation = self._get_activation_layer(activation)
         self.dropout = torch.nn.Dropout(dropout)
 
@@ -419,11 +430,14 @@ class ValueDataEncoder(torch.nn.Module):
 
         enc_args, enc_kwargs = (
             [self.d_model, self.n_heads, self.dim_feedforward, dropout],
-            {'activation': activation, 'batch_first': True, 'norm_first': self.normalize_before}
+            {'activation': activation, 'norm_first': self.normalize_before}
         )
         if norm == 'LayerNorm':
-            return torch.nn.TransformerEncoderLayer(*enc_args, **enc_kwargs)
+            return torch.nn.TransformerEncoderLayer(*enc_args, batch_first=True, **enc_kwargs)
         elif norm == 'BatchNorm':
+            # TransformerBatchNormEncoderLayer takes no batch_first argument: it builds its
+            # MultiheadAttention with batch_first=True unconditionally, so it is already
+            # batch-first and passing the keyword raises TypeError.
             return TransformerBatchNormEncoderLayer(*enc_args, **enc_kwargs)
         else:
             raise ValueError(f'norm: Expected "LayerNorm" or "BatchNorm", got {norm}.')
@@ -475,20 +489,18 @@ class ValueDataEncoder(torch.nn.Module):
         # Add time-dependent positional embeddings
         embedding = self.position_encoding_layer(embedding, timestamps, timestep_masks)
 
-        # Permute the embedding tensor to match the expected input shape for the transformer encoder
-        # The transformer expects the input in the shape (seq_length, batch_size, d_model)
-        embedding = embedding.permute(1, 0, 2)
-        
-        # Perform the forward pass through the transformer encoder
-        # NOTE padding mask logic is reversed to comply with MultiHeadAttention, TransformerEncoderLayer
-        # Expects 0/False for tokens that are not masked, 1/True for padding tokens that are masked
-        inverted_timestep_masks = ~timestep_masks.bool().T  # Shape: (seq_length, batch_size)
-        embedding = self.transformer_encoder(embedding, src_key_padding_mask=inverted_timestep_masks)  
+        # The encoder layer is constructed with batch_first=True, so it takes
+        # (batch_size, seq_length, d_model) directly and no permute is needed. Permuting to
+        # (seq_length, batch_size, d_model) made the encoder read the time axis as the batch
+        # axis: attention ran across the episodes that happened to share a batch, and never
+        # across time. The transposed key padding mask matched that misreading, which is why
+        # the shapes lined up and nothing raised.
+        # NOTE padding mask logic is reversed to comply with MultiheadAttention:
+        # False for tokens that are attended to, True for padding tokens that are masked out.
+        inverted_timestep_masks = ~timestep_masks.bool()  # Shape: (batch_size, seq_length)
+        embedding = self.transformer_encoder(embedding, src_key_padding_mask=inverted_timestep_masks)
         embedding = self.activation(embedding)
         embedding = self.dropout(embedding)
-        
-        # Return to original dim order, (batch_size, seq_length, d_model)
-        embedding = embedding.permute(1, 0, 2) 
 
         return embedding
 
@@ -632,39 +644,39 @@ class MaskedTokenGenerator(torch.nn.Module):
         if self.predict_numeric_feats:
             # Extract and mask numeric feature indicators
             numeric_inds = batch['numeric']['indicators']
-            masked_numeric_inds = numeric_inds * record_masks['numeric']['indicators']
+            masked_numeric_inds = numeric_inds * (1 - record_masks['numeric']['indicators'])
             inds_to_concat.append(masked_numeric_inds)
             # Extract and mask numeric feature values
             numeric_vals = torch.cat(batch['numeric']['values'], dim=2)
-            masked_numeric_vals = numeric_vals * torch.cat(record_masks['numeric']['values'], dim=2)
+            masked_numeric_vals = numeric_vals * (1 - torch.cat(record_masks['numeric']['values'], dim=2))
             vals_to_concat.append(masked_numeric_vals)
 
         if self.predict_categorical_feats:
             # Extract and mask categorical feature indicators
             categorical_inds = batch['categorical']['indicators']
-            masked_categorical_inds = categorical_inds * record_masks['categorical']['indicators']
+            masked_categorical_inds = categorical_inds * (1 - record_masks['categorical']['indicators'])
             inds_to_concat.append(masked_categorical_inds)
             # Extract and mask categorical feature values
             categorical_vals = torch.cat(batch['categorical']['values'], dim=2)
-            masked_categorical_vals = categorical_vals * torch.cat(record_masks['categorical']['values'], dim=2)
+            masked_categorical_vals = categorical_vals * (1 - torch.cat(record_masks['categorical']['values'], dim=2))
             vals_to_concat.append(masked_categorical_vals)
 
         if self.predict_ordinal_feats:
             # Extract and mask ordinal feature indicators
             ordinal_inds = batch['ordinal']['indicators']
-            masked_ordinal_inds = ordinal_inds * record_masks['ordinal']['indicators']
+            masked_ordinal_inds = ordinal_inds * (1 - record_masks['ordinal']['indicators'])
             inds_to_concat.append(masked_ordinal_inds)
             # Extract and mask ordinal feature values
             ordinal_vals = torch.cat(batch['ordinal']['values'], dim=2)
-            masked_ordinal_vals = ordinal_vals * torch.cat(record_masks['ordinal']['values'], dim=2)
+            masked_ordinal_vals = ordinal_vals * (1 - torch.cat(record_masks['ordinal']['values'], dim=2))
             vals_to_concat.append(masked_ordinal_vals)
 
         if self.predict_multilabel_feats:
             multilabel_inds = batch['multilabel']['indicators']
-            masked_multilabel_inds = multilabel_inds * record_masks['multilabel']['indicators']
+            masked_multilabel_inds = multilabel_inds * (1 - record_masks['multilabel']['indicators'])
             inds_to_concat.append(masked_multilabel_inds)
             multilabel_vals = torch.cat(batch['multilabel']['values'], dim=2)
-            masked_multilabel_vals = multilabel_vals * torch.cat(record_masks['multilabel']['values'], dim=2)
+            masked_multilabel_vals = multilabel_vals * (1 - torch.cat(record_masks['multilabel']['values'], dim=2))
             vals_to_concat.append(masked_multilabel_vals)
 
         # Concatenate the tensors for numeric, categorical, and ordinal features along the feature dimension
@@ -683,8 +695,8 @@ class MaskedTokenGenerator(torch.nn.Module):
             text_indicators = batch['text']['indicators']
             text_embeddings = batch['text']['embedded_values']
             # Zero out masked text feature embedding components
-            masked_text_indicators = text_indicators * record_masks['text']['indicators']
-            masked_text_embeddings = text_embeddings * torch.stack(record_masks['text']['embedded_values'], dim=2)
+            masked_text_indicators = text_indicators * (1 - record_masks['text']['indicators'])
+            masked_text_embeddings = text_embeddings * (1 - torch.stack(record_masks['text']['embedded_values'], dim=2))
             # Combine the numeric, categorical, and text data into a single tensor for input to the encoder
             #   masked_indicators shape: (batch_size, max_timeseries_length, n_num_feats + n_cat_feats + n_text_feats)
             #   masked_values shape: (batch_size, max_timeseries_length, total_feat_dim)
