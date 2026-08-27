@@ -435,7 +435,15 @@ class MixedClassifier(torch.nn.Module):
             n_obs_records = event_masks.sum(dim=-1, keepdim=True).clamp(min=1)  # Clamp to avoid errors
 
             if self.aggr == 'max':
+                # Padding embeddings were zeroed just above, so a plain max returns 0 for any
+                # channel whose observed values are all negative -- a value no record produced,
+                # and one that depends on how much padding the episode happens to carry. Filling
+                # padding with -inf means it can never win. Rows that are entirely padding come
+                # back all -inf and are sent to the zero vector, which is what the other branches
+                # give them too.
+                event_enc = event_enc.masked_fill(event_masks[..., None] == 0, float('-inf'))
                 event_enc, _ = torch.max(event_enc, dim=1)
+                event_enc = torch.nan_to_num(event_enc, neginf=0.0)
             elif self.aggr == 'mean':
                 event_enc = torch.sum(event_enc, dim=1) / n_obs_records
             elif self.aggr == 'none':
@@ -526,7 +534,11 @@ class MixedClassifier(torch.nn.Module):
                 n_obs_records = val_masks.sum(dim=-1, keepdim=True).clamp(min=1)  # Clamp to avoid errors
 
                 if self.aggr == 'max':
+                    # See the event branch: zeroed padding would win any channel whose observed
+                    # values are all negative, so exclude it with -inf instead.
+                    val_enc = val_enc.masked_fill(val_masks[..., None] == 0, float('-inf'))
                     val_enc, _ = torch.max(val_enc, dim=1)
+                    val_enc = torch.nan_to_num(val_enc, neginf=0.0)
                 elif self.aggr == 'mean':
                     # Exclude padding timesteps from mean calculation
                     val_enc = torch.sum(val_enc, dim=1) / n_obs_records

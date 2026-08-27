@@ -1222,7 +1222,6 @@ def collate_tensorized(
     # Mask out history region when historical records are disabled
     if not use_historical_records and max_history_len_steps > 0:
         val_masks[:, :max_history_len_steps] = 0.0
-        event_masks[:, :max_history_len_steps] = 0.0
     static_data = torch.stack([b['static_data'] for b in batch], dim=0)
 
     # Stack indicator tensors
@@ -1232,6 +1231,26 @@ def collate_tensorized(
     val_multilabel_ind = torch.stack([b['val_multilabel_indicators'] for b in batch], dim=0)
     val_text_ind = torch.stack([b['val_text_indicators'] for b in batch], dim=0)
     event_ind = torch.stack([b['event_indicators'] for b in batch], dim=0)
+
+    # Restrict the event stream to in-stay records.
+    #
+    # The THP gates its base-intensity term on tensor index 0 (`initial_non_event_ll` keys off
+    # `non_pad_mask[:, 0]`) and shifts its type and time losses by one index. History is
+    # right-justified in [0, max_history_len_steps), so every episode holding less than the full
+    # history capacity carries a run of leading padding -- which silently drops the base intensity
+    # and misaligns the shifted targets. Slicing the history region away makes index 0 the first
+    # in-stay record for every episode: episode data is left-justified from max_history_len_steps
+    # and MIN_EPISODE_LEN_STEPS guarantees the slot is filled.
+    #
+    # It also collapses the inter-event gaps the THP models. The delta across the history/in-stay
+    # boundary spans the whole pre-admission interval, where in-stay records sit on the ~1 h
+    # resample grid, so the time-prediction targets stop spanning orders of magnitude.
+    #
+    # History still reaches the value encoder; only the event stream is restricted.
+    if max_history_len_steps > 0:
+        event_times = event_times[:, max_history_len_steps:].contiguous()
+        event_masks = event_masks[:, max_history_len_steps:].contiguous()
+        event_ind = event_ind[:, max_history_len_steps:].contiguous()
 
     # Stack per-feature value tensors
     n_numeric_feats = len(batch[0]['val_numeric_values'])
