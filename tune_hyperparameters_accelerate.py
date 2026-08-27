@@ -207,6 +207,8 @@ if __name__ == "__main__":
     EVENT_FEATS = dataset_config['EVENT_FEATS']
     TEXT_FEATS = dataset_config['TEXT_FEATS']
     STATIC_FEATS = dataset_config['STATIC_FEATS']
+    # Extraction-time capacity of the history region, used to interpret the stored layout of
+    # datasets extracted before that value was recorded in metadata.pkl.
     MAX_HISTORY_LEN_STEPS = dataset_config.get('MAX_HISTORY_LEN_STEPS', 0)
 
     # Get experiment config parameters
@@ -262,6 +264,19 @@ if __name__ == "__main__":
     FINETUNE_TOTAL_EPOCH = experiment_config.get('FINETUNE_TOTAL_EPOCH', 500)
     FINETUNE_LEARNING_RATE_DECAY = experiment_config.get('FINETUNE_LEARNING_RATE_DECAY', 0.8)
     USE_HISTORICAL_RECORDS = experiment_config.get('USE_HISTORICAL_RECORDS', True)
+
+    # Runtime sequence-length caps. Unlike every other hyperparameter here these change the
+    # shape of the batches, so the dataloaders have to be rebuilt when they change rather than
+    # just rebinding a global; see the rebuild inside the trial loop below.
+    SEQ_LEN_HYPERPARAMETERS = ('HISTORY_LEN_STEPS', 'EPISODE_LEN_STEPS')
+    HISTORY_LEN_STEPS = experiment_config.get('HISTORY_LEN_STEPS', None)
+    EPISODE_LEN_STEPS = experiment_config.get('EPISODE_LEN_STEPS', None)
+    # A tuned hyperparameter's config value is the list of values to try; HyperparameterContext
+    # treats the first entry as the default, so mirror that when priming the initial loaders.
+    if 'HISTORY_LEN_STEPS' in HYPERPARAMETERS_TO_TUNE:
+        HISTORY_LEN_STEPS = HISTORY_LEN_STEPS[0]
+    if 'EPISODE_LEN_STEPS' in HYPERPARAMETERS_TO_TUNE:
+        EPISODE_LEN_STEPS = EPISODE_LEN_STEPS[0]
 
 
     # Create timer
@@ -338,24 +353,37 @@ if __name__ == "__main__":
     torch.cuda.empty_cache()
 
     # Create dataloaders using the optimized tensorized format with text-balanced sampling
-    dataloader_list = prepare_dataloaders(
-        fold_dir,
-        BATCH_SIZE,
-        num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
-        prefetch_factor=2 if num_workers > 0 else 1,
-        balance_text=USE_TEXT,
-        world_size=_world_size,
-        rank=_rank,
-        use_historical_records=USE_HISTORICAL_RECORDS,
-        max_history_len_steps=MAX_HISTORY_LEN_STEPS
+    def build_tuning_dataloaders(history_len_steps, episode_len_steps):
+        """Build the train and test loaders for a given pair of sequence-length caps.
+
+        Args:
+            history_len_steps: Runtime cap on historical timesteps, or None for all.
+            episode_len_steps: Runtime cap on in-stay timesteps, or None for all.
+
+        Returns:
+            Tuple of (train_loader, test_loader). For HP tuning only train and test are used;
+            test doubles as the model-selection set.
+        """
+        loaders = prepare_dataloaders(
+            fold_dir,
+            BATCH_SIZE,
+            num_workers=num_workers,
+            pin_memory=torch.cuda.is_available(),
+            prefetch_factor=2 if num_workers > 0 else 1,
+            balance_text=USE_TEXT,
+            world_size=_world_size,
+            rank=_rank,
+            use_historical_records=USE_HISTORICAL_RECORDS,
+            history_len_steps=history_len_steps,
+            episode_len_steps=episode_len_steps,
+            extracted_history_len_steps=MAX_HISTORY_LEN_STEPS
+        )
+        return (loaders[0], loaders[2]) if len(loaders) == 3 else (loaders[0], loaders[1])
+
+    train_loader, test_loader = build_tuning_dataloaders(
+        HISTORY_LEN_STEPS, EPISODE_LEN_STEPS
     )
-    
-    # For HP tuning, we use train and test loaders only (test is used for model selection)
-    if len(dataloader_list) == 3:
-        train_loader, _, test_loader = dataloader_list
-    else:
-        train_loader, test_loader = dataloader_list
+    built_seq_lens = (HISTORY_LEN_STEPS, EPISODE_LEN_STEPS)
 
 
     with HyperparameterContext(HYPERPARAMETERS_TO_TUNE, experiment_config) as hp_context:
@@ -400,6 +428,28 @@ if __name__ == "__main__":
                     print(f'\n{"="*60}')
                     print(f'TESTING: {hp_name} = {value}')
                 hp_context.set_for_testing(hp_name, value)
+
+                # Sequence-length caps change the batch shape, so the loaders (and the
+                # text-balancing sampler that depends on the cropped text counts) must be
+                # rebuilt. set_for_testing() has just rebound every tuned hyperparameter, so
+                # compare against what the current loaders were built with rather than keying
+                # off hp_name -- this also resets the caps when tuning moves on to another
+                # hyperparameter and the caps revert to their defaults.
+                if any(hp in HYPERPARAMETERS_TO_TUNE for hp in SEQ_LEN_HYPERPARAMETERS):
+                    wanted_seq_lens = (HISTORY_LEN_STEPS, EPISODE_LEN_STEPS)
+                    if wanted_seq_lens != built_seq_lens:
+                        if accelerator.is_main_process:
+                            print(
+                                f'Rebuilding dataloaders for sequence-length caps '
+                                f'{built_seq_lens} -> {wanted_seq_lens}'
+                            )
+                        del train_loader, test_loader
+                        gc.collect()
+                        train_loader, test_loader = build_tuning_dataloaders(
+                            *wanted_seq_lens
+                        )
+                        built_seq_lens = wanted_seq_lens
+
                 current_settings = hp_context.get_current_settings()
                 for name, val in current_settings.items():
                     status = "TESTING" if name == hp_name else "DEFAULT"

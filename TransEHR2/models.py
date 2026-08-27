@@ -447,9 +447,16 @@ class MixedClassifier(torch.nn.Module):
             elif self.aggr == 'mean':
                 event_enc = torch.sum(event_enc, dim=1) / n_obs_records
             elif self.aggr == 'none':
-                # Select the final observed record's encoding for each batch item
-                # If a batch item has no observed records, use the zeroed embedding at the first timestep
-                final_record_idx = n_obs_records.squeeze(-1) - 1  # (batch_size, )
+                # Select the final observed record's encoding for each batch item.
+                # NOTE The non-padding timesteps are contiguous but do not necessarily begin at
+                # index 0: history is right-justified in the leading history region, so an episode
+                # with fewer historical records than the history window carries leading padding.
+                # The count of observed records is therefore not the index of the final one, and
+                # the last non-padding position has to be located from the end of the mask.
+                # Rows that are entirely padding resolve to the final index, whose embedding was
+                # zeroed above, so they still contribute a zero vector as before.
+                flipped_mask = event_masks.float().flip(dims=[1])
+                final_record_idx = event_masks.size(1) - 1 - flipped_mask.argmax(dim=1)  # (batch_size, )
                 batch_size = event_enc.size(0)
                 event_enc = event_enc[torch.arange(batch_size), final_record_idx.long()]
             
@@ -543,9 +550,13 @@ class MixedClassifier(torch.nn.Module):
                     # Exclude padding timesteps from mean calculation
                     val_enc = torch.sum(val_enc, dim=1) / n_obs_records
                 elif self.aggr == 'none':
-                    # Select the final observed record's encoding for each batch item
-                    # If a batch item has no observed records, use the zeroed embedding at the first timestep
-                    final_record_idx = n_obs_records.squeeze(-1) - 1  # (batch_size, )
+                    # Select the final observed record's encoding for each batch item.
+                    # NOTE See the corresponding branch in the event-data aggregation above: the
+                    # non-padding timesteps are contiguous but may carry leading padding, so the
+                    # final observed record is located from the end of the mask rather than from
+                    # the count of observed records.
+                    flipped_mask = val_masks.float().flip(dims=[1])
+                    final_record_idx = val_masks.size(1) - 1 - flipped_mask.argmax(dim=1)  # (batch_size, )
                     batch_size = val_enc.size(0)
                     val_enc = val_enc[torch.arange(batch_size), final_record_idx.long()]
 

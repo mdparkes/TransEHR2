@@ -74,12 +74,47 @@ class MixedDataset(Dataset):
     * *phenotype* (np.ndarray): Array of shape (n_episodes, n_phenotypes) containing multi-label
       phenotype indicators.
 
-    * *max_ts_len* (int): Maximum timeseries length across all episodes.
+    * *max_ts_len* (int): Maximum timeseries length across all episodes, as extracted. Equals
+      `max_history_len_steps + max_episode_len_steps` from the extraction configuration.
+
+    * *max_history_len_steps* (int): Number of leading timestep indices reserved for
+      pre-admission historical records at extraction time. Episode (in-stay) data always
+      begins at index `max_history_len_steps`.
 
     * *text_token_len* (List[int]): List of token sequence lengths for each text feature.
 
-    The __getitem__ method returns a dictionary with torch tensors, reconstructing dense text
-    embedding arrays on-the-fly from the sparse storage format.
+    **Runtime sequence-length cropping**
+
+    The extracted layout is suffix-truncatable on the history side and prefix-truncatable on the
+    episode side, so shorter sequence limits can be applied at load time without re-extracting:
+
+        index:  0 .......... max_history_len_steps .......... max_ts_len
+                [ pad | history (right-justified) ][ episode (left-justified) ]
+
+    `filter_timeseries_records()` retains the *most recent* `min(n_historic, H)` historical
+    records and the *earliest* `min(n_episode, E)` in-stay records. Cropping the stored window to
+    `[max_history_len_steps - H_new, max_history_len_steps + E_new)` therefore yields exactly the
+    arrays that an extraction with `H_new`/`E_new` would have produced, provided
+    `H_new <= max_history_len_steps` and `E_new <= max_episode_len_steps`. Episode inclusion
+    criteria depend only on the in-stay portion before truncation, so the set of episodes is
+    unaffected.
+
+    Note that numeric standardization statistics are computed at extraction time over the full
+    extracted window, so cropped data remains normalized against all available timesteps. This is
+    intentional: it holds normalization constant across a sequence-length sweep.
+
+    * *history_len_steps* (Optional[int]): Runtime cap on historical timesteps. None uses all
+      extracted history.
+
+    * *episode_len_steps* (Optional[int]): Runtime cap on in-stay timesteps. None uses all
+      extracted episode steps.
+
+    * *ts_len* (int): Width of the timestep axis actually returned by __getitem__, i.e.
+      `min(history_len_steps, max_history_len_steps) + min(episode_len_steps, max_episode_len_steps)`.
+
+    The __getitem__ method returns a dictionary with torch tensors, cropped to the configured
+    window and reconstructing dense text embedding arrays on-the-fly from the sparse storage
+    format.
     """
 
     def __init__(
@@ -111,12 +146,53 @@ class MixedDataset(Dataset):
         phenotype: np.ndarray,
         max_ts_len: int,
         text_token_len: List[int],
+        max_history_len_steps: int = 0,
+        history_len_steps: Optional[int] = None,
+        episode_len_steps: Optional[int] = None,
     ):
+        """Initialize an instance.
+
+        Args:
+            max_ts_len: Width of the extracted timestep axis
+                (`max_history_len_steps + max_episode_len_steps`).
+            text_token_len: Token sequence length for each text feature.
+            max_history_len_steps: Number of leading timestep indices reserved for historical
+                records at extraction time. Defaults to 0 (no history region).
+            history_len_steps: Runtime cap on historical timesteps. Must not exceed
+                `max_history_len_steps`. None (default) uses all extracted history.
+            episode_len_steps: Runtime cap on in-stay timesteps. Must not exceed
+                `max_ts_len - max_history_len_steps`. None (default) uses all extracted
+                episode steps.
+
+        Raises:
+            ValueError: If a requested length is negative or exceeds what was extracted.
+        """
         self.n_episodes = val_times.shape[0]
         self.max_ts_len = max_ts_len
+        self.max_history_len_steps = max_history_len_steps
+        self.max_episode_len_steps = max_ts_len - max_history_len_steps
         self.n_text_feats = len(text_token_len)
         self.text_token_len = text_token_len
         self.text_embed_dim = text_embed_dim
+
+        # Resolve the runtime crop window. Cropping is only valid in the shortening direction:
+        # the extracted arrays cannot manufacture timesteps that were never extracted.
+        self.history_len_steps = self._resolve_len(
+            history_len_steps, self.max_history_len_steps, 'history_len_steps',
+            'MAX_HISTORY_LEN_STEPS'
+        )
+        self.episode_len_steps = self._resolve_len(
+            episode_len_steps, self.max_episode_len_steps, 'episode_len_steps',
+            'MAX_EPISODE_LEN_STEPS'
+        )
+
+        # History is right-justified in [0, max_history_len_steps) and episode data is
+        # left-justified from max_history_len_steps, so a single contiguous slice applies both
+        # caps at once, for value- and event-associated arrays alike.
+        self.ts_start = self.max_history_len_steps - self.history_len_steps
+        self.ts_end = self.max_history_len_steps + self.episode_len_steps
+        self.ts_len = self.ts_end - self.ts_start
+        self.is_cropped = (self.ts_start != 0) or (self.ts_end != self.max_ts_len)
 
         # Store numpy arrays directly
         self.val_numeric_indicators = val_numeric_indicators
@@ -143,6 +219,35 @@ class MixedDataset(Dataset):
         self.length_of_stay = length_of_stay
         self.phenotype = phenotype
 
+    @staticmethod
+    def _resolve_len(requested: Optional[int], extracted: int, arg_name: str,
+                     config_key: str) -> int:
+        """Validate a requested runtime length against what was extracted.
+
+        Args:
+            requested: Requested number of timesteps, or None to use all extracted steps.
+            extracted: Number of timesteps available in the extracted arrays.
+            arg_name: Name of the constructor argument, for error messages.
+            config_key: Name of the extraction-time config key, for error messages.
+
+        Returns:
+            The number of timesteps to retain.
+
+        Raises:
+            ValueError: If `requested` is negative or exceeds `extracted`.
+        """
+        if requested is None:
+            return extracted
+        if requested < 0:
+            raise ValueError(f'{arg_name} must be non-negative, got {requested}')
+        if requested > extracted:
+            raise ValueError(
+                f'{arg_name}={requested} exceeds the {extracted} timesteps present in the '
+                f'extracted data. Sequence limits can only be shortened at load time; to go '
+                f'longer, re-extract with a larger {config_key}.'
+            )
+        return requested
+
     def __len__(self) -> int:
         return self.n_episodes
 
@@ -150,12 +255,16 @@ class MixedDataset(Dataset):
         """
         Return episode as torch tensors, reconstructing dense text embeddings on-the-fly.
         """
-        # Reconstruct dense text embeddings from sparse storage
+        ts_start, ts_end = self.ts_start, self.ts_end
+
+        # Reconstruct dense text embeddings from sparse storage. Sparse timesteps are absolute
+        # indices into the extracted axis, so entries outside the crop window are dropped and
+        # the survivors are shifted into the cropped frame.
         text_embeddings_dense = []
 
         for f in range(self.n_text_feats):
             dense_embeds = np.zeros(
-                (self.max_ts_len, self.text_embed_dim), dtype=np.float32
+                (self.ts_len, self.text_embed_dim), dtype=np.float32
             )
 
             start = int(self.val_text_offsets[f][idx])
@@ -167,27 +276,28 @@ class MixedDataset(Dataset):
 
                 for i in range(end - start):
                     ts = int(timesteps[i])
-                    dense_embeds[ts] = embeddings[i]
+                    if ts_start <= ts < ts_end:
+                        dense_embeds[ts - ts_start] = embeddings[i]
 
             text_embeddings_dense.append(torch.from_numpy(dense_embeds))
 
         # Return tensors (copy from mmap)
         return {
-            'val_numeric_indicators': torch.from_numpy(self.val_numeric_indicators[idx].copy()),
-            'val_numeric_values': [torch.from_numpy(v[idx].copy()) for v in self.val_numeric_values],
-            'val_categorical_indicators': torch.from_numpy(self.val_categorical_indicators[idx].copy()),
-            'val_categorical_values': [torch.from_numpy(v[idx].copy()) for v in self.val_categorical_values],
-            'val_ordinal_indicators': torch.from_numpy(self.val_ordinal_indicators[idx].copy()) if self.val_ordinal_indicators.size > 0 else torch.empty(0),
-            'val_ordinal_values': [torch.from_numpy(v[idx].copy()) for v in self.val_ordinal_values],
-            'val_multilabel_indicators': torch.from_numpy(self.val_multilabel_indicators[idx].copy()) if self.val_multilabel_indicators.size > 0 else torch.empty(0),
-            'val_multilabel_values': [torch.from_numpy(v[idx].copy()) for v in self.val_multilabel_values],
-            'val_text_indicators': torch.from_numpy(self.val_text_indicators[idx].copy()),
+            'val_numeric_indicators': torch.from_numpy(self.val_numeric_indicators[idx, ts_start:ts_end].copy()),
+            'val_numeric_values': [torch.from_numpy(v[idx, ts_start:ts_end].copy()) for v in self.val_numeric_values],
+            'val_categorical_indicators': torch.from_numpy(self.val_categorical_indicators[idx, ts_start:ts_end].copy()),
+            'val_categorical_values': [torch.from_numpy(v[idx, ts_start:ts_end].copy()) for v in self.val_categorical_values],
+            'val_ordinal_indicators': torch.from_numpy(self.val_ordinal_indicators[idx, ts_start:ts_end].copy()) if self.val_ordinal_indicators.size > 0 else torch.empty(0),
+            'val_ordinal_values': [torch.from_numpy(v[idx, ts_start:ts_end].copy()) for v in self.val_ordinal_values],
+            'val_multilabel_indicators': torch.from_numpy(self.val_multilabel_indicators[idx, ts_start:ts_end].copy()) if self.val_multilabel_indicators.size > 0 else torch.empty(0),
+            'val_multilabel_values': [torch.from_numpy(v[idx, ts_start:ts_end].copy()) for v in self.val_multilabel_values],
+            'val_text_indicators': torch.from_numpy(self.val_text_indicators[idx, ts_start:ts_end].copy()),
             'val_text_embeddings': text_embeddings_dense,
-            'val_times': torch.from_numpy(self.val_times[idx].copy()),
-            'val_masks': torch.from_numpy(self.val_masks[idx].copy()),
-            'event_indicators': torch.from_numpy(self.event_indicators[idx].copy()),
-            'event_times': torch.from_numpy(self.event_times[idx].copy()),
-            'event_masks': torch.from_numpy(self.event_masks[idx].copy()),
+            'val_times': torch.from_numpy(self.val_times[idx, ts_start:ts_end].copy()),
+            'val_masks': torch.from_numpy(self.val_masks[idx, ts_start:ts_end].copy()),
+            'event_indicators': torch.from_numpy(self.event_indicators[idx, ts_start:ts_end].copy()),
+            'event_times': torch.from_numpy(self.event_times[idx, ts_start:ts_end].copy()),
+            'event_masks': torch.from_numpy(self.event_masks[idx, ts_start:ts_end].copy()),
             'static_data': torch.from_numpy(self.static_data[idx].copy()),
             'mortality': torch.tensor(float(self.mortality[idx]), dtype=torch.float32),
             'length_of_stay': torch.tensor(float(self.length_of_stay[idx]), dtype=torch.float32),

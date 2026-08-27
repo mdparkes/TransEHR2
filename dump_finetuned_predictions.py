@@ -171,7 +171,9 @@ def create_inference_loader(
     num_workers: int,
     pin_memory: bool,
     use_historical_records: bool = True,
-    max_history_len_steps: int = 0,
+    history_len_steps: Optional[int] = None,
+    episode_len_steps: Optional[int] = None,
+    extracted_history_len_steps: Optional[int] = None,
     world_size: int = 1,
     rank: int = 0
 ) -> Tuple[Optional[DataLoader], int]:
@@ -189,8 +191,13 @@ def create_inference_loader(
         pin_memory: Whether to use pinned memory for CUDA transfers.
         use_historical_records: If False, zero out masks for the
             history region so the model ignores pre-admission data.
-        max_history_len_steps: Number of timestep indices reserved
-            for historical records.
+        history_len_steps: Runtime cap on historical timesteps, applied
+            by cropping at load time. None uses all extracted history.
+        episode_len_steps: Runtime cap on in-stay timesteps. None uses
+            all extracted episode steps.
+        extracted_history_len_steps: Size of the history region in the
+            extracted arrays. Only needed for datasets extracted before
+            that value was recorded in metadata.pkl.
         world_size: Total number of distributed processes.
         rank: Index of the current process.
 
@@ -208,7 +215,12 @@ def create_inference_loader(
             return None, 0
         raise FileNotFoundError(f"'{split}/' not found in {fold_dir}")
 
-    dataset = load_dataset(dataset_path)
+    dataset = load_dataset(
+        dataset_path,
+        history_len_steps=history_len_steps,
+        episode_len_steps=episode_len_steps,
+        extracted_history_len_steps=extracted_history_len_steps,
+    )
     total = len(dataset)
 
     # Shard sequentially across ranks
@@ -222,7 +234,7 @@ def create_inference_loader(
     collate_fn = partial(
         collate_tensorized,
         use_historical_records=use_historical_records,
-        max_history_len_steps=max_history_len_steps,
+        history_len_steps=dataset.history_len_steps,
     )
     loader = DataLoader(
         subset,
@@ -610,12 +622,17 @@ if __name__ == '__main__':
     EVENT_FEATS = dataset_config['EVENT_FEATS']
     TEXT_FEATS = dataset_config['TEXT_FEATS']
     STATIC_FEATS = dataset_config['STATIC_FEATS']
+    # Extraction-time capacity of the history region, used to interpret the stored layout of
+    # datasets extracted before that value was recorded in metadata.pkl.
     MAX_HISTORY_LEN_STEPS = dataset_config.get('MAX_HISTORY_LEN_STEPS', 0)
 
     USE_TEXT = experiment_config['USE_TEXT']
     USE_HISTORICAL_RECORDS = experiment_config.get(
         'USE_HISTORICAL_RECORDS', True
     )
+    # Runtime sequence-length caps; must match the values the model was trained with.
+    HISTORY_LEN_STEPS = experiment_config.get('HISTORY_LEN_STEPS', None)
+    EPISODE_LEN_STEPS = experiment_config.get('EPISODE_LEN_STEPS', None)
     BATCH_SIZE = args.batch_size or experiment_config['BATCH_SIZE']
     MODEL_DIR = args.model_dir
     EXPERIMENT_NAME = args.experiment_name
@@ -690,7 +707,9 @@ if __name__ == '__main__':
                 fold_dir, split, BATCH_SIZE,
                 args.num_workers, pin_memory,
                 use_historical_records=USE_HISTORICAL_RECORDS,
-                max_history_len_steps=MAX_HISTORY_LEN_STEPS,
+                history_len_steps=HISTORY_LEN_STEPS,
+                episode_len_steps=EPISODE_LEN_STEPS,
+                extracted_history_len_steps=MAX_HISTORY_LEN_STEPS,
                 world_size=accelerator.num_processes,
                 rank=accelerator.process_index
             )

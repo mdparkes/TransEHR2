@@ -1,24 +1,46 @@
-# Establishes a baseline level of performance using the TransEHR model of Xu et al.
+# Sweeps the pre-admission history sequence length to test whether a shorter history aids
+# learning. HISTORY_LEN_STEPS crops the extracted arrays at load time, so every value below is
+# run against the same extraction (MAX_HISTORY_LEN_STEPS: 500 in configs/datasets/mimic4.yaml)
+# with identical episodes and identical standardization statistics. No re-extraction is needed.
+#
+# The tuning script rebuilds the dataloaders whenever this value changes, since it alters the
+# batch shape. Values must not exceed the extracted MAX_HISTORY_LEN_STEPS.
+#
+# All other hyperparameters are fixed at the values settled in experiment2_text.yaml so that
+# history length is the only thing varying.
 
-EXPERIMENT_NAME: "experiment1_baseline"
+EXPERIMENT_NAME: "tune_sequence_lengths"
+
+# List of hyperparameter names for easy access during tuning
+# These hyperparameters' values must be lists of options to try
+HYPERPARAMETERS_TO_TUNE:
+  - HISTORY_LEN_STEPS
+
+# Values to test
+HISTORY_LEN_STEPS:
+  - 500
+  - 250
+  - 100
+  - 50
+  - 0
+
+# Fixed hyperparameters
+CMPNT_MASK_RATIO: 0.25
+PRETRAIN_LEARNING_RATE: 0.002
+PRETRAIN_LEARNING_RATE_DECAY: 0.90
+OBS_UNOBS_SAMPLE_RATIO: 5.0
 
 BATCH_SIZE: 200
 
 # Whether to use text data as features
-USE_TEXT: False
+USE_TEXT: True
 
 # Whether to use pre-admission historical records. If False, historical
 # timesteps are masked out at collation time so the model only sees
 # episode data. Requires data extracted with left-padded history layout.
 USE_HISTORICAL_RECORDS: True
 
-# Runtime sequence-length caps, applied by cropping the extracted arrays at load time.
-# `null` uses every timestep that was extracted. Setting a smaller value is equivalent to
-# re-extracting with a smaller MAX_HISTORY_LEN_STEPS / MAX_EPISODE_LEN_STEPS in the dataset
-# config, but needs no re-extraction; values larger than what was extracted are rejected.
-# Numeric standardization statistics are computed at extraction time over the full window, so
-# they stay constant across a sequence-length sweep.
-HISTORY_LEN_STEPS: null
+# In-stay sequence length is held fixed at everything that was extracted; only history varies.
 EPISODE_LEN_STEPS: null
 
 # Whether to let the generator and discriminator predict feature presence indicators as well as values
@@ -60,21 +82,14 @@ PREDICTOR_AGGREGATION_METHOD: "mean"
 
 MODEL_DIR: "/uhome/pr3/projects/p60290_2/TransEHR2/models"
 
-PRETRAIN_LEARNING_RATE: 0.002
-PRETRAIN_LEARNING_RATE_DECAY: 0.9
-PRETRAIN_TOTAL_EPOCH: 1000
+PRETRAIN_TOTAL_EPOCH: 200
 
 DISC_LOSS_WEIGHT: 1.0
-THP_LOSS_NLL_WEIGHT: 0.01
-THP_LOSS_MC_SAMPLES: 100
+
 USE_THP_PRED_LOSS: True
+THP_LOSS_MC_SAMPLES: 100
+THP_LOSS_NLL_WEIGHT: 0.01
 THP_PRED_LOSS_TYPE_WT: 1.0
 THP_PRED_LOSS_TIME_WT: 0.000001
 
 RECORD_MASK_RATIO: 0.15
-OBS_UNOBS_SAMPLE_RATIO: 5.0
-CMPNT_MASK_RATIO: 0.25
-
-FINETUNE_LEARNING_RATE: 0.0002
-FINETUNE_TOTAL_EPOCH: 500
-FINETUNE_LEARNING_RATE_DECAY: 0.9
