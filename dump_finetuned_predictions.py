@@ -364,17 +364,20 @@ def load_finetuned_weights(
 def install_nan_hooks(model: MixedClassifier) -> List:
     """Install forward hooks that replace NaN encoder output with zeros.
 
-    The ValueDataEncoder uses ``batch_first=True`` with a manually permuted
-    input so that each timestep becomes a "batch" processed by PyTorch's
-    ``TransformerEncoder``.  When **every** episode in the real batch has
-    padding at a given timestep, all key positions for that "batch item"
-    are masked, producing ``softmax(-inf, …, -inf) = NaN``.  Those NaN
-    values survive the subsequent ``val_enc * mask`` operation because
+    A query row with no attendable key softmaxes over nothing, and
+    ``torch.nn.MultiheadAttention`` returns NaN for it.  Those NaN values
+    survive the subsequent ``val_enc * mask`` operation because
     ``NaN * 0 = NaN`` in IEEE 754, and then ``torch.sum`` propagates the
     NaN to every prediction in the batch.
 
-    This hook replaces NaN values in each encoder's output with zeros so
-    that they are harmlessly absorbed by the padding mask and aggregation.
+    Two changes have narrowed what can still reach this hook.  The permute
+    that made each *timestep* a batch item is gone, so a timestep padded
+    across the whole batch no longer masks every key; and the encoders now
+    own their attention, giving fully masked rows the zero vector rather
+    than NaN.  The remaining route is ``norm='BatchNorm'``, which still
+    delegates to ``torch.nn.MultiheadAttention`` -- no shipped config
+    selects it.  The hook is kept as a backstop, and its counter says
+    whether anything is still arriving.
 
     Args:
         model: A MixedClassifier whose encoders may produce NaN at

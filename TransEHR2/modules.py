@@ -8,7 +8,13 @@ from typing import Dict, List, Optional, Tuple
 
 from TransEHR2.constants import HF_API_TOKEN, LLM_NAME, MAX_TOKEN_LENGTH, PAD, TOKENIZER_PAD_TOKEN
 from TransEHR2.data.custom_types import EventAssociatedTensorData, ValueAssociatedTensorData
-from TransEHR2.layers import EncoderLayer, TemporalPositionEncoding, TransformerBatchNormEncoderLayer
+from TransEHR2.layers import (
+    EncoderLayer,
+    TemporalPositionEncoding,
+    TransformerBatchNormEncoderLayer,
+    build_key_padding_attention_mask,
+    get_activation_module,
+)
 from TransEHR2.utils import combine_value_and_text_data
 
 
@@ -199,7 +205,8 @@ class EventDataEncoder(torch.nn.Module):
             d_k: int, 
             d_v: int,
             dropout: float,
-            normalize_before: bool = False
+            normalize_before: bool = False,
+            query_key_transform: Optional[torch.nn.Module] = None
     ):
         """Initialize an instance.
 
@@ -215,6 +222,10 @@ class EventDataEncoder(torch.nn.Module):
             normalize_before (bool, optional): Whether to apply layer normalization before the attention and
                 feed-forward layers in each encoder layer. If False, layer normalization is applied after.
                 Defaults to False.
+            query_key_transform (torch.nn.Module, optional): A position-dependent transform applied to the query
+                and key tensors inside every attention layer -- the seam a rotary position encoding occupies.
+                See `MultiHeadAttention` for the contract. The one instance is shared by every block, so it must
+                be stateless across calls. Defaults to None, which leaves the attention unchanged.
         """
 
         super().__init__()
@@ -227,6 +238,7 @@ class EventDataEncoder(torch.nn.Module):
         self.d_v = d_v
         self.dropout = dropout
         self.normalize_before = normalize_before
+        self.query_key_transform = query_key_transform
         
         # NOTE Xu et al. used a torch.nn.Embedding layer to project event types to the model dimension. That worked
         # because the original implementation of the forward pass expected one event ID per timestep (i.e. [batch_size, 
@@ -243,7 +255,11 @@ class EventDataEncoder(torch.nn.Module):
         self.position_encoding_layer = TemporalPositionEncoding(d_model=self.d_model, dropout=0.1)
         enc_args, enc_kwargs = (
             [self.d_model, self.d_inner, self.n_head, self.d_k, self.d_v],
-            {'dropout': self.dropout, 'normalize_before': self.normalize_before}
+            {
+                'dropout': self.dropout,
+                'normalize_before': self.normalize_before,
+                'query_key_transform': self.query_key_transform,
+            }
         )
         self.layer_stack = torch.nn.ModuleList([EncoderLayer(*enc_args, **enc_kwargs) for _ in range(self.n_layers)])
 
@@ -330,7 +346,12 @@ class EventDataEncoder(torch.nn.Module):
         enc_output = self.indicator_input_projection_layer(indicators.float())
         for enc_layer in self.layer_stack:
             enc_output = self.position_encoding_layer(enc_output, timestamps, non_padding_mask)
-            enc_output, _ = enc_layer(enc_output, non_padding_mask=non_padding_mask, self_attention_mask=self_attn_mask)
+            enc_output, _ = enc_layer(
+                enc_output,
+                non_padding_mask=non_padding_mask,
+                self_attention_mask=self_attn_mask,
+                positions=timestamps,
+            )
 
         return enc_output
 
@@ -347,7 +368,11 @@ class ValueDataEncoder(torch.nn.Module):
         n_heads (int): Number of attention heads in multi-head attention layers.
         project_inp (torch.nn.Linear): Linear projection layer to transform input features to model dimension.
         pos_enc (PositionalEncoding): Positional encoding layer (either fixed or learnable).
-        transformer_encoder (torch.nn.TransformerEncoder): Main transformer encoder stack.
+        layer_stack (torch.nn.ModuleList): Main transformer encoder stack. With `norm='LayerNorm'` the blocks
+            are `EncoderLayer` instances -- the repository's own layer, shared with the event stream, whose
+            attention is owned in `MultiHeadAttention` and therefore reachable by a query/key transform. With
+            `norm='BatchNorm'` they are `TransformerBatchNormEncoderLayer` instances, which wrap
+            `torch.nn.MultiheadAttention` and expose no such seam.
         act (torch.nn.ReLU|torch.nn.GELU): Activation function used throughout the network.
         dropout1 (torch.nn.Dropout): Dropout layer applied to outputs.
         feat_dim (int): Dimension of input features.
@@ -365,6 +390,7 @@ class ValueDataEncoder(torch.nn.Module):
         activation: str = 'gelu',
         norm: str = 'BatchNorm',
         normalize_before: bool = False,
+        query_key_transform: Optional[torch.nn.Module] = None,
     ):
         r"""Initialize an instance.
 
@@ -381,15 +407,39 @@ class ValueDataEncoder(torch.nn.Module):
             pos_encoding (str, optional): The strategy to use for generating a positional encoding of a timestamp.
                 If 'learnable', use `LearnablePositionalEncoding`. If 'fixed', use `FixedPositionalEncoding`. Defaults to 'fixed'.
             activation (str, optional): The activation function applied throughout the network. Defaults to 'gelu'.
-            norm (str, optional): The type of normalization to use in the `TransformerEncoder`. If 'LayerNorm', 
-                `self.transformer_encoder` will be initialized with an instance of `TransformerEncoder` that uses 
-                `TransformerEncoderLayer'. Otherwise, `self.transformer_encoder` will be initialized with an instance 
-                of `TransformerEncoder` that uses `TransformerBatchNormEncoderLayer`.
+            norm (str, optional): The type of normalization to use in the encoder stack. If 'LayerNorm',
+                `self.layer_stack` is built from `EncoderLayer` -- the repository's own block, shared with the
+                event stream, which owns its attention and can therefore carry a `query_key_transform`. If
+                'BatchNorm', it is built from `TransformerBatchNormEncoderLayer`, which delegates to
+                `torch.nn.MultiheadAttention` and cannot. No shipped experiment config selects 'BatchNorm'.
             normalize_before (bool, optional): Whether to apply normalization before attention and feedforward 
                 operations (Pre-LN). If False, normalization is applied after (Post-LN). Defaults to False.
+            query_key_transform (torch.nn.Module, optional): A position-dependent transform applied to the query
+                and key tensors inside every attention layer -- the seam a rotary position encoding occupies.
+                See `MultiHeadAttention` for the contract. The one instance is shared by every block, so it must
+                be stateless across calls. Only the `norm='LayerNorm'` stack can carry one; passing a transform
+                alongside `norm='BatchNorm'` raises, because that layer delegates to
+                `torch.nn.MultiheadAttention`, which does not expose q and k between projection and dot product.
+                Defaults to None, which leaves the attention unchanged.
+
+        Raises:
+            ValueError: If `norm` is not 'LayerNorm' or 'BatchNorm', if `d_model` is not divisible by
+                `n_heads`, or if `query_key_transform` is given with `norm='BatchNorm'`.
         """
 
         super().__init__()
+        if norm not in ('LayerNorm', 'BatchNorm'):
+            raise ValueError(f'norm: Expected "LayerNorm" or "BatchNorm", got {norm}.')
+        if d_model % n_heads != 0:
+            raise ValueError(
+                f'd_model ({d_model}) must be divisible by n_heads ({n_heads}) so that the per-head width '
+                'd_model // n_heads is exact.'
+            )
+        if query_key_transform is not None and norm != 'LayerNorm':
+            raise ValueError(
+                "query_key_transform requires norm='LayerNorm'; the BatchNorm block uses "
+                'torch.nn.MultiheadAttention, which does not expose the query and key tensors.'
+            )
         self.n_features = n_features
         self.feat_dim = feat_dim
         self.d_model = d_model
@@ -398,6 +448,12 @@ class ValueDataEncoder(torch.nn.Module):
         self.dim_feedforward = dim_feedforward
         self.norm = norm
         self.normalize_before = normalize_before
+        self.query_key_transform = query_key_transform
+        # torch.nn.MultiheadAttention splits d_model evenly across heads, so the migrated stack has to do the
+        # same: EncoderLayer takes d_k and d_v explicitly and would otherwise silently run at a different
+        # attention width than the layer it replaces.
+        self.d_k = self.d_v = d_model // n_heads
+        self.owns_attention = norm == 'LayerNorm'
         # NOTE Xu et al. only used the value_input_projection_layer in their code, but in the paper they described
         # using two separate projection layers for the indicator and value-associated data. We follow the paper.
         # The value input projection uses bias, but the indicator input projection does not.
@@ -408,49 +464,54 @@ class ValueDataEncoder(torch.nn.Module):
         # dropout will also be applied to the position encoding of the event-associated data encoder in this 
         # implementation.
         self.position_encoding_layer = TemporalPositionEncoding(d_model=d_model, dropout=0.1)
-        # nn.TransformerEncoder clones its prototype layer with copy.deepcopy, which has two
-        # consequences we do not want. Every block would start from identical weights, so a
-        # deeper stack behaves differently from a freshly constructed one; and the prototype
-        # stays registered as a submodule that forward never calls, leaving its parameters in
-        # the state dict, in the optimizer, and in DDP's reduction set without ever receiving a
-        # gradient. Build the blocks independently and install them directly instead.
-        encoder_layers = [
-            self._get_encoder_layer(norm, activation, dropout) for _ in range(n_encoder_blocks)
-        ]
-        self.transformer_encoder = torch.nn.TransformerEncoder(
-            encoder_layers[0], n_encoder_blocks, enable_nested_tensor=False
+        # Blocks are built independently rather than deep-copied from a prototype. nn.TransformerEncoder
+        # clones its prototype with copy.deepcopy, which has two consequences we do not want: every block
+        # starts from identical weights, so a deeper stack behaves differently from a freshly constructed
+        # one; and the prototype stays registered as a submodule that forward never calls, leaving its
+        # parameters in the state dict, in the optimizer, and in DDP's reduction set without ever receiving
+        # a gradient. The wrapper itself is gone as well -- with enable_nested_tensor=False and no final
+        # norm, nn.TransformerEncoder.forward is a loop over its layers and nothing more, so running the
+        # loop here costs nothing and keeps both norm variants on one code path.
+        self.layer_stack = torch.nn.ModuleList(
+            [self._get_encoder_layer(norm, activation, dropout) for _ in range(n_encoder_blocks)]
         )
-        self.transformer_encoder.layers = torch.nn.ModuleList(encoder_layers)
-        self.activation = self._get_activation_layer(activation)
+        self.activation = get_activation_module(activation)
         self.dropout = torch.nn.Dropout(dropout)
 
 
     def _get_encoder_layer(self, norm: str, activation: str, dropout: float) -> torch.nn.Module:
-        """Get the encoder layer to use in the transformer."""
+        """Build one encoder block. `norm` is validated in `__init__`, so it is one of two values here."""
 
-        enc_args, enc_kwargs = (
-            [self.d_model, self.n_heads, self.dim_feedforward, dropout],
-            {'activation': activation, 'norm_first': self.normalize_before}
-        )
         if norm == 'LayerNorm':
-            return torch.nn.TransformerEncoderLayer(*enc_args, batch_first=True, **enc_kwargs)
-        elif norm == 'BatchNorm':
-            # TransformerBatchNormEncoderLayer takes no batch_first argument: it builds its
-            # MultiheadAttention with batch_first=True unconditionally, so it is already
-            # batch-first and passing the keyword raises TypeError.
-            return TransformerBatchNormEncoderLayer(*enc_args, **enc_kwargs)
-        else:
-            raise ValueError(f'norm: Expected "LayerNorm" or "BatchNorm", got {norm}.')
-
-
-    @staticmethod
-    def _get_activation_layer(activation):
-        if activation == 'relu':
-            return torch.nn.ReLU()
-        elif activation == 'gelu':
-            return torch.nn.GELU()
-        else:
-            raise ValueError(f'activation: expected "relu" or "gelu", got {activation}')
+            # The repository's own encoder block, the same class the event stream stacks. It owns its
+            # attention in MultiHeadAttention instead of delegating to torch.nn.MultiheadAttention, which is
+            # what makes a query/key transform possible at all. Its class name is already in
+            # fsdp_transformer_layer_cls_to_wrap, so the FSDP config needs no change.
+            #
+            # normalize_before is passed explicitly: EncoderLayer defaults it to False while both of its
+            # children default it to True, and this model is pre-LN because post-LN was unstable.
+            return EncoderLayer(
+                self.d_model,
+                self.dim_feedforward,
+                self.n_heads,
+                self.d_k,
+                self.d_v,
+                dropout=dropout,
+                normalize_before=self.normalize_before,
+                activation=activation,
+                query_key_transform=self.query_key_transform,
+            )
+        # TransformerBatchNormEncoderLayer takes no batch_first argument: it builds its MultiheadAttention
+        # with batch_first=True unconditionally, so it is already batch-first and passing the keyword raises
+        # TypeError.
+        return TransformerBatchNormEncoderLayer(
+            self.d_model,
+            self.n_heads,
+            self.dim_feedforward,
+            dropout,
+            activation=activation,
+            norm_first=self.normalize_before,
+        )
 
 
     def forward(self, indicators: Tensor, values: Tensor, timestamps: Tensor, timestep_masks: Tensor) -> Tensor:
@@ -489,16 +550,29 @@ class ValueDataEncoder(torch.nn.Module):
         # Add time-dependent positional embeddings
         embedding = self.position_encoding_layer(embedding, timestamps, timestep_masks)
 
-        # The encoder layer is constructed with batch_first=True, so it takes
-        # (batch_size, seq_length, d_model) directly and no permute is needed. Permuting to
-        # (seq_length, batch_size, d_model) made the encoder read the time axis as the batch
-        # axis: attention ran across the episodes that happened to share a batch, and never
-        # across time. The transposed key padding mask matched that misreading, which is why
-        # the shapes lined up and nothing raised.
-        # NOTE padding mask logic is reversed to comply with MultiheadAttention:
-        # False for tokens that are attended to, True for padding tokens that are masked out.
-        inverted_timestep_masks = ~timestep_masks.bool()  # Shape: (batch_size, seq_length)
-        embedding = self.transformer_encoder(embedding, src_key_padding_mask=inverted_timestep_masks)
+        # Both stacks are batch-first and take (batch_size, seq_length, d_model) directly, so no permute is
+        # needed. Permuting to (seq_length, batch_size, d_model) made the encoder read the time axis as the
+        # batch axis: attention ran across the episodes that happened to share a batch, and never across
+        # time. The transposed key padding mask matched that misreading, which is why the shapes lined up and
+        # nothing raised.
+        if self.owns_attention:
+            # EncoderLayer masks the key axis with a boolean mask that is True where attention is forbidden,
+            # and separately zeroes padded query rows via non_padding_mask. Timestamps are handed down as
+            # `positions` for the query/key transform; with no transform installed they go unused.
+            self_attention_mask = build_key_padding_attention_mask(timestep_masks)
+            for encoder_layer in self.layer_stack:
+                embedding, _ = encoder_layer(
+                    embedding,
+                    non_padding_mask=timestep_masks,
+                    self_attention_mask=self_attention_mask,
+                    positions=timestamps,
+                )
+        else:
+            # NOTE padding mask logic is reversed to comply with MultiheadAttention:
+            # False for tokens that are attended to, True for padding tokens that are masked out.
+            inverted_timestep_masks = ~timestep_masks.bool()  # Shape: (batch_size, seq_length)
+            for encoder_layer in self.layer_stack:
+                embedding = encoder_layer(embedding, src_key_padding_mask=inverted_timestep_masks)
         embedding = self.activation(embedding)
         embedding = self.dropout(embedding)
 
