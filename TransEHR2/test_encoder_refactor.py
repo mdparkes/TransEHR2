@@ -389,7 +389,7 @@ def test_the_delegated_stack_still_needs_the_nan_guard_and_the_migrated_one_does
 
 
 def test_value_encoder_rejects_configurations_it_cannot_build():
-    """Three ways to ask for something the stack cannot deliver, each of them silent before."""
+    """Ways to ask for something the stack cannot deliver, each of them silent before."""
     common = dict(
         n_features=N_FEATURES, feat_dim=FEAT_DIM, d_model=D_MODEL,
         n_encoder_blocks=1, dim_feedforward=DIM_FF,
@@ -398,7 +398,15 @@ def test_value_encoder_rejects_configurations_it_cannot_build():
         (dict(n_heads=N_HEADS, norm='RmsNorm'), 'norm'),
         (dict(n_heads=5, norm='LayerNorm'), 'divisible'),
         (dict(n_heads=N_HEADS, norm='BatchNorm', query_key_transform=torch.nn.Identity()),
-         'query_key_transform'),
+         'query/key transform'),
+        (dict(n_heads=N_HEADS, norm='BatchNorm', position_encoding='rope',
+              ladder_p_min=2.0, ladder_p_max=3000.0), 'query/key transform'),
+        (dict(n_heads=N_HEADS, norm='LayerNorm', position_encoding='rotary'),
+         'position_encoding'),
+        (dict(n_heads=N_HEADS, norm='LayerNorm', position_encoding='rope'), 'ladder_p_min'),
+        (dict(n_heads=N_HEADS, norm='LayerNorm', position_encoding='rope', ladder_p_min=2.0,
+              ladder_p_max=3000.0, query_key_transform=torch.nn.Identity()), 'one or the other'),
+        (dict(n_heads=N_HEADS, norm='LayerNorm', ladder_p_min=2.0), 'together'),
     ):
         try:
             ValueDataEncoder(**common, **kwargs)
