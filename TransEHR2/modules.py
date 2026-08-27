@@ -419,11 +419,14 @@ class ValueDataEncoder(torch.nn.Module):
 
         enc_args, enc_kwargs = (
             [self.d_model, self.n_heads, self.dim_feedforward, dropout],
-            {'activation': activation, 'batch_first': True, 'norm_first': self.normalize_before}
+            {'activation': activation, 'norm_first': self.normalize_before}
         )
         if norm == 'LayerNorm':
-            return torch.nn.TransformerEncoderLayer(*enc_args, **enc_kwargs)
+            return torch.nn.TransformerEncoderLayer(*enc_args, batch_first=True, **enc_kwargs)
         elif norm == 'BatchNorm':
+            # TransformerBatchNormEncoderLayer takes no batch_first argument: it builds its
+            # MultiheadAttention with batch_first=True unconditionally, so it is already
+            # batch-first and passing the keyword raises TypeError.
             return TransformerBatchNormEncoderLayer(*enc_args, **enc_kwargs)
         else:
             raise ValueError(f'norm: Expected "LayerNorm" or "BatchNorm", got {norm}.')

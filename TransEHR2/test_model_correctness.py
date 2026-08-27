@@ -9,6 +9,7 @@ Run directly (``python -m TransEHR2.test_model_correctness``) or under pytest.
 
 import torch
 
+from TransEHR2.layers import TransformerBatchNormEncoderLayer
 from TransEHR2.modules import ValueDataEncoder
 
 
@@ -24,7 +25,9 @@ N_BLOCKS = 1
 DIM_FF = 16
 
 
-def _build_value_encoder(seed: int = 0, n_blocks: int = N_BLOCKS) -> ValueDataEncoder:
+def _build_value_encoder(
+    seed: int = 0, n_blocks: int = N_BLOCKS, norm: str = 'LayerNorm'
+) -> ValueDataEncoder:
     """A small ValueDataEncoder in eval mode, so dropout does not perturb comparisons."""
     torch.manual_seed(seed)
     encoder = ValueDataEncoder(
@@ -36,7 +39,7 @@ def _build_value_encoder(seed: int = 0, n_blocks: int = N_BLOCKS) -> ValueDataEn
         dim_feedforward=DIM_FF,
         dropout=0.1,
         activation='gelu',
-        norm='LayerNorm',
+        norm=norm,
         normalize_before=True,
     )
     encoder.eval()
@@ -249,6 +252,62 @@ def test_generator_input_is_masked_not_revealed():
     assert context_delta < 1e-6, (
         f'generator context was altered where it should be intact (max delta {context_delta:.3e})'
     )
+
+
+# --------------------------------------------------------------------------------------------
+# BatchNorm encoder path
+# --------------------------------------------------------------------------------------------
+
+def test_batchnorm_encoder_builds_and_runs():
+    """``norm='BatchNorm'`` must construct and complete a forward pass.
+
+    Fails against the unfixed builder, which passed ``batch_first=True`` to both branches;
+    TransformerBatchNormEncoderLayer takes no such argument, so construction raised TypeError.
+    The path is inert in the shipped configs -- every experiment sets NORM: 'LayerNorm' -- so
+    nothing exercised it.
+    """
+    encoder = _build_value_encoder(norm='BatchNorm')
+    layers = list(encoder.transformer_encoder.layers)
+    assert all(isinstance(layer, TransformerBatchNormEncoderLayer) for layer in layers)
+
+    indicators, values, timestamps, masks = _synthetic_batch()
+    with torch.no_grad():
+        output = encoder(indicators, values, timestamps, masks)
+
+    assert output.shape == (values.size(0), values.size(1), D_MODEL)
+    assert torch.isfinite(output).all(), 'BatchNorm encoder produced non-finite activations'
+
+
+def test_batchnorm_normalizes_over_batch_and_time_per_feature():
+    """The layer's permutes must put d_model on the channel axis for a batch-first input.
+
+    The permutes and docstrings in TransformerBatchNormEncoderLayer were written for
+    (seq, batch, d_model) inputs, but the encoder now feeds (batch, seq, d_model). This pins
+    down that the running statistics are still one per feature, pooled over every
+    (episode, timestep) position, and that the layer returns the layout it was given.
+    """
+    torch.manual_seed(0)
+    layer = TransformerBatchNormEncoderLayer(
+        D_MODEL, N_HEADS, DIM_FF, dropout=0.0, activation='gelu', norm_first=True
+    )
+    layer.train()
+
+    batch_size, seq_len = 4, 8
+    src = torch.randn(batch_size, seq_len, D_MODEL, generator=torch.Generator().manual_seed(2))
+    output = layer(src)
+
+    assert output.shape == src.shape, 'layer did not return its input layout'
+    assert layer.norm1.running_mean.numel() == D_MODEL, 'channel axis is not d_model'
+
+    # norm_first applies norm1 to src unchanged, so with momentum 0.1 and zeroed running
+    # statistics the update is 0.1 * the batch statistic over all (episode, timestep) positions.
+    pooled = src.reshape(-1, D_MODEL)
+    assert torch.allclose(layer.norm1.running_mean, 0.1 * pooled.mean(0), atol=1e-6), (
+        'running mean is not the per-feature mean pooled over episodes and timesteps'
+    )
+    assert torch.allclose(
+        layer.norm1.running_var, 0.9 + 0.1 * pooled.var(0, unbiased=True), atol=1e-6
+    ), 'running variance is not the per-feature variance pooled over episodes and timesteps'
 
 
 if __name__ == '__main__':
