@@ -616,10 +616,13 @@ class RotaryTemporalEncoding(torch.nn.Module):
         rather than all of it -- specialization rather than a defect, and the same idea as ALiBi's
         per-head slopes, but it needs a sentence of justification in Methods.
 
-        For the value encoder that restores parity exactly: `n_head * d_head / 2` is `d_model / 2`
-        whenever the projection is square. The event encoder's is not -- `THP_ENCODER_D_K` is 64
-        against `d_model` 256 -- so it gets `n_head * 32` bands against the additive arm's 128. Use
-        `band_count` to check parity for a given configuration rather than assuming it.
+        Parity with the additive arm therefore needs `n_head * d_head == d_model`. The value
+        encoder gets that for free, since `d_head` is derived as `d_model // n_heads`. The event
+        encoder does not: it takes `d_k` as its own config value, and `THP_ENCODER_D_K` was raised
+        from 64 to 128 for exactly this reason. `d_v` stayed at 64 -- only q and k are rotated, so
+        only their width sets the band count, and an asymmetric `d_k`/`d_v` is fine here because
+        the softmax temperature is `d_k ** 0.5` either way. Lowering `d_k` again reopens the
+        deficit silently, so check `band_count` against `d_model / 2` rather than assuming it.
     """
 
     def __init__(self, n_head: int, d_head: int, p_min: float, p_max: float):

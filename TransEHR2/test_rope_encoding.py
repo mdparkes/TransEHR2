@@ -39,7 +39,7 @@ from TransEHR2.modules import EventDataEncoder, ValueDataEncoder
 # The production geometry, from experiment1_baseline.yaml.
 D_MODEL = 256
 N_HEADS = 2
-THP_D_K = 64
+THP_D_K = 128
 
 # Ladder bounds from the plan: P_min = 2 * delta_min, P_max = 63 * delta_max.
 VALUE_GAP_MAX = 125_073.0
@@ -295,20 +295,47 @@ def test_bands_are_partitioned_across_heads_not_repeated():
     assert torch.unique(rotary.lambdas).numel() == rotary.band_count, 'bands are repeated'
 
 
-def test_band_count_matches_the_additive_arm_where_the_projection_is_square():
-    """Value encoder: parity is exact. Event encoder: it is not, and by how much is recorded."""
-    value = RotaryTemporalEncoding(N_HEADS, D_MODEL // N_HEADS, VALUE_P_MIN, VALUE_P_MAX)
-    assert value.band_count == D_MODEL // 2, (
-        f'rotary arm has {value.band_count} bands against the additive arm\'s {D_MODEL // 2}'
-    )
+def test_band_count_matches_the_additive_arm_on_both_streams():
+    """Parity needs `n_head * d_head == d_model`, and only one stream gets that for free.
 
-    event = RotaryTemporalEncoding(N_HEADS, THP_D_K, EVENT_P_MIN, EVENT_P_MAX)
-    additive_event_bands = D_MODEL // 2
-    print(
-        f'  event stream band parity: rotary {event.band_count} vs additive {additive_event_bands} '
-        f'({additive_event_bands / event.band_count:.0f}x deficit, from THP_ENCODER_D_K={THP_D_K})'
-    )
-    assert event.band_count == N_HEADS * THP_D_K // 2
+    The value encoder derives its per-head width from `d_model`, so it cannot be wrong. The event
+    encoder takes `d_k` from config, which is why `THP_ENCODER_D_K` is 128 rather than the
+    submitted model's 64 -- at 64 the rotary arm ran 64 bands against the additive arm's 128, and
+    a win for the additive arm could have been a win for twice the frequencies instead.
+    """
+    for label, d_head, bounds in (
+        ('value', D_MODEL // N_HEADS, (VALUE_P_MIN, VALUE_P_MAX)),
+        ('event', THP_D_K, (EVENT_P_MIN, EVENT_P_MAX)),
+    ):
+        rotary = RotaryTemporalEncoding(N_HEADS, d_head, *bounds)
+        assert rotary.band_count == D_MODEL // 2, (
+            f'{label} stream: rotary arm has {rotary.band_count} bands against the additive '
+            f"arm's {D_MODEL // 2}"
+        )
+
+
+def test_every_shipped_config_gives_the_two_arms_the_same_band_count():
+    """The parity check that reads the configs, so lowering d_k cannot pass unnoticed."""
+    import pathlib
+
+    import yaml
+
+    directory = pathlib.Path(__file__).resolve().parent / 'configs' / 'experiments'
+    checked = 0
+    for path in sorted(directory.glob('*.yaml')):
+        config = yaml.safe_load(path.read_text())
+        if 'THP_ENCODER_D_K' not in config:
+            continue
+        checked += 1
+        additive_bands = config['THP_ENCODER_D_MODEL'] // 2
+        rotary_bands = config['THP_ENCODER_N_HEADS'] * config['THP_ENCODER_D_K'] // 2
+        assert rotary_bands == additive_bands, (
+            f'{path.name}: event stream would run {rotary_bands} rotary bands against '
+            f'{additive_bands} additive ones; THP_ENCODER_D_K must be '
+            f"{config['THP_ENCODER_D_MODEL'] // config['THP_ENCODER_N_HEADS']}"
+        )
+    assert checked >= 8, f'only {checked} configs carry an event encoder; the scan is not working'
+    print(f'  {checked} shipped configs, band parity on all of them')
 
 
 def test_rotation_rejects_what_it_cannot_encode():

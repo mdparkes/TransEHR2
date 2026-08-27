@@ -341,12 +341,14 @@ class EventDataEncoder(torch.nn.Module):
 
         Note:
             The event stream's rotary ladder holds `n_head * d_k / 2` distinct frequencies against the
-            additive arm's `d_model / 2`. With the shipped configuration -- `d_model` 256, `n_head` 2,
-            `d_k` 64 -- that is 64 against 128, a residual two-fold spectral deficit that partitioning
-            across heads cannot close because the projection is not square. Raising `THP_ENCODER_D_K` to
-            128 would close it; leaving it is defensible on the grounds that both ladders span the same
-            1-48 h range post fix 03 and differ only in resolution, but it has to be stated rather than
-            discovered.
+            additive arm's `d_model / 2`, so the two arms run the same ladder resolution only when
+            `n_head * d_k == d_model`. Unlike the value encoder, which derives its per-head width from
+            `d_model`, this one takes `d_k` as its own config value -- and `THP_ENCODER_D_K` is 128 in
+            every shipped config for exactly this reason, up from the 64 the submitted model used.
+            `THP_ENCODER_D_V` stays at 64: only q and k are rotated, so only their width sets the band
+            count, and the softmax temperature is `d_k ** 0.5` regardless. Lowering `d_k` reopens a
+            spectral deficit that no amount of partitioning across heads can close, and a win for the
+            additive arm would then be unattributable.
         """
 
         super().__init__()
