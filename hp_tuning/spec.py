@@ -18,6 +18,8 @@ back through it.
 """
 
 import os
+import textwrap
+
 import yaml
 
 from typing import Any, Dict, List, Optional
@@ -120,6 +122,38 @@ def load_spec(spec_path: str) -> Dict[str, Any]:
                 f"would silently collapse two trials into one."
             )
 
+    # Extra trials are one-off ablations that hang off the sweep rather than sitting in the
+    # grid: a single named change from the centre, measured head-to-head against it. They are
+    # deliberately NOT grid cells -- an ablation has no ordered set of values to rank and must
+    # never influence which grid value is selected.
+    for index, extra in enumerate(spec.get('EXTRA_TRIALS') or []):
+        where = f"{spec_path}: EXTRA_TRIALS[{index}]"
+        for key in ('name', 'arm', 'select_on', 'overrides'):
+            if key not in extra:
+                raise ValueError(f"{where} is missing the required key {key!r}")
+        if extra['arm'] not in spec['ARMS']:
+            raise ValueError(
+                f"{where} names arm {extra['arm']!r}, which is not in ARMS "
+                f"({sorted(spec['ARMS'])})"
+            )
+        if extra['select_on'] not in SELECTION_CRITERIA:
+            raise ValueError(
+                f"{where} selects on {extra['select_on']!r}; "
+                f"expected one of {sorted(SELECTION_CRITERIA)}"
+            )
+        if not extra['overrides']:
+            raise ValueError(
+                f"{where} overrides nothing, so it would duplicate the centre it is meant to "
+                f"be compared against."
+            )
+        collides = sorted(set(extra['overrides']) & set(spec['GRID']))
+        if collides:
+            raise ValueError(
+                f"{where} overrides {collides}, which the grid also sweeps. An extra trial is "
+                f"read as one change from the centre; changing a swept hyperparameter as well "
+                f"would confound it with that hyperparameter's own coordinate."
+            )
+
     spec_dir = os.path.dirname(os.path.abspath(spec_path))
     for key in ('BASE_CONFIG', 'DATASET_CONFIG', 'OUTPUT_DIR', 'MANIFEST'):
         if not os.path.isabs(spec[key]):
@@ -130,6 +164,14 @@ def load_spec(spec_path: str) -> Dict[str, Any]:
     # needs it. It belongs to the base config rather than the spec -- one source of truth, and
     # a spec that disagreed with the configs it generates would send the reporter looking in
     # the wrong tree.
+    if not os.path.exists(spec['BASE_CONFIG']):
+        raise ValueError(
+            f"{spec_path} points at a base config that does not exist:\n"
+            f"    {spec['BASE_CONFIG']}\n"
+            f"If this sweep runs on the settings a previous phase selected, that config is "
+            f"written by select_tuned_hyperparameters.py and the previous phase has to finish "
+            f"first."
+        )
     with open(spec['BASE_CONFIG'], 'r') as f_in:
         base_config = yaml.safe_load(f_in)
     if 'MODEL_DIR' not in base_config:
@@ -173,6 +215,7 @@ def expand_trials(spec: Dict[str, Any]) -> List[Dict[str, Any]]:
             'overrides': dict(arm_overrides, **defaults),
             # The centre is the default trial for every hyperparameter at once.
             'covers': [{'hyperparameter': name, 'value': defaults[name]} for name in hp_names],
+            'is_extra': False,
             # Every hyperparameter that selects downstream needs the centre as its baseline,
             # so the centre is finetuned whenever any of them do.
             'needs_finetune': any(
@@ -195,8 +238,35 @@ def expand_trials(spec: Dict[str, Any]) -> List[Dict[str, Any]]:
                     'value': value,
                     'overrides': overrides,
                     'covers': [{'hyperparameter': hp_name, 'value': value}],
+            'is_extra': False,
                     'needs_finetune': criterion['needs_finetune'],
                 })
+
+        for extra in spec.get('EXTRA_TRIALS') or []:
+            if extra['arm'] != arm_name:
+                continue
+            criterion = SELECTION_CRITERIA[extra['select_on']]
+            # Built from the DEFAULTS, not from any grid cell, so the only thing separating it
+            # from the arm's centre is its own overrides. That is what makes the head-to-head
+            # against the centre a one-variable comparison.
+            overrides = dict(arm_overrides, **defaults)
+            overrides.update(extra['overrides'])
+            trials.append({
+                'name': f"{spec['SPEC_NAME']}_{arm_name}_{extra['name']}",
+                'arm': arm_name,
+                'is_centre': False,
+                'hyperparameter': None,
+                'value': None,
+                'overrides': overrides,
+                # Empty on purpose: `covers` is how the ranking stage finds the trial for a
+                # grid cell, so an empty list keeps an ablation out of every ranking and out
+                # of selection. An extra trial is reported, never selected on.
+                'covers': [],
+                'needs_finetune': criterion['needs_finetune'],
+                'is_extra': True,
+                'select_on': extra['select_on'],
+                'description': extra.get('description', ''),
+            })
 
     names = [trial['name'] for trial in trials]
     if len(set(names)) != len(names):
@@ -263,17 +333,42 @@ def write_trial_configs(
                 f"version on disk."
             )
 
-        described = (
-            'the shared all-defaults centre' if trial['is_centre']
-            else f"{trial['hyperparameter']} = {trial['value']!r}"
-        )
+        if trial['is_centre']:
+            described = 'the shared all-defaults centre'
+        elif trial.get('is_extra', False):
+            changed = ', '.join(
+                f'{key} = {value!r}' for key, value in sorted(trial['overrides'].items())
+                if key not in (spec['GRID'].keys() | set(spec['ARMS'][trial['arm']] or {}))
+                and base_config.get(key) != value
+            )
+            described = f"ablation {trial['name'].rsplit('_', 1)[-1]} -- {changed}"
+        else:
+            described = f"{trial['hyperparameter']} = {trial['value']!r}"
+
+        if trial.get('is_extra', False):
+            rationale = (
+                f"# This is an ablation, not a grid cell. It sits at the centre in every\n"
+                f"# respect but the setting above, so it is read head-to-head against the\n"
+                f"# centre, and it takes no part in selecting any hyperparameter's value.\n"
+            )
+            if trial.get('description'):
+                wrapped = '\n'.join(
+                    f'#   {line}' for line in
+                    textwrap.wrap(' '.join(trial['description'].split()), width= 88)
+                )
+                rationale += f'#\n{wrapped}\n'
+        else:
+            rationale = (
+                f"# Every other tuned hyperparameter sits at its default, which is what makes\n"
+                f"# this an additive sweep: each value is measured against one shared point.\n"
+            )
+
         header = (
             f"# Generated by generate_tuning_configs.py from {spec['SPEC_PATH']}\n"
             f"# Do not edit by hand -- regenerate the spec instead.\n"
             f"#\n"
             f"# Sweep: {spec['SPEC_NAME']}   Arm: {trial['arm']}   Trial: {described}\n"
-            f"# Every other tuned hyperparameter sits at its default, which is what makes this\n"
-            f"# an additive sweep: each value is measured against one shared reference point.\n"
+            f"{rationale}"
             f"\n"
         )
         with open(config_path, 'w') as f_out:
@@ -324,6 +419,9 @@ def write_manifest(spec: Dict[str, Any], trials: List[Dict[str, Any]]) -> str:
                 'value': trial['value'],
                 'covers': trial['covers'],
                 'needs_finetune': trial['needs_finetune'],
+                'is_extra': trial.get('is_extra', False),
+                'select_on': trial.get('select_on'),
+                'description': trial.get('description', ''),
             }
             for trial in trials
         ],
@@ -377,4 +475,25 @@ def finetune_trials(manifest: Dict[str, Any], arm: Optional[str] = None) -> List
     return [
         t for t in manifest['trials']
         if t['needs_finetune'] and (arm is None or t['arm'] == arm)
+    ]
+
+
+def extra_trials(manifest: Dict[str, Any], arm: Optional[str] = None) -> List[Dict[str, Any]]:
+    """The one-off ablations attached to a sweep, as distinct from its grid cells.
+
+    These are reported and never selected on: each is a single named change from its arm's
+    centre, so it reads as a head-to-head rather than as a coordinate with an ordered set of
+    values to rank.
+
+    Args:
+        manifest: A loaded manifest.
+        arm: Restrict to one encoding arm, or None for every arm.
+
+    Returns:
+        The matching trials, in manifest order. Empty for a sweep with no EXTRA_TRIALS block,
+        including any manifest written before extras existed.
+    """
+    return [
+        t for t in manifest['trials']
+        if t.get('is_extra', False) and (arm is None or t['arm'] == arm)
     ]

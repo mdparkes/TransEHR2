@@ -14,8 +14,8 @@ from typing import Any, Dict, List, Optional
 
 from jmir_reporting.tables import Table, build_document, render_text
 
-from hp_tuning.results import compare_arms, rank_hyperparameter
-from hp_tuning.spec import SELECTION_CRITERIA
+from hp_tuning.results import compare_arms, rank_hyperparameter, read_result
+from hp_tuning.spec import SELECTION_CRITERIA, extra_trials
 
 
 # Supporting columns shown alongside each criterion's selection metric. The selection metric is
@@ -239,6 +239,72 @@ def build_arm_comparison_table(
     return table
 
 
+def build_extras_table(
+        manifest: Dict[str, Any],
+        arm: str,
+        number: int
+) -> Optional[Table]:
+    """Build the head-to-head table of an arm's ablations against its centre.
+
+    An ablation is not a grid cell and has no ordered set of values to rank, so it is shown as
+    a pair -- the centre, then the single named change from it -- rather than folded into a
+    ranking it must not influence.
+
+    Args:
+        manifest: A loaded manifest.
+        arm: The encoding arm.
+        number: The table number used in the caption.
+
+    Returns:
+        The table, or None if the arm has no ablations.
+    """
+    extras = extra_trials(manifest, arm)
+    if not extras:
+        return None
+
+    centre = next(
+        (t for t in manifest['trials'] if t['arm'] == arm and t['is_centre']), None
+    )
+
+    # Ablations may in principle select on different criteria; group by the one they use so a
+    # single table never mixes pretraining losses with task scores.
+    by_criterion = {}
+    for extra in extras:
+        by_criterion.setdefault(extra.get('select_on') or 'mortality', []).append(extra)
+
+    criterion = sorted(by_criterion)[0]
+    spec = SELECTION_CRITERIA[criterion]
+    rows = ([(centre, 'centre (reference)')] if centre is not None else [])
+    rows += [(extra, extra['name'].rsplit('_', 1)[-1]) for extra in by_criterion[criterion]]
+
+    results = [read_result(manifest, trial, criterion) for trial, _ in rows]
+    columns = _used_columns(criterion, [{'results': results}])
+
+    table = Table(
+        number=number,
+        caption=(
+            f'Ablations against the {arm} centre, {manifest["fold"]}, on '
+            f'{spec["metric"].replace("_", " ")}.'
+        ),
+        stub_head='Configuration',
+        columns=[heading for _, heading in columns] + ['Trial'],
+    )
+    table.add_footnote(
+        'Each row differs from the centre in exactly one setting. These are ablations, not '
+        'grid cells: they are reported here and take no part in selecting any '
+        'hyperparameter\'s value.'
+    )
+    for (trial, label), result in zip(rows, results):
+        if result.is_usable:
+            cells = [format_metric(result.scores.get(key)) for key, _ in columns]
+        else:
+            cells = [STATUS_TEXT.get(result.status, result.status)] + [''] * (len(columns) - 1)
+        cells.append(result.name)
+        table.add_row(label, cells)
+
+    return table
+
+
 def build_all_tables(manifest: Dict[str, Any], first_number: int = 1) -> List[Table]:
     """Build every table for a sweep: one per arm per criterion, plus the arm comparison.
 
@@ -257,6 +323,10 @@ def build_all_tables(manifest: Dict[str, Any], first_number: int = 1) -> List[Ta
             if table is not None:
                 tables.append(table)
                 number += 1
+        extras = build_extras_table(manifest, arm, number)
+        if extras is not None:
+            tables.append(extras)
+            number += 1
     comparison = build_arm_comparison_table(manifest, number)
     if comparison is not None:
         tables.append(comparison)
@@ -304,6 +374,25 @@ def write_csv(manifest: Dict[str, Any], path: str) -> str:
                         result.name,
                         result.detail,
                     ] + [result.scores.get(key, '') for key in metric_keys])
+
+            # Ablations carry no grid coordinate, so they get their own rows with the
+            # hyperparameter column naming the ablation rather than a swept key.
+            for extra in extra_trials(manifest, arm):
+                criterion = extra.get('select_on') or 'mortality'
+                result = read_result(manifest, extra, criterion)
+                writer.writerow([
+                    arm,
+                    f"<ablation:{extra['name'].rsplit('_', 1)[-1]}>",
+                    '',
+                    False,
+                    criterion,
+                    SELECTION_CRITERIA[criterion]['metric'],
+                    '' if result.value is None else result.value,
+                    False,
+                    result.status,
+                    result.name,
+                    result.detail,
+                ] + [result.scores.get(key, '') for key in metric_keys])
     return path
 
 

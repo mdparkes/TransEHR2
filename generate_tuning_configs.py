@@ -69,9 +69,18 @@ def main(argv=None):
     print(f"{len(trials)} pretraining jobs, {n_finetune} finetuning jobs.")
     print()
 
+    spec_extras = {
+        f"{spec['SPEC_NAME']}_{extra['arm']}_{extra['name']}": extra['overrides']
+        for extra in (spec.get('EXTRA_TRIALS') or [])
+    }
+
     for trial in trials:
         if trial['is_centre']:
             described = 'centre (all defaults)'
+        elif trial.get('is_extra', False):
+            changed = ', '.join(f'{k} = {v!r}' for k, v in sorted(
+                spec_extras.get(trial['name'], {}).items()))
+            described = f'ablation: {changed}'
         else:
             described = f"{trial['hyperparameter']} = {trial['value']!r}"
         stages = 'pretrain + finetune' if trial['needs_finetune'] else 'pretrain'
