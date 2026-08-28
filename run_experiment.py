@@ -701,6 +701,13 @@ def main():
                 best_train_losses, best_val_losses, experiment_config
             )
 
+        # Unregister the model and optimizer from the Accelerator before the next stage
+        # prepares its own. `prepare` APPENDS to an internal registry, and `save_state` writes
+        # every entry in it, so a checkpoint taken during a later stage would carry this stage's
+        # model as well -- and a resuming process, which reaches that stage having prepared only
+        # one model, loads the wrong entry into it. The accelerate runner avoids this by
+        # discarding the whole Accelerator between stages; one process needs only the unregister.
+        accelerator.free_memory()
         del electra
         gc.collect()
         torch.cuda.empty_cache()
@@ -795,6 +802,9 @@ def main():
                     raise
                 timer.end_phase('finetune', is_main_process=True)
 
+                # See the note after pretraining: the evaluation below prepares a model of
+                # its own, and the next task's finetune prepares another.
+                accelerator.free_memory()
                 del downstream_predictor
                 gc.collect()
                 torch.cuda.empty_cache()
@@ -824,6 +834,7 @@ def main():
                 mem_test_mode=mem_test_mode
             )
 
+            accelerator.free_memory()
             del downstream_predictor
             gc.collect()
             torch.cuda.empty_cache()

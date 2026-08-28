@@ -453,6 +453,68 @@ def test_limit_episodes_truncates_every_partition(sweep):
     assert 'SMOKE TEST' in result.stdout
 
 
+@pytest.mark.slow
+def test_multi_task_run_keeps_one_model_registered_per_stage(sweep):
+    """A Phase 4 style run -- pretrain plus more than one task in one process -- must not let
+    the Accelerator accumulate prepared models.
+
+    ``Accelerator.prepare`` APPENDS to an internal registry and ``save_state`` writes every
+    entry in it. Without an unregister between stages, a checkpoint taken ten epochs into the
+    second task carries the pretraining model and the first task's model as well, and a
+    resuming process -- which reaches that stage having prepared only the model it needs --
+    loads the wrong entry into it. It surfaces as a size mismatch rather than as silent
+    corruption, but it kills the resume.
+
+    The accelerate runner discards the whole Accelerator between stages, which hides this. This
+    runner keeps one for the process, so the unregister has to be explicit.
+
+    Two tasks are enough: the bug needs a stage that prepares a model after another already
+    has. Phenotype is left out because it needs a phenotyping listfile the synthetic fold does
+    not carry.
+    """
+    with open(sweep['base_config'], 'r') as f_in:
+        config = yaml.safe_load(f_in)
+    config['EXPERIMENT_NAME'] = 'itest_multitask'
+    config_path = os.path.join(sweep['root'], 'multitask.yaml')
+    with open(config_path, 'w') as f_out:
+        yaml.dump(config, f_out)
+
+    probe = os.path.join(sweep['root'], 'registry_probe.py')
+    with open(probe, 'w') as f_out:
+        f_out.write(
+            "import sys\n"
+            "import accelerate\n"
+            "_prepare = accelerate.Accelerator.prepare\n"
+            "_worst = [0]\n"
+            "def prepare(self, *args, **kwargs):\n"
+            "    out = _prepare(self, *args, **kwargs)\n"
+            "    _worst[0] = max(_worst[0], len(self._models))\n"
+            "    return out\n"
+            "accelerate.Accelerator.prepare = prepare\n"
+            "import atexit\n"
+            "atexit.register(lambda: print(f'MAX_REGISTERED_MODELS={_worst[0]}'))\n"
+            "sys.argv = sys.argv[1:]\n"
+            "import runpy\n"
+            "runpy.run_path('run_experiment.py', run_name='__main__')\n"
+        )
+
+    result = _run([sys.executable, probe, 'run_experiment.py',
+                   sweep['dataset_config'], config_path,
+                   '--folds', 'fold0', '--tasks', 'mortality', 'length_of_stay',
+                   '--num_workers', '0'])
+    assert result.returncode == 0, result.stdout[-4000:]
+
+    marker = [line for line in result.stdout.splitlines()
+              if line.startswith('MAX_REGISTERED_MODELS=')]
+    assert marker, f'the probe did not report:\n{result.stdout[-2000:]}'
+    worst = int(marker[-1].split('=')[1])
+    assert worst == 1, (
+        f'the Accelerator held {worst} prepared models at once. Every stage must unregister '
+        f'its model before the next one prepares, or a checkpoint written in a later stage '
+        f'cannot be resumed.'
+    )
+
+
 def test_measure_spans_ignores_padding():
     """The span measurement that checks the ladder must not treat padded zeros as records.
 
