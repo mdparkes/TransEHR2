@@ -989,16 +989,23 @@ def pretrain_model(
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=learning_rate_decay)
 
     # Initialize loss functions
+    #
+    # These are moved to the accelerator's device, which matters for exactly one of them and
+    # is free for the other two. MaskedGeneratorLoss holds a BetaLoss per ordinal feature, and
+    # BetaLoss registers its class-probability table as a buffer. Left on the CPU, that buffer
+    # is indexed by target classes that live on the GPU, and every ordinal feature raises
+    # "indices should be either on cpu or on the same device as the indexed tensor". The data
+    # has three ordinal features (the GCS scales), so this fires on the first batch.
     gen_loss_fn = MaskedGeneratorLoss(
         ordinal_features=ordinal_features
-    )
-    disc_loss_fn = MaskedDiscriminatorLoss(weight=disc_loss_weight)
+    ).to(accelerator.device)
+    disc_loss_fn = MaskedDiscriminatorLoss(weight=disc_loss_weight).to(accelerator.device)
     thp_loss_fn = TransformerHawkesLoss(
         add_prediction_loss=use_thp_pred_loss,
         nll_weight=thp_loss_nll_weight,
         type_weight=thp_pred_loss_type_wt,
         time_weight=thp_pred_loss_time_wt
-    )
+    ).to(accelerator.device)
 
     if accelerator.is_main_process:
         param_shapes = get_param_shapes(model)
@@ -1577,16 +1584,23 @@ def pretrain_with_hyperparameter(
 
 
     # Initialize loss functions
+    #
+    # These are moved to the accelerator's device, which matters for exactly one of them and
+    # is free for the other two. MaskedGeneratorLoss holds a BetaLoss per ordinal feature, and
+    # BetaLoss registers its class-probability table as a buffer. Left on the CPU, that buffer
+    # is indexed by target classes that live on the GPU, and every ordinal feature raises
+    # "indices should be either on cpu or on the same device as the indexed tensor". The data
+    # has three ordinal features (the GCS scales), so this fires on the first batch.
     gen_loss_fn = MaskedGeneratorLoss(
         ordinal_features=ordinal_features
-    )
-    disc_loss_fn = MaskedDiscriminatorLoss(weight=disc_loss_weight)
+    ).to(accelerator.device)
+    disc_loss_fn = MaskedDiscriminatorLoss(weight=disc_loss_weight).to(accelerator.device)
     thp_loss_fn = TransformerHawkesLoss(
         add_prediction_loss=use_thp_pred_loss,
         nll_weight=thp_loss_nll_weight,
         type_weight=thp_pred_loss_type_wt,
         time_weight=thp_pred_loss_time_wt
-    )
+    ).to(accelerator.device)
 
 
     # Get the parameter shapes for unflattening later
