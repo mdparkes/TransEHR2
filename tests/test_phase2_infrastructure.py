@@ -36,6 +36,10 @@ from TransEHR2.data.preprocessing import save_dataset
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+# Working directory for every subprocess, set by the `sweep` fixture. Keeps the relative
+# ./log and ./checkpoints trees the runner writes out of the repository.
+_SCRATCH = [None]
+
 # One episode per row: (n_val_history, n_val_episode, n_event_history, n_event_episode).
 # Six episodes rather than five so that a batch of two divides every partition evenly and the
 # mortality labels the fixture assigns (i % 2) are balanced, which the AUPRC computation needs.
@@ -201,12 +205,18 @@ def _write_configs(root, data_dir, model_dir):
     return dataset_config_path, base_config_path
 
 
-def _run(command, cwd=REPO_ROOT):
+def _run(command, cwd=None):
     """Run a subprocess with the repository on PYTHONPATH and return the completed process.
 
+    Runs in a scratch directory rather than in the repository, because run_experiment.py writes
+    ./log/<experiment>/ and ./checkpoints/<experiment>/ relative to the working directory. With
+    cwd set to the repository those land in the real log/ and checkpoints/ trees and stay there
+    after the test passes. The repository is reachable through PYTHONPATH, and the caller passes
+    absolute script paths, so nothing depends on being run from the root.
+
     Args:
-        command: Argument list.
-        cwd: Working directory.
+        command: Argument list. Script paths must be absolute.
+        cwd: Working directory. Defaults to the module scratch directory.
 
     Returns:
         The CompletedProcess, with stdout and stderr merged into stdout.
@@ -228,9 +238,21 @@ def _run(command, cwd=REPO_ROOT):
                  'WORLD_SIZE', 'RANK', 'LOCAL_RANK', 'MASTER_ADDR', 'MASTER_PORT'):
         env.pop(name, None)
     return subprocess.run(
-        command, cwd=cwd, env=env, text=True,
+        command, cwd=cwd or _SCRATCH[0] or REPO_ROOT, env=env, text=True,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT
     )
+
+
+def script(name):
+    """Absolute path to a repository entry point, so it can be run from anywhere.
+
+    Args:
+        name: File name at the repository root, e.g. 'run_experiment.py'.
+
+    Returns:
+        The absolute path.
+    """
+    return os.path.join(REPO_ROOT, name)
 
 
 @pytest.fixture(scope='module')
@@ -244,6 +266,9 @@ def sweep(tmp_path_factory):
     data_dir = os.path.join(root, 'data')
     model_dir = os.path.join(root, 'models')
     os.makedirs(data_dir, exist_ok=True)
+    # Every subprocess runs here, so the runner's relative ./log and ./checkpoints land in the
+    # temporary tree and go away with it.
+    _SCRATCH[0] = root
 
     _write_variable_properties(os.path.join(root, 'variable_properties.yaml'))
     _write_fold(os.path.join(data_dir, 'fold0'))
@@ -268,7 +293,7 @@ def sweep(tmp_path_factory):
     with open(spec_path, 'w') as f_out:
         yaml.dump(spec, f_out)
 
-    result = _run([sys.executable, 'generate_tuning_configs.py', spec_path])
+    result = _run([sys.executable, script('generate_tuning_configs.py'), spec_path])
     assert result.returncode == 0, result.stdout
 
     with open(spec['MANIFEST'], 'r') as f_in:
@@ -322,12 +347,12 @@ def test_each_trial_config_sets_its_own_value(sweep):
 def test_trial_lookup_matches_the_manifest_order(sweep):
     """tuning_trial.py indexes the same lists the SLURM arrays will index."""
     for stage, expected in (('pretrain', 6), ('finetune', 4)):
-        result = _run([sys.executable, 'tuning_trial.py', sweep['manifest_path'],
+        result = _run([sys.executable, script('tuning_trial.py'), sweep['manifest_path'],
                        '--stage', stage, '--count'])
         assert result.returncode == 0, result.stdout
         assert int(result.stdout.strip()) == expected
 
-        result = _run([sys.executable, 'tuning_trial.py', sweep['manifest_path'],
+        result = _run([sys.executable, script('tuning_trial.py'), sweep['manifest_path'],
                        '--stage', stage, '--index', str(expected), '--field', 'name'])
         assert result.returncode == 1, 'an out-of-range array index must fail its own task'
         assert 'out of range' in result.stdout
@@ -343,7 +368,7 @@ def test_runner_rejects_a_tuning_grid(sweep):
     with open(grid_config, 'w') as f_out:
         yaml.dump(config, f_out)
 
-    result = _run([sys.executable, 'run_experiment.py', sweep['dataset_config'], grid_config,
+    result = _run([sys.executable, script('run_experiment.py'), sweep['dataset_config'], grid_config,
                    '--folds', 'fold0', '--tasks', 'none'])
     assert result.returncode != 0
     assert 'HYPERPARAMETERS_TO_TUNE' in result.stdout
@@ -351,7 +376,7 @@ def test_runner_rejects_a_tuning_grid(sweep):
 
 def test_runner_rejects_an_unknown_fold(sweep):
     """A mistyped fold fails in a second rather than after a pretrain."""
-    result = _run([sys.executable, 'run_experiment.py', sweep['dataset_config'],
+    result = _run([sys.executable, script('run_experiment.py'), sweep['dataset_config'],
                    sweep['base_config'], '--folds', 'fold9', '--tasks', 'none'])
     assert result.returncode != 0
     assert 'fold9' in result.stdout
@@ -369,7 +394,7 @@ def test_pretrain_then_finetune_then_report_then_select(sweep):
     common = ['--folds', 'fold0', '--num_workers', '0']
 
     for trial in manifest['trials']:
-        result = _run([sys.executable, 'run_experiment.py', sweep['dataset_config'],
+        result = _run([sys.executable, script('run_experiment.py'), sweep['dataset_config'],
                        trial['config'], '--tasks', 'none'] + common)
         assert result.returncode == 0, f"{trial['name']}:\n{result.stdout[-4000:]}"
 
@@ -389,7 +414,7 @@ def test_pretrain_then_finetune_then_report_then_select(sweep):
         assert data['hyperparameters']['POSITION_ENCODING'] == trial['arm']
 
     for trial in [t for t in manifest['trials'] if t['needs_finetune']]:
-        result = _run([sys.executable, 'run_experiment.py', sweep['dataset_config'],
+        result = _run([sys.executable, script('run_experiment.py'), sweep['dataset_config'],
                        trial['config'], '--tasks', 'mortality'] + common)
         assert result.returncode == 0, f"{trial['name']}:\n{result.stdout[-4000:]}"
         # Pretrained weights were already on disk, so this run must have skipped pretraining.
@@ -406,14 +431,14 @@ def test_pretrain_then_finetune_then_report_then_select(sweep):
         assert 'AUPRC' in data['validation_scores']
 
     tables_dir = os.path.join(sweep['root'], 'tables')
-    result = _run([sys.executable, 'report_tuning_results.py', sweep['manifest_path'],
+    result = _run([sys.executable, script('report_tuning_results.py'), sweep['manifest_path'],
                    '--tables_dir', tables_dir, '--require_complete'])
     assert result.returncode == 0, result.stdout
     for name in ('itest_tuning.docx', 'itest_tuning.csv'):
         assert os.path.exists(os.path.join(tables_dir, name)), f'{name} was not written'
 
     assembled_path = os.path.join(sweep['root'], 'assembled.yaml')
-    result = _run([sys.executable, 'select_tuned_hyperparameters.py', sweep['manifest_path'],
+    result = _run([sys.executable, script('select_tuned_hyperparameters.py'), sweep['manifest_path'],
                    '--output', assembled_path])
     assert result.returncode == 0, result.stdout
 
@@ -446,7 +471,7 @@ def test_limit_episodes_truncates_every_partition(sweep):
     with open(limited_path, 'w') as f_out:
         yaml.dump(config, f_out)
 
-    result = _run([sys.executable, 'run_experiment.py', sweep['dataset_config'], limited_path,
+    result = _run([sys.executable, script('run_experiment.py'), sweep['dataset_config'], limited_path,
                    '--folds', 'fold0', '--tasks', 'none', '--num_workers', '0',
                    '--limit_episodes', '2'])
     assert result.returncode == 0, result.stdout[-4000:]
@@ -495,10 +520,10 @@ def test_multi_task_run_keeps_one_model_registered_per_stage(sweep):
             "atexit.register(lambda: print(f'MAX_REGISTERED_MODELS={_worst[0]}'))\n"
             "sys.argv = sys.argv[1:]\n"
             "import runpy\n"
-            "runpy.run_path('run_experiment.py', run_name='__main__')\n"
+            f"runpy.run_path({script('run_experiment.py')!r}, run_name='__main__')\n"
         )
 
-    result = _run([sys.executable, probe, 'run_experiment.py',
+    result = _run([sys.executable, probe, script('run_experiment.py'),
                    sweep['dataset_config'], config_path,
                    '--folds', 'fold0', '--tasks', 'mortality', 'length_of_stay',
                    '--num_workers', '0'])
