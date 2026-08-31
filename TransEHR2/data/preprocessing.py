@@ -899,6 +899,34 @@ def _process_single_episode(
         return None
 
 
+def compute_static_feat_dims(var_properties, static_feats, max_token_length):
+    """Width of each static feature in the stored `static_data` array.
+
+    The model side needs this too, and must not reimplement it. `len(STATIC_FEATS)` is *not*
+    the width: since 75c39e8 made categorical encoding actually one-hot, a categorical static
+    occupies `size` columns rather than one -- Gender is 3 wide (Other/F/M), so Age + Gender is
+    4 columns, not 2. An entry point that passes the feature *count* as the static dimension
+    builds a classifier two columns too narrow and dies in the first forward pass with
+    `mat1 and mat2 shapes cannot be multiplied`. Arrays extracted before that commit were the
+    old width, so the mismatch only surfaces on a re-extraction.
+
+    Args:
+        var_properties: Parsed `variable_properties.yaml`.
+        static_feats: The STATIC_FEATS list from the dataset config, in order.
+        max_token_length: Width given to a static text feature.
+
+    Returns:
+        A list of per-feature widths; `sum()` is the stored `static_data` width.
+    """
+    dims = []
+    for feat in static_feats:
+        if var_properties[feat]['type'] == 'text':
+            dims.append(max_token_length)
+        else:
+            dims.append(var_properties[feat]['size'])
+    return dims
+
+
 def _get_tensor_dimensions(
     var_properties_path: str,
     valued_feats: List[str],
@@ -961,13 +989,9 @@ def _get_tensor_dimensions(
     text_feat_dims = [max_token_length for _ in text_feats]
     
     # Static features - handle different types
-    static_feat_dims = []
-    for feat in static_feats:
-        feat_type = var_properties[feat]['type']
-        if feat_type == 'text':
-            static_feat_dims.append(max_token_length)
-        else:
-            static_feat_dims.append(var_properties[feat]['size'])
+    static_feat_dims = compute_static_feat_dims(
+        var_properties, static_feats, max_token_length
+    )
     
     return TensorDimensions(
         n_episodes=n_episodes,
