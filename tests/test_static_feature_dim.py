@@ -19,6 +19,8 @@ and that the count is not a valid stand-in for the width.
 """
 
 import os
+import re
+import subprocess
 import yaml
 
 import pytest
@@ -28,6 +30,8 @@ from TransEHR2.data.preprocessing import compute_static_feat_dims
 
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# `n_static_features=len(STATIC_FEATS)` and friends -- an argument, not prose about one.
+ARGUMENT_PATTERN = re.compile(r'=\s*len\(STATIC_FEATS\)')
 DATASET_CONFIG = os.path.join(REPO_ROOT, 'TransEHR2', 'configs', 'datasets', 'mimic4.yaml')
 VARIABLE_PROPERTIES = os.path.join(REPO_ROOT, 'data', 'variable_properties.yaml')
 
@@ -86,22 +90,44 @@ def test_text_static_contributes_the_token_length():
 
 
 def test_entry_points_do_not_pass_the_feature_count():
-    """Guard every entry point at once: none of them may size statics by count again."""
+    """Guard every entry point at once: none of them may size statics by count again.
+
+    Enumerates what git tracks rather than listing filenames. An earlier version of this probe
+    named four files and so never looked at `run_experiment.py` -- which lives only on the
+    branches carrying the single-GPU runner, and is the one entry point the Phase 2 smoke test
+    actually invokes. It kept the bug through two rounds of fixes while this suite stayed green.
+
+    `git ls-files` rather than `os.walk` because the working tree also holds ignored local
+    copies of the entry points; those are nobody's deliverable, and walking the filesystem makes
+    the probe's verdict depend on which stray files a given checkout happens to have.
+    """
+    tracked = subprocess.run(
+        ['git', 'ls-files', '*.py'],
+        cwd=REPO_ROOT, capture_output=True, text=True, check=True,
+    ).stdout.split()
+    assert tracked, 'git ls-files returned nothing; this probe cannot verify anything'
+
     offenders = []
-    for name in ['run_experiment_accelerate.py', 'tune_hyperparameters_accelerate.py',
-                 'dump_finetuned_predictions.py',
-                 os.path.join('TransEHR2', 'test_tune_hyperparameters.py')]:
-        path = os.path.join(REPO_ROOT, name)
+    for relative in tracked:
+        # This probe names the anti-pattern in its own prose and its own assertion.
+        if relative == 'tests/test_static_feature_dim.py':
+            continue
+        path = os.path.join(REPO_ROOT, relative)
         if not os.path.exists(path):
             continue
         with open(path) as fh:
-            for lineno, line in enumerate(fh, 1):
-                stripped = line.strip()
-                # The word appears in explanatory comments; only a real argument counts.
-                if stripped.startswith('#'):
-                    continue
-                if 'len(STATIC_FEATS)' in stripped:
-                    offenders.append('%s:%d: %s' % (name, lineno, stripped))
+            try:
+                lines = fh.readlines()
+            except UnicodeDecodeError:
+                continue
+        for lineno, line in enumerate(lines, 1):
+            # Match an actual argument or assignment, not a mention. The name appears in
+            # comments and docstrings that exist precisely to warn against it, and a probe
+            # that trips on its own warnings teaches people to delete the warnings.
+            if not ARGUMENT_PATTERN.search(line):
+                continue
+            offenders.append('%s:%d: %s' % (relative, lineno, line.strip()))
+
     assert not offenders, (
         'static dimensions must come from compute_static_feat_dims(), not a feature count:\n'
         + '\n'.join(offenders)
