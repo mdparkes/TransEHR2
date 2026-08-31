@@ -19,7 +19,8 @@ from typing import Any, Dict, Tuple
 import pickle
 import re
 
-from TransEHR2.data.preprocessing import prepare_dataloaders
+from TransEHR2.constants import MAX_TOKEN_LENGTH
+from TransEHR2.data.preprocessing import compute_static_feat_dims, prepare_dataloaders
 from TransEHR2.models import ELECTRA
 from TransEHR2.modules import MaskedTokenDiscriminator, MaskedTokenGenerator, TransformerHawkesProcess
 from TransEHR2.modules import EventDataEncoder, ValueDataEncoder
@@ -295,6 +296,12 @@ if __name__ == "__main__":
     # Get feature dimensions
     with open(VARIABLE_PROPERTIES_PATH, 'r') as f_in:
         variable_properties = yaml.safe_load(f_in)
+    # Width of the stored static_data array. NOT len(STATIC_FEATS): a categorical static is
+    # one-hot and occupies `size` columns, so Age + Gender is 4 wide, not 2. Derived from the
+    # same helper the extraction uses so the two cannot drift apart.
+    static_dim = sum(compute_static_feat_dims(
+        variable_properties, STATIC_FEATS, MAX_TOKEN_LENGTH
+    ))
     tot_val_feat_dim = 0
     numeric_feat_dims = []
     categorical_class_cnts = []
@@ -521,7 +528,7 @@ if __name__ == "__main__":
                     n_ordinal_features=len(ordinal_features),
                     n_multilabel_features=len(multilabel_class_cnts),
                     n_text_features=len(TEXT_FEATS) if USE_TEXT else 0,
-                    n_static_features=len(STATIC_FEATS),
+                    n_static_features=static_dim,
                     dim_feedforward=DISCRIMINATOR_DIM_FEEDFORWARD
                 )
                 transformer_hawkes_process = TransformerHawkesProcess(
