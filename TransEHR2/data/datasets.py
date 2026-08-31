@@ -251,6 +251,18 @@ class MixedDataset(Dataset):
     def __len__(self) -> int:
         return self.n_episodes
 
+    def _empty_indicators(self) -> torch.Tensor:
+        """Indicator tensor for a feature type the extraction produced no features for.
+
+        `load_dataset` substitutes a `(0, 0, 0)` array whenever metadata reports zero features
+        of a type, so the per-episode slice cannot be taken. The replacement still has to be
+        two-dimensional `(timesteps, features)`: `collate_tensorized` stacks these into
+        `(batch, timesteps, features)` and `_gen_val_assoc_feat_mask` unpacks exactly three
+        dimensions. Returning a bare `torch.empty(0)` collates to `(batch, 0)` and raises
+        `not enough values to unpack (expected 3, got 2)` on the first batch.
+        """
+        return torch.zeros((self.ts_len, 0), dtype=torch.float32)
+
     def __getitem__(self, idx: int) -> Dict:
         """
         Return episode as torch tensors, reconstructing dense text embeddings on-the-fly.
@@ -287,9 +299,9 @@ class MixedDataset(Dataset):
             'val_numeric_values': [torch.from_numpy(v[idx, ts_start:ts_end].copy()) for v in self.val_numeric_values],
             'val_categorical_indicators': torch.from_numpy(self.val_categorical_indicators[idx, ts_start:ts_end].copy()),
             'val_categorical_values': [torch.from_numpy(v[idx, ts_start:ts_end].copy()) for v in self.val_categorical_values],
-            'val_ordinal_indicators': torch.from_numpy(self.val_ordinal_indicators[idx, ts_start:ts_end].copy()) if self.val_ordinal_indicators.size > 0 else torch.empty(0),
+            'val_ordinal_indicators': torch.from_numpy(self.val_ordinal_indicators[idx, ts_start:ts_end].copy()) if self.val_ordinal_indicators.size > 0 else self._empty_indicators(),
             'val_ordinal_values': [torch.from_numpy(v[idx, ts_start:ts_end].copy()) for v in self.val_ordinal_values],
-            'val_multilabel_indicators': torch.from_numpy(self.val_multilabel_indicators[idx, ts_start:ts_end].copy()) if self.val_multilabel_indicators.size > 0 else torch.empty(0),
+            'val_multilabel_indicators': torch.from_numpy(self.val_multilabel_indicators[idx, ts_start:ts_end].copy()) if self.val_multilabel_indicators.size > 0 else self._empty_indicators(),
             'val_multilabel_values': [torch.from_numpy(v[idx, ts_start:ts_end].copy()) for v in self.val_multilabel_values],
             'val_text_indicators': torch.from_numpy(self.val_text_indicators[idx, ts_start:ts_end].copy()),
             'val_text_embeddings': text_embeddings_dense,
