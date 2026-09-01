@@ -408,26 +408,23 @@ def pretrain_one_epoch(
     accelerator: Accelerator,
     desc: str = "Training",
     mem_test_mode: bool = False,
-    profile_steps: int = 0,
-    profile_steps_per_epoch: Optional[int] = None,
+    profiler: Optional[Any] = None,
 ) -> Dict[str, float]:
     """Execute one epoch of pretraining.
 
     Args:
-        profile_steps: When positive, time each phase of the step, stop after this many steps
-            and print the breakdown. Diagnostic only: the phase boundaries synchronize the CUDA
-            stream, which slows the step down. Zero runs the epoch normally.
-        profile_steps_per_epoch: Steps in a full, untruncated epoch, used to extrapolate the
-            per-epoch cost. `len(loader)` is wrong here whenever --limit_episodes is in play,
-            which it always is for a profiling run.
+        profiler: A StepProfiler owned by the caller, so that its step budget and warmup span
+            the whole run rather than restarting each epoch -- the steady state is in the second
+            epoch onward, once the page cache over the memory-mapped arrays is warm. None runs
+            the epoch uninstrumented.
 
     Returns dictionary of average losses for the epoch.
     """
 
     model.train()
 
-    profiler = (StepProfiler(profile_steps, device=accelerator.device)
-                if profile_steps > 0 else NullStepProfiler())
+    if profiler is None:
+        profiler = NullStepProfiler()
     
     train_losses = []
     train_gen_losses = []
@@ -526,9 +523,6 @@ def pretrain_one_epoch(
                 print("Memory usage during pretraining training:", flush=True)
             print_peak_memory(accelerator)
             break  # Exit after two batches for memory testing
-
-    if profiler.enabled and accelerator.is_main_process:
-        profiler.report(steps_per_epoch=profile_steps_per_epoch or len(loader))
 
     # Gather and average losses across all ranks
     train_losses = accelerator.gather(torch.tensor(train_losses, device=accelerator.device))
@@ -967,6 +961,7 @@ def pretrain_model(
     mem_test_mode: bool = False,
     ordinal_features: Optional[List[int]] = None,
     profile_steps: int = 0,
+    profile_warmup: int = 3,
     profile_steps_per_epoch: Optional[int] = None
 ) -> Tuple[Dict[str, float], Dict[str, float]]:
     """Pre-train an ELECTRA-style model with Accelerate support (FSDP or DDP).
@@ -997,7 +992,12 @@ def pretrain_model(
         profile_steps: If positive, run this many training steps with a per-phase wall-clock
             breakdown, print it, and return without validating, checkpointing or saving. The
             phase boundaries synchronize the CUDA stream, so the totals are an upper bound on
-            real throughput; the ratios between phases are the usable output.
+            real throughput; the ratios between phases are the usable output. The budget spans
+            epochs, so a value above one epoch's step count carries on into the next.
+        profile_warmup: Leading steps discarded before measuring. Set it to a whole epoch's step
+            count to measure the steady state: the first pass over the memory-mapped arrays pays
+            page faults that later passes do not, so it is not the cost a multi-epoch budget
+            should be priced from.
 
     Returns:
         Tuple of (best_train_losses, best_val_losses) dictionaries. Both are empty under
@@ -1112,6 +1112,9 @@ def pretrain_model(
     best_epoch_val_loss = best_epoch_val_losses['Optimization_Loss']
     early_stopping_counter = training_metadata.get('early_stopping_counter', 0) 
 
+    profiler = (StepProfiler(profile_steps, warmup=profile_warmup, device=accelerator.device)
+                if profile_steps > 0 else NullStepProfiler())
+
     # Wall clock of each completed epoch -- training, validation, state extraction and
     # checkpointing together. Reported at the end so a short run can be extrapolated on a
     # per-epoch cost rather than on whole-process wall time, which carries fixed startup and
@@ -1140,13 +1143,18 @@ def pretrain_model(
             accelerator=accelerator,
             desc=f"Epoch {epoch + 1} Training",
             mem_test_mode=mem_test_mode,
-            profile_steps=profile_steps,
-            profile_steps_per_epoch=profile_steps_per_epoch
+            profiler=profiler
         )
 
-        if profile_steps > 0:
+        if profiler.enabled:
+            # Skip validation, checkpointing and the improvement check while profiling: they
+            # would dominate a run of a few dozen steps, and nothing here is worth keeping.
+            if not profiler.done:
+                continue
             if accelerator.is_main_process:
-                print('Profiling run: stopping before validation. Nothing was saved.',
+                profiler.report(
+                    steps_per_epoch=profile_steps_per_epoch or len(train_loader))
+                print('Profiling run: stopped before validation. Nothing was saved.',
                       flush=True)
             return {}, {}
 
@@ -1238,6 +1246,16 @@ def pretrain_model(
         if (epoch + 1) % 50 == 0:
             scheduler.step()
     
+
+    if profiler.enabled:
+        # Reached only when the epoch budget ran out before the step budget, e.g. a 192-step
+        # profile against a 1-epoch config. Report what was measured rather than nothing.
+        if accelerator.is_main_process:
+            profiler.report(steps_per_epoch=profile_steps_per_epoch or len(train_loader))
+            print(f'Profiling run: the {total_epoch}-epoch budget ended before '
+                  f'{profile_steps} steps were taken. Raise PRETRAIN_TOTAL_EPOCH to profile '
+                  f'deeper. Nothing was saved.', flush=True)
+        return {}, {}
 
     if accelerator.is_main_process:
         report_epoch_timing(epoch_seconds, total_epoch)

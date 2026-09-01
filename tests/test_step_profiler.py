@@ -218,3 +218,55 @@ def test_a_passing_timing_check_carries_no_detail():
                        for c in ast.walk(node) if isinstance(c, ast.Constant)
                        and isinstance(c.value, str))]
     assert guarded, 'the "printed no timing line" message is not guarded by `if not ok`'
+
+
+class TestTheProfilerSpansEpochs:
+    """A truncated, page-warm sample is not the per-step cost of a real epoch. The profiler has
+    to be able to skip a whole first pass over the memory-mapped arrays and measure the second,
+    which means one profiler for the run rather than one per epoch."""
+
+    def test_pretrain_model_owns_the_profiler(self):
+        import torch.utils.tensorboard  # noqa: F401  (annotation evaluated at import)
+        import TransEHR2.routines_accelerate as routines
+
+        params = inspect.signature(routines.pretrain_model).parameters
+        assert 'profile_steps' in params
+        assert 'profile_warmup' in params
+        # The epoch function receives it rather than constructing one, or the warmup would
+        # restart every epoch and never reach the steady state.
+        epoch_params = inspect.signature(routines.pretrain_one_epoch).parameters
+        assert 'profiler' in epoch_params
+        assert 'profile_steps' not in epoch_params
+
+    def test_a_warmup_of_one_epoch_discards_that_epoch(self):
+        """96 steps of warmup against a 192-step budget leaves exactly the second epoch."""
+        profiler = StepProfiler(total_steps=192, warmup=96)
+        for _ in range(192):
+            profiler.mark('forward')
+            profiler.end_step()
+        assert len(profiler.timings['TOTAL']) == 96
+
+    def test_done_reports_the_budget_being_spent(self):
+        profiler = StepProfiler(total_steps=4, warmup=1)
+        assert profiler.done is False
+        for _ in range(4):
+            profiler.end_step()
+        assert profiler.done is True
+
+    def test_the_null_profiler_is_never_done(self):
+        """`pretrain_model` breaks out of the epoch loop on `done`, so the production path must
+        report False forever."""
+        assert NullStepProfiler().done is False
+
+    def test_a_short_epoch_budget_still_reports(self):
+        """Reaching the end of the epochs before the step budget must print what was measured,
+        not silently return nothing."""
+        import torch.utils.tensorboard  # noqa: F401
+        import TransEHR2.routines_accelerate as routines
+
+        source = inspect.getsource(routines.pretrain_model)
+        after_loop = source.split('report_epoch_timing')[0]
+        assert after_loop.count('profiler.report(') == 2, (
+            'expected a report both when the step budget completes and when the epoch budget '
+            'runs out first'
+        )

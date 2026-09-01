@@ -942,6 +942,7 @@ class NullStepProfiler:
     """Stand-in used when profiling is off, so the training loop calls the same methods."""
 
     enabled = False
+    done = False
 
     def mark(self, phase: str) -> None:
         pass
@@ -949,7 +950,7 @@ class NullStepProfiler:
     def end_step(self) -> bool:
         return False
 
-    def report(self) -> None:
+    def report(self, steps_per_epoch: Optional[int] = None) -> None:
         pass
 
 
@@ -963,8 +964,13 @@ class StepProfiler:
     what identifies the bottleneck.
 
     The first `warmup` steps are recorded and discarded. They carry one-time costs -- cuDNN
-    algorithm selection, allocator growth, dataloader worker startup -- that do not recur and
-    would otherwise dominate a short measurement.
+    algorithm selection, allocator growth, dataloader worker startup, and a cold page cache over
+    the memory-mapped arrays -- that do not recur and would otherwise dominate a short
+    measurement. Setting `warmup` to a whole epoch's worth of steps measures the steady state
+    rather than the first pass, which is the number a multi-epoch budget should be priced from.
+
+    One profiler spans the whole run rather than one epoch, so `total_steps` may exceed the
+    steps in a single epoch.
 
     Args:
         total_steps: Steps to run before the loop stops, warmup included.
@@ -982,6 +988,11 @@ class StepProfiler:
         self.timings: Dict[str, List[float]] = {}  # insertion-ordered, so phases print in loop order
         self._last = None
         self._start_of_step = None
+
+    @property
+    def done(self) -> bool:
+        """Whether every requested step has been taken, warmup included."""
+        return self.step >= self.total_steps
 
     def _sync(self) -> None:
         if torch.cuda.is_available():
@@ -1006,7 +1017,7 @@ class StepProfiler:
         self.step += 1
         self._last = now
         self._start_of_step = now
-        return self.step >= self.total_steps
+        return self.done
 
     def report(self, steps_per_epoch: Optional[int] = None) -> None:
         """Print the per-phase breakdown and, given a step count, the implied epoch cost."""

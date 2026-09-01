@@ -443,6 +443,12 @@ def main():
              'synchronize the CUDA stream, so the step total is an upper bound; the ratios '
              'between phases are what identifies the bottleneck.'
     )
+    parser.add_argument(
+        '--profile_warmup', type=int, default=3, metavar='N',
+        help='Leading steps discarded before the profile measures. Set it to one epoch of '
+             'steps to measure the steady state: the first pass over the memory-mapped arrays '
+             'pays page faults that later passes do not, and --profile_steps spans epochs.'
+    )
     args = parser.parse_args()
 
     # Profiling must exercise the training step, so it cannot be allowed to load existing
@@ -726,6 +732,7 @@ def main():
                     mem_test_mode=mem_test_mode,
                     ordinal_features=ordinal_features if ordinal_features else None,
                     profile_steps=args.profile_steps,
+                    profile_warmup=args.profile_warmup,
                     profile_steps_per_epoch=full_steps_per_epoch
                 )
             except Exception as e:
