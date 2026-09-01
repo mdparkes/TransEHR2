@@ -170,3 +170,33 @@ class TestTimingIsMeasuredNotExtrapolated:
             argparse.Namespace(arms=['additive']), report, {}, {'PRETRAIN_TOTAL_EPOCH': 200}
         )
         assert any('No --time recommendation' in note for note in report.notes)
+
+
+class TestTimingStageRerunHazards:
+    """A rerun has to produce fresh numbers or say plainly that it did not."""
+
+    def test_a_zero_epoch_line_is_recognised_as_a_resumed_run(self):
+        """`pretrain_model` resuming at its epoch budget completes nothing and measures nothing.
+        Reported as 'no line printed' this would look like a format problem, not a stale
+        checkpoint."""
+        assert test_phase2_pipeline.ZERO_EPOCH_LINE.search(
+            f'\n{EPOCH_TIMING_PREFIX} n=0\n') is not None
+        assert test_phase2_pipeline.ZERO_EPOCH_LINE.search(
+            f'\n{EPOCH_TIMING_PREFIX} n=3 mean=17.5000 first=48.0 steady_n=2\n') is None
+
+    def test_a_zero_epoch_line_does_not_parse_as_a_measurement(self):
+        """EPOCH_LINE must not match it: n=0 carries no mean to price the request from."""
+        assert EPOCH_LINE.search(f'{EPOCH_TIMING_PREFIX} n=0') is None
+
+    def test_the_timing_stage_clears_stale_checkpoints(self):
+        source = inspect.getsource(test_phase2_pipeline.run_stage_timing)
+        assert 'shutil.rmtree' in source
+        assert 'checkpoints' in source
+
+    def test_the_first_arm_is_budget_checked_against_the_pipeline_estimate(self):
+        """Without a seed the first run is waved through with any time left and killed mid-epoch,
+        which loses the report the whole reserve exists to protect."""
+        signature = inspect.signature(test_phase2_pipeline.run_stage_timing)
+        assert 'trial_estimate' in signature.parameters
+        source = inspect.getsource(test_phase2_pipeline.run_stage_timing)
+        assert 'estimate = trial_estimate' in source

@@ -44,6 +44,7 @@ Nothing here writes to the real models/ tree: MODEL_DIR is rewritten to point in
 import argparse
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -736,9 +737,11 @@ def run_stage_pipeline(args, report, work_dir, base_config):
 EPOCH_LINE = re.compile(
     rf'^{EPOCH_TIMING_PREFIX}\s+n=(\d+)\s+mean=([\d.]+)\s+first=([\d.]+)', re.MULTILINE)
 STARTUP_LINE = re.compile(rf'^{STARTUP_TIMING_PREFIX}\s+([\d.]+)', re.MULTILINE)
+# A resumed run that is already at its epoch budget completes no epochs and measures nothing.
+ZERO_EPOCH_LINE = re.compile(rf'^{EPOCH_TIMING_PREFIX}\s+n=0\s*$', re.MULTILINE)
 
 
-def run_stage_timing(args, report, work_dir, base_config):
+def run_stage_timing(args, report, work_dir, base_config, trial_estimate=None):
     """Time full-size epochs directly, one short run per arm.
 
     Extrapolating from the truncated pipeline stage cannot work: a trial's wall time is fixed
@@ -756,6 +759,9 @@ def run_stage_timing(args, report, work_dir, base_config):
         report: The Report to record into.
         work_dir: Scratch directory.
         base_config: The real base config, copied per arm.
+        trial_estimate: Seconds one `run_experiment.py` invocation took in the pipeline stage,
+            used as the budget estimate for the first arm. Without it the first run would be
+            waved through with any amount of time left and killed mid-epoch, losing the report.
 
     Returns:
         {arm: {'startup': seconds, 'epoch': seconds, 'epochs': n}} for every arm that finished.
@@ -787,13 +793,23 @@ def run_stage_timing(args, report, work_dir, base_config):
         with open(config_path, 'w') as f_out:
             yaml.dump(config, f_out, default_flow_style=False, sort_keys=False)
 
+        # run_experiment.py puts checkpoints under ./checkpoints/<EXPERIMENT_NAME>/, outside
+        # work_dir, and pretrain_model resumes from them. A run that completes cleans up after
+        # itself, but one killed at the allocation limit does not -- and the next run would
+        # resume at the final epoch, complete zero epochs, and report no per-epoch cost at all.
+        stale = os.path.join('checkpoints', config['EXPERIMENT_NAME'], args.fold, 'pretrained')
+        if os.path.isdir(stale):
+            print(f"    removing a stale checkpoint at {stale}")
+            shutil.rmtree(stale)
+
         # One arm's measurement is enough to recommend from, so a tight allocation should stop
-        # here rather than lose the run mid-epoch and report nothing.
-        estimate = None
+        # here rather than lose the run mid-epoch and report nothing. Before any arm has been
+        # measured, the pipeline stage's per-invocation wall time is the closest proxy there is.
         if timings:
-            slowest = max(t['startup'] + t['epoch'] * args.timing_epochs
-                          for t in timings.values())
-            estimate = slowest * 1.5
+            estimate = max(t['startup'] + t['epoch'] * args.timing_epochs
+                           for t in timings.values()) * 1.5
+        else:
+            estimate = trial_estimate
         allowed, reason = budget_allows(estimate, args.reserve_seconds)
         if not allowed:
             report.record('timing', f'{arm}: per-epoch cost measured', None,
@@ -809,13 +825,19 @@ def run_stage_timing(args, report, work_dir, base_config):
         )
         epoch_match = EPOCH_LINE.search(text)
         startup_match = STARTUP_LINE.search(text)
+        ran_no_epochs = ZERO_EPOCH_LINE.search(text) is not None
         ok = status == 0 and epoch_match is not None and startup_match is not None
-        report.record(
-            'timing', f'{arm}: per-epoch cost measured', ok,
-            '\n'.join(text.strip().splitlines()[-15:]) if status else
-            f'the run finished but printed no {EPOCH_TIMING_PREFIX} / '
-            f'{STARTUP_TIMING_PREFIX} line, so there is nothing to size the request from'
-        )
+        if status:
+            detail = '\n'.join(text.strip().splitlines()[-15:])
+        elif ran_no_epochs:
+            detail = (f'the run completed zero epochs, so it measured nothing. It resumed from '
+                      f'a checkpoint at or past {args.timing_epochs} epochs -- check '
+                      f'checkpoints/{config["EXPERIMENT_NAME"]}/ and remove it.')
+        else:
+            detail = (f'the run finished but printed no {EPOCH_TIMING_PREFIX} / '
+                      f'{STARTUP_TIMING_PREFIX} line, so there is nothing to size the '
+                      f'request from')
+        report.record('timing', f'{arm}: per-epoch cost measured', ok, detail)
         if not ok:
             continue
 
@@ -975,6 +997,7 @@ def main(argv=None):
     if 'memory' in stages:
         run_stage_memory(args, report, args.work_dir, base_config)
 
+    mean_trial_seconds = None
     if 'pipeline' in stages:
         mean_trial_seconds = run_stage_pipeline(args, report, args.work_dir, base_config)
         if mean_trial_seconds is not None:
@@ -985,7 +1008,8 @@ def main(argv=None):
 
     # Its own stage, so `--only timing` can re-measure without re-running the sweep.
     if 'timing' in stages:
-        timings = run_stage_timing(args, report, args.work_dir, base_config)
+        timings = run_stage_timing(args, report, args.work_dir, base_config,
+                                   trial_estimate=mean_trial_seconds)
         report_timing(args, report, timings, base_config)
 
     status = report.summarise()
