@@ -23,6 +23,7 @@ import argparse
 import os
 import subprocess
 import sys
+import time
 
 import numpy as np
 import pytest
@@ -616,3 +617,36 @@ def test_generated_test_spec_survives_a_relative_work_dir(tmp_path, monkeypatch)
     with open(spec['BASE_CONFIG']) as fh:
         written_base = yaml.safe_load(fh)
     assert os.path.isabs(written_base['MODEL_DIR']), written_base['MODEL_DIR']
+
+
+def test_deadline_helpers_stop_before_the_allocation_ends(monkeypatch):
+    """The smoke test must exit on its own rather than be killed at the SLURM limit.
+
+    A job killed at its limit is recorded as TIMEOUT -- worse for the group's accounting than
+    finishing early, per `slurm_test_phase2.sh`'s own header -- and it discards the report. The
+    run that prompted this got through three of four finetunes and printed no verdict at all.
+
+    `budget_allows` gates each trial on the time left in `SLURM_JOB_END_TIME`, keeping back a
+    reserve for the reporting and selection stages.
+    """
+    import test_phase2_pipeline as gate
+
+    # No SLURM environment: never blocks, so local runs are unaffected.
+    monkeypatch.delenv('SLURM_JOB_END_TIME', raising=False)
+    assert gate.seconds_until_job_ends() is None
+    assert gate.budget_allows(9_999_999, 420)[0] is True
+
+    # A malformed value must not crash the test harness mid-sweep.
+    monkeypatch.setenv('SLURM_JOB_END_TIME', 'not-a-timestamp')
+    assert gate.seconds_until_job_ends() is None
+    assert gate.budget_allows(9_999_999, 420)[0] is True
+
+    # Thirty minutes left, seven reserved: a ten-minute trial fits, a thirty-minute one does not.
+    monkeypatch.setenv('SLURM_JOB_END_TIME', str(time.time() + 30 * 60))
+    assert gate.budget_allows(10 * 60, 420)[0] is True
+    allowed, reason = gate.budget_allows(30 * 60, 420)
+    assert allowed is False
+    assert 'left in the allocation' in reason
+
+    # An unknown estimate cannot be judged, so the first trial always runs.
+    assert gate.budget_allows(None, 420)[0] is True

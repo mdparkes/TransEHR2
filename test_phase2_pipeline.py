@@ -371,6 +371,46 @@ def parse_peak_memory(text):
     return max(peaks) if peaks else None
 
 
+def seconds_until_job_ends():
+    """Seconds left in the SLURM allocation, or None when not running under SLURM.
+
+    SLURM exports `SLURM_JOB_END_TIME` as a Unix timestamp. Knowing it lets the test stop on
+    its own terms instead of being killed at the limit: a job killed at its limit is recorded
+    as TIMEOUT, which is worse for the group's accounting than finishing early, and it throws
+    away the report -- the run that hit this got through three of four finetunes and printed
+    no verdict at all.
+    """
+    raw = os.environ.get('SLURM_JOB_END_TIME')
+    if not raw:
+        return None
+    try:
+        return float(raw) - time.time()
+    except ValueError:
+        return None
+
+
+def budget_allows(next_estimate, reserve_seconds):
+    """Whether another trial of `next_estimate` seconds fits before the deadline.
+
+    Args:
+        next_estimate: Expected seconds for the trial about to start, or None if unknown.
+        reserve_seconds: Seconds to keep back for the reporting and selection stages.
+
+    Returns:
+        (True, '') to proceed, or (False, reason) to stop cleanly.
+    """
+    remaining = seconds_until_job_ends()
+    if remaining is None or next_estimate is None:
+        return True, ''
+    if next_estimate <= remaining - reserve_seconds:
+        return True, ''
+    return False, (
+        f'{remaining / 60:.1f} min left in the allocation, {reserve_seconds / 60:.1f} min '
+        f'reserved for reporting, and the next trial is estimated at '
+        f'{next_estimate / 60:.1f} min.'
+    )
+
+
 def run_subprocess(command, log_path, env=None):
     """Run a command, tee its output to a log, and return (status, elapsed, text).
 
@@ -552,7 +592,16 @@ def run_stage_pipeline(args, report, work_dir, base_config):
               '--limit_episodes', str(args.limit_episodes)]
 
     pretrain_times = []
+    finetune_times = []
+    ran_out = None
     for index, trial in enumerate(pretrains):
+        # Estimate from the slowest completed trial, not the mean: stopping one trial early
+        # costs a re-run, being killed at the limit costs the whole report.
+        allowed, reason = budget_allows(
+            max(pretrain_times) if pretrain_times else None, args.reserve_seconds)
+        if not allowed:
+            ran_out = f'pretrain {index + 1}/{len(pretrains)} -- {reason}'
+            break
         print(f"\n  pretrain {index + 1}/{len(pretrains)}: {trial['name']}")
         status, elapsed, text = run_subprocess(
             [sys.executable, 'run_experiment.py', manifest['dataset_config'], trial['config'],
@@ -580,6 +629,14 @@ def run_stage_pipeline(args, report, work_dir, base_config):
                           f'pretraining loss.' if not os.path.exists(eval_path) else '')
 
     for index, trial in enumerate(finetunes):
+        # A finetune has no completed sibling to estimate from on the first pass, so fall back
+        # to the pretrain times; the two stages train the same encoders for the same epochs.
+        reference = finetune_times or pretrain_times
+        allowed, reason = budget_allows(
+            max(reference) if reference else None, args.reserve_seconds)
+        if not allowed:
+            ran_out = ran_out or f'finetune {index + 1}/{len(finetunes)} -- {reason}'
+            break
         print(f"\n  finetune {index + 1}/{len(finetunes)}: {trial['name']}")
         status, elapsed, text = run_subprocess(
             [sys.executable, 'run_experiment.py', manifest['dataset_config'], trial['config'],
@@ -587,6 +644,8 @@ def run_stage_pipeline(args, report, work_dir, base_config):
             os.path.join(work_dir, 'logs', f"finetune_{trial['name']}.log")
         )
         ok = status == 0
+        if ok:
+            finetune_times.append(elapsed)
         report.record('pipeline', f"finetune {trial['name']}", ok,
                       '\n'.join(text.strip().splitlines()[-15:]) if not ok else
                       f'{elapsed:.1f}s')
@@ -603,6 +662,26 @@ def run_stage_pipeline(args, report, work_dir, base_config):
                           f'{eval_path} has no validation_scores block, so the three '
                           f'downstream-selected hyperparameters have nothing to rank on.'
                           if not has_scores else '')
+
+    if ran_out is not None:
+        # Say what to change, not just that it stopped. The per-trial cost is close to linear
+        # in the episode count, so the ratio of what fitted to what was needed is the factor
+        # to shrink by; a further 20% comes off for the margin that was missing this time.
+        n_trials = len(pretrains) + len(finetunes)
+        n_done = len(pretrain_times) + len(finetune_times)
+        suggestion = ''
+        if n_done:
+            fraction = n_done / n_trials
+            suggested = max(25, int(args.limit_episodes * fraction * 0.8))
+            suggestion = (
+                f' {n_done} of {n_trials} trials finished, so about {fraction:.0%} of the '
+                f'sweep fitted the allocation. Re-run with '
+                f'TEST_ARGS="--limit_episodes {suggested}", or raise --time -- but note that '
+                f'PAD_TO_LIMIT sleeps out any surplus, so the group is charged for the larger '
+                f'request either way. Shrinking is the cheaper fix.'
+            )
+        report.record('pipeline', 'the sweep finished inside the allocation', None,
+                      f'Stopped before {ran_out}{suggestion}')
 
     status, _, text = run_subprocess(
         [sys.executable, 'report_tuning_results.py', manifest_path,
@@ -716,6 +795,11 @@ def main(argv=None):
                              'including a MODEL_DIR override, so the real models/ tree is '
                              'never touched.')
     parser.add_argument('--arms', type=str, nargs='+', default=['additive', 'rope'])
+    parser.add_argument('--reserve_seconds', type=int, default=420,
+                        help='Seconds held back from the SLURM allocation for the reporting '
+                             'and selection stages. The trial loops stop rather than start a '
+                             'trial that would not finish inside the remainder, so the test '
+                             'exits on its own instead of being killed as TIMEOUT.')
     parser.add_argument('--epochs', type=int, default=2,
                         help='Epochs per trial in the pipeline stage. Two is the minimum that '
                              'exercises the improvement check and the scheduler step.')
