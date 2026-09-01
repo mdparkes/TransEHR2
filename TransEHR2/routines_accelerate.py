@@ -25,6 +25,7 @@ from TransEHR2.models import MixedClassifier
 from TransEHR2.utils import DistributedTimer
 from TransEHR2.utils import format_pretraining_performance_table, generate_record_masks, get_param_shapes
 from TransEHR2.utils import print_peak_memory, move_batch_to_device
+from TransEHR2.utils import NullStepProfiler, StepProfiler
 
 
 MetadataDict: TypeAlias = Dict[str, Any]
@@ -407,13 +408,26 @@ def pretrain_one_epoch(
     accelerator: Accelerator,
     desc: str = "Training",
     mem_test_mode: bool = False,
+    profile_steps: int = 0,
+    profile_steps_per_epoch: Optional[int] = None,
 ) -> Dict[str, float]:
     """Execute one epoch of pretraining.
-    
+
+    Args:
+        profile_steps: When positive, time each phase of the step, stop after this many steps
+            and print the breakdown. Diagnostic only: the phase boundaries synchronize the CUDA
+            stream, which slows the step down. Zero runs the epoch normally.
+        profile_steps_per_epoch: Steps in a full, untruncated epoch, used to extrapolate the
+            per-epoch cost. `len(loader)` is wrong here whenever --limit_episodes is in play,
+            which it always is for a profiling run.
+
     Returns dictionary of average losses for the epoch.
     """
 
     model.train()
+
+    profiler = (StepProfiler(profile_steps, device=accelerator.device)
+                if profile_steps > 0 else NullStepProfiler())
     
     train_losses = []
     train_gen_losses = []
@@ -427,7 +441,12 @@ def pretrain_one_epoch(
     
     for i, batch in tqdm(enumerate(loader), desc=desc, leave=False, disable=disable_tqdm):
 
+        # Closes the interval that began when the previous step ended, so it measures how long
+        # the loop waited on the dataloader rather than any work of its own.
+        profiler.mark('dataloader wait')
+
         batch = move_batch_to_device(batch, device=accelerator.device)
+        profiler.mark('move to device')
         value_associated_data_masks, _ = generate_record_masks(
             batch,
             feature_sample_rate=record_mask_ratio,
@@ -435,6 +454,7 @@ def pretrain_one_epoch(
             subsample_rate=cmpnt_mask_ratio
         )
         accelerator.wait_for_everyone()
+        profiler.mark('generate masks')
 
         electra_output = model(
             batch,
@@ -444,6 +464,7 @@ def pretrain_one_epoch(
             compute_intensities=True,
             thp_loss_mc_samples=thp_loss_mc_samples
         )
+        profiler.mark('forward')
 
         generator_preds = electra_output['generator']
         discriminator_preds = electra_output['discriminator']
@@ -480,21 +501,34 @@ def pretrain_one_epoch(
             train_thp_type_losses.append(0.0)
             train_thp_time_losses.append(0.0)
 
+        # Four of the seven per-step `.item()` calls sit in the THP branch above, so their
+        # synchronization cost is inside 'loss compute' rather than here.
+        profiler.mark('loss compute')
+
         train_losses.append(loss.item())
         train_gen_losses.append(gen_loss.item())
         train_disc_losses.append(disc_loss.item())
+        profiler.mark('loss readback')
 
         optimizer.zero_grad()
         accelerator.backward(loss)
+        profiler.mark('backward')
         accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         accelerator.wait_for_everyone()
+        profiler.mark('clip + optimizer')
+
+        if profiler.end_step():
+            break
 
         if mem_test_mode and i == 1:
             if accelerator.is_main_process:
                 print("Memory usage during pretraining training:", flush=True)
             print_peak_memory(accelerator)
             break  # Exit after two batches for memory testing
+
+    if profiler.enabled and accelerator.is_main_process:
+        profiler.report(steps_per_epoch=profile_steps_per_epoch or len(loader))
 
     # Gather and average losses across all ranks
     train_losses = accelerator.gather(torch.tensor(train_losses, device=accelerator.device))
@@ -931,7 +965,9 @@ def pretrain_model(
     timer: Optional[DistributedTimer] = None,
     accelerator: Accelerator = None,
     mem_test_mode: bool = False,
-    ordinal_features: Optional[List[int]] = None
+    ordinal_features: Optional[List[int]] = None,
+    profile_steps: int = 0,
+    profile_steps_per_epoch: Optional[int] = None
 ) -> Tuple[Dict[str, float], Dict[str, float]]:
     """Pre-train an ELECTRA-style model with Accelerate support (FSDP or DDP).
     
@@ -958,9 +994,14 @@ def pretrain_model(
         accelerator: Accelerator instance for distributed training
         mem_test_mode: If True, runs the forward and backward passes on a single batch, reports memory usage, and 
             raises an Exception to terminate. Useful for figuring out batch size limits.
-    
+        profile_steps: If positive, run this many training steps with a per-phase wall-clock
+            breakdown, print it, and return without validating, checkpointing or saving. The
+            phase boundaries synchronize the CUDA stream, so the totals are an upper bound on
+            real throughput; the ratios between phases are the usable output.
+
     Returns:
-        Tuple of (best_train_losses, best_val_losses) dictionaries
+        Tuple of (best_train_losses, best_val_losses) dictionaries. Both are empty under
+        profile_steps, which trains nothing worth keeping.
     """
 
     report_freq = 10
@@ -1091,8 +1132,16 @@ def pretrain_model(
             cmpnt_mask_ratio=cmpnt_mask_ratio,
             accelerator=accelerator,
             desc=f"Epoch {epoch + 1} Training",
-            mem_test_mode=mem_test_mode
+            mem_test_mode=mem_test_mode,
+            profile_steps=profile_steps,
+            profile_steps_per_epoch=profile_steps_per_epoch
         )
+
+        if profile_steps > 0:
+            if accelerator.is_main_process:
+                print('Profiling run: stopping before validation. Nothing was saved.',
+                      flush=True)
+            return {}, {}
 
         # Validation phase
         curr_epoch_val_losses = pretrain_validate(

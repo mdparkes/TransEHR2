@@ -8,7 +8,7 @@ import yaml
 from accelerate import Accelerator
 from datetime import timedelta
 from torch import Tensor
-from typing import Any, Dict, List, OrderedDict, Tuple, Union
+from typing import Any, Dict, List, Optional, OrderedDict, Tuple, Union
 
 from TransEHR2.data.datasets import MixedDataset
 from TransEHR2.data.custom_types import MixedTensorDataset
@@ -936,3 +936,106 @@ def convert_model_to_dtype(model: torch.nn.Module, dtype: torch.dtype = torch.bf
             continue
         buffer.data = buffer.data.to(dtype)
     return model
+
+
+class NullStepProfiler:
+    """Stand-in used when profiling is off, so the training loop calls the same methods."""
+
+    enabled = False
+
+    def mark(self, phase: str) -> None:
+        pass
+
+    def end_step(self) -> bool:
+        return False
+
+    def report(self) -> None:
+        pass
+
+
+class StepProfiler:
+    """Wall-clock breakdown of one training step, by phase.
+
+    Every `mark` synchronizes the CUDA stream before reading the clock, so work lands in the
+    phase that launched it rather than in whichever later call happened to block. That makes an
+    instrumented step slower than an uninstrumented one, and the totals here are therefore an
+    upper bound on real throughput. What they are good for is the ratio between phases, which is
+    what identifies the bottleneck.
+
+    The first `warmup` steps are recorded and discarded. They carry one-time costs -- cuDNN
+    algorithm selection, allocator growth, dataloader worker startup -- that do not recur and
+    would otherwise dominate a short measurement.
+
+    Args:
+        total_steps: Steps to run before the loop stops, warmup included.
+        warmup: Leading steps to discard.
+        device: Device whose stream is synchronized. CPU-only runs skip the sync.
+    """
+
+    enabled = True
+
+    def __init__(self, total_steps: int, warmup: int = 3, device: Optional[Any] = None):
+        self.total_steps = max(total_steps, warmup + 1)
+        self.warmup = warmup
+        self.device = device
+        self.step = 0
+        self.timings: Dict[str, List[float]] = {}  # insertion-ordered, so phases print in loop order
+        self._last = None
+        self._start_of_step = None
+
+    def _sync(self) -> None:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+    def mark(self, phase: str) -> None:
+        """Close the interval that started at the previous mark and attribute it to `phase`."""
+        self._sync()
+        now = time.perf_counter()
+        if self._last is not None and self.step >= self.warmup:
+            self.timings.setdefault(phase, []).append(now - self._last)
+        self._last = now
+        if self._start_of_step is None:
+            self._start_of_step = now
+
+    def end_step(self) -> bool:
+        """Close the step. Returns True when the loop should stop."""
+        self._sync()
+        now = time.perf_counter()
+        if self._start_of_step is not None and self.step >= self.warmup:
+            self.timings.setdefault('TOTAL', []).append(now - self._start_of_step)
+        self.step += 1
+        self._last = now
+        self._start_of_step = now
+        return self.step >= self.total_steps
+
+    def report(self, steps_per_epoch: Optional[int] = None) -> None:
+        """Print the per-phase breakdown and, given a step count, the implied epoch cost."""
+        measured = self.step - self.warmup
+        if measured <= 0 or 'TOTAL' not in self.timings:
+            print('\nSTEP PROFILE: no steps completed past warmup.', flush=True)
+            return
+
+        total = sum(self.timings['TOTAL']) / len(self.timings['TOTAL'])
+        print(f'\n{"=" * 66}')
+        print(f'STEP PROFILE  ({measured} steps measured, {self.warmup} discarded as warmup)')
+        print('=' * 66)
+        print(f'{"phase":<24}{"mean s":>10}{"share":>9}{"min s":>11}{"max s":>11}')
+        print('-' * 66)
+        for phase, samples in self.timings.items():
+            if phase == 'TOTAL':
+                continue
+            mean = sum(samples) / len(samples)
+            print(f'{phase:<24}{mean:>10.4f}{mean / total:>8.1%}{min(samples):>11.4f}'
+                  f'{max(samples):>11.4f}')
+        print('-' * 66)
+        print(f'{"TOTAL":<24}{total:>10.4f}{1.0:>8.1%}'
+              f'{min(self.timings["TOTAL"]):>11.4f}{max(self.timings["TOTAL"]):>11.4f}')
+        print('=' * 66)
+        if steps_per_epoch:
+            print(f'  {steps_per_epoch} training steps per full epoch at this batch size')
+            print(f'  implied training time per epoch: {total * steps_per_epoch / 3600:.2f} h')
+            print(f'  (validation is extra and is not in this figure)')
+        if torch.cuda.is_available():
+            print(f'  peak allocated: {torch.cuda.max_memory_allocated() / 2**30:.2f} GB'
+                  f'   reserved: {torch.cuda.max_memory_reserved() / 2**30:.2f} GB')
+        print(flush=True)

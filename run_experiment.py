@@ -47,8 +47,14 @@ import argparse
 import gc
 import os
 import re
+import time
 import torch
 import yaml
+
+# Read before the framework imports below, so --profile_steps can separate fixed startup cost
+# -- imports, CUDA context, memory-mapping the arrays, model construction -- from per-step cost.
+# Extrapolating a short run without that split multiplies startup by the epoch count.
+_PROCESS_START = time.perf_counter()
 
 from accelerate import Accelerator
 from accelerate.utils import DistributedType
@@ -429,9 +435,18 @@ def main():
              'run are meaningless as measurements and are written to the same paths a real '
              'run would use, so point MODEL_DIR somewhere disposable.'
     )
+    parser.add_argument(
+        '--profile_steps', type=int, default=0, metavar='N',
+        help='DIAGNOSTIC ONLY. Run N pretraining steps with a per-phase wall-clock breakdown, '
+             'print it, and exit without validating or saving. The phase boundaries '
+             'synchronize the CUDA stream, so the step total is an upper bound; the ratios '
+             'between phases are what identifies the bottleneck.'
+    )
     args = parser.parse_args()
 
-    force_pretrain = args.force_pretrain
+    # Profiling must exercise the training step, so it cannot be allowed to load existing
+    # weights and skip pretraining.
+    force_pretrain = args.force_pretrain or args.profile_steps > 0
     force_finetune = args.force_finetune
     num_workers = args.num_workers
     mem_test_mode = args.mem_test_mode
@@ -582,6 +597,10 @@ def main():
         else:
             train_loader, test_loader = dataloader_list[0], dataloader_list[-1]
             val_loader = None
+        # Captured before truncation: the profiler extrapolates with it, and --limit_episodes
+        # is always set on a profiling run.
+        full_steps_per_epoch = len(train_loader)
+
         if args.limit_episodes is not None:
             dataloader_list = [
                 truncate_loader(loader, args.limit_episodes) for loader in dataloader_list
@@ -672,6 +691,12 @@ def main():
             model_save_path = f'{model_save_dir}/pretrained.pt'
             checkpoint_dir = f'./checkpoints/{EXPERIMENT_NAME}/{fold_name}/pretrained'
 
+            if args.profile_steps > 0:
+                print(f"\nStartup before the first training step: "
+                      f"{time.perf_counter() - _PROCESS_START:.1f}s "
+                      f"(imports, CUDA context, dataset load, model construction). This is "
+                      f"paid once per job, not once per epoch.\n", flush=True)
+
             timer.start_phase('pretrain', is_main_process=True)
             try:
                 best_train_losses, best_val_losses = pretrain_model(
@@ -694,7 +719,9 @@ def main():
                     checkpoint_dir=checkpoint_dir,
                     accelerator=accelerator,
                     mem_test_mode=mem_test_mode,
-                    ordinal_features=ordinal_features if ordinal_features else None
+                    ordinal_features=ordinal_features if ordinal_features else None,
+                    profile_steps=args.profile_steps,
+                    profile_steps_per_epoch=full_steps_per_epoch
                 )
             except Exception as e:
                 print(f'Error during pretraining: {e}')
@@ -702,6 +729,13 @@ def main():
             finally:
                 writer.close()
             timer.end_phase('pretrain', is_main_process=True)
+
+            if args.profile_steps > 0:
+                # pretrain_model returns empty loss dicts under profiling, so there is nothing
+                # to write and nothing downstream can run on.
+                print('Profiling run complete. No weights, evaluation or checkpoint written.',
+                      flush=True)
+                return
 
             write_pretrain_evaluation(
                 pretrain_evaluation_fp, EXPERIMENT_NAME, fold_name,
