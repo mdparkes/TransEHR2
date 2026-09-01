@@ -28,9 +28,9 @@ What it checks, in the order it checks it:
    hundred episodes and two epochs, so it tests the plumbing rather than the model.
 
 5. **Timing.** Extrapolates from the truncated run to a full-size trial and prints the
-   ``--time`` value the real jobs should request. Over-requesting is charged against the whole
-   group, so the sweep should be launched with a measured limit rather than the placeholder in
-   the batch scripts.
+   ``--time`` value the real jobs should request. Requesting more than a job takes
+   deprioritizes the whole group's queue position, so the sweep should be launched with a
+   measured limit rather than the placeholder in the batch scripts.
 
 Usage:
     python test_phase2_pipeline.py --work_dir /tmp/phase2_test
@@ -374,11 +374,9 @@ def parse_peak_memory(text):
 def seconds_until_job_ends():
     """Seconds left in the SLURM allocation, or None when not running under SLURM.
 
-    SLURM exports `SLURM_JOB_END_TIME` as a Unix timestamp. Knowing it lets the test stop on
-    its own terms instead of being killed at the limit: a job killed at its limit is recorded
-    as TIMEOUT, which is worse for the group's accounting than finishing early, and it throws
-    away the report -- the run that hit this got through three of four finetunes and printed
-    no verdict at all.
+    SLURM exports `SLURM_JOB_END_TIME` as a Unix timestamp. A job cut off at its limit never
+    prints the summary or the `--time` recommendation, which are the outputs of the run, so
+    the trial loops use this to stop while there is still time to report.
     """
     raw = os.environ.get('SLURM_JOB_END_TIME')
     if not raw:
@@ -595,8 +593,8 @@ def run_stage_pipeline(args, report, work_dir, base_config):
     finetune_times = []
     ran_out = None
     for index, trial in enumerate(pretrains):
-        # Estimate from the slowest completed trial, not the mean: stopping one trial early
-        # costs a re-run, being killed at the limit costs the whole report.
+        # Slowest completed trial rather than the mean, so a slow outlier does not overrun
+        # the limit and cost the report.
         allowed, reason = budget_allows(
             max(pretrain_times) if pretrain_times else None, args.reserve_seconds)
         if not allowed:
@@ -664,9 +662,8 @@ def run_stage_pipeline(args, report, work_dir, base_config):
                           if not has_scores else '')
 
     if ran_out is not None:
-        # Say what to change, not just that it stopped. The per-trial cost is close to linear
-        # in the episode count, so the ratio of what fitted to what was needed is the factor
-        # to shrink by; a further 20% comes off for the margin that was missing this time.
+        # Per-trial cost is close to linear in the episode count, so the fraction of trials
+        # that fitted gives the shrink factor, less 20% for margin.
         n_trials = len(pretrains) + len(finetunes)
         n_done = len(pretrain_times) + len(finetune_times)
         suggestion = ''
@@ -676,9 +673,9 @@ def run_stage_pipeline(args, report, work_dir, base_config):
             suggestion = (
                 f' {n_done} of {n_trials} trials finished, so about {fraction:.0%} of the '
                 f'sweep fitted the allocation. Re-run with '
-                f'TEST_ARGS="--limit_episodes {suggested}", or raise --time -- but note that '
-                f'PAD_TO_LIMIT sleeps out any surplus, so the group is charged for the larger '
-                f'request either way. Shrinking is the cheaper fix.'
+                f'TEST_ARGS="--limit_episodes {suggested}" to fit the current limit, or '
+                f'raise --time so the whole sweep runs -- a request is capped at 7 days and '
+                f'costs nothing so long as the job uses what it asks for.'
             )
         report.record('pipeline', 'the sweep finished inside the allocation', None,
                       f'Stopped before {ran_out}{suggestion}')
@@ -798,8 +795,9 @@ def main(argv=None):
     parser.add_argument('--reserve_seconds', type=int, default=420,
                         help='Seconds held back from the SLURM allocation for the reporting '
                              'and selection stages. The trial loops stop rather than start a '
-                             'trial that would not finish inside the remainder, so the test '
-                             'exits on its own instead of being killed as TIMEOUT.')
+                             'trial that would not finish inside the remainder, so the run '
+                             'still prints its summary and its --time recommendation instead '
+                             'of being cut off mid-trial.')
     parser.add_argument('--epochs', type=int, default=2,
                         help='Epochs per trial in the pipeline stage. Two is the minimum that '
                              'exercises the improvement check and the scheduler step.')

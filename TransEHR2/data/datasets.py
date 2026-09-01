@@ -255,11 +255,10 @@ class MixedDataset(Dataset):
         """Indicator tensor for a feature type the extraction produced no features for.
 
         `load_dataset` substitutes a `(0, 0, 0)` array whenever metadata reports zero features
-        of a type, so the per-episode slice cannot be taken. The replacement still has to be
+        of a type, so the per-episode slice cannot be taken. The replacement must still be
         two-dimensional `(timesteps, features)`: `collate_tensorized` stacks these into
         `(batch, timesteps, features)` and `_gen_val_assoc_feat_mask` unpacks exactly three
-        dimensions. Returning a bare `torch.empty(0)` collates to `(batch, 0)` and raises
-        `not enough values to unpack (expected 3, got 2)` on the first batch.
+        dimensions from the result.
         """
         return torch.zeros((self.ts_len, 0), dtype=torch.float32)
 

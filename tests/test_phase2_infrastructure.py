@@ -562,21 +562,14 @@ def test_measure_spans_ignores_padding():
 
 
 def test_generated_test_spec_survives_a_relative_work_dir(tmp_path, monkeypatch):
-    """The GPU smoke test's stage 4 must produce a spec whose paths load_spec() can resolve.
+    """write_test_spec must produce a spec whose paths load_spec() can resolve.
 
-    `load_spec` resolves a relative BASE_CONFIG/DATASET_CONFIG/OUTPUT_DIR/MANIFEST **relative to
-    the spec file's own directory** -- the convention that lets the real
-    `phase2_spec.yaml` name `phase2_base.yaml` as a bare filename sitting beside it.
+    `load_spec` resolves a relative BASE_CONFIG, DATASET_CONFIG, OUTPUT_DIR or MANIFEST relative
+    to the spec file's own directory, which is what lets the real `phase2_spec.yaml` name
+    `phase2_base.yaml` as a bare filename beside it. `slurm_test_phase2.sh` defaults `WORK_DIR`
+    to a relative path, so a relative BASE_CONFIG is joined onto the spec dir and doubled.
 
-    `slurm_test_phase2.sh` defaults `WORK_DIR` to a *relative* `log/test_phase2_<jobid>`, so
-    `write_test_spec` wrote `BASE_CONFIG: log/test_phase2_27973/spec/phase2_test_base.yaml`,
-    which load_spec then joined onto the spec dir:
-
-        log/test_phase2_27973/spec/log/test_phase2_27973/spec/phase2_test_base.yaml
-
-    and generate_tuning_configs.py:48 raised. OUTPUT_DIR and MANIFEST had the same fault and
-    would have failed immediately after. The probe drives the writer with a relative work_dir --
-    the case the SLURM default actually produces -- and asserts every path round-trips.
+    The probe drives the writer with a relative work_dir and asserts every path round-trips.
     """
     import test_phase2_pipeline
     from hp_tuning.spec import load_spec
@@ -620,14 +613,10 @@ def test_generated_test_spec_survives_a_relative_work_dir(tmp_path, monkeypatch)
 
 
 def test_deadline_helpers_stop_before_the_allocation_ends(monkeypatch):
-    """The smoke test must exit on its own rather than be killed at the SLURM limit.
+    """`budget_allows` gates each trial on the time left in the SLURM allocation.
 
-    A job killed at its limit is recorded as TIMEOUT -- worse for the group's accounting than
-    finishing early, per `slurm_test_phase2.sh`'s own header -- and it discards the report. The
-    run that prompted this got through three of four finetunes and printed no verdict at all.
-
-    `budget_allows` gates each trial on the time left in `SLURM_JOB_END_TIME`, keeping back a
-    reserve for the reporting and selection stages.
+    A job cut off at its limit never prints the summary or the `--time` recommendation, so the
+    trial loops stop while a reserve remains for the reporting and selection stages.
     """
     import test_phase2_pipeline as gate
 

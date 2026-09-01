@@ -902,13 +902,10 @@ def _process_single_episode(
 def compute_static_feat_dims(var_properties, static_feats, max_token_length):
     """Width of each static feature in the stored `static_data` array.
 
-    The model side needs this too, and must not reimplement it. `len(STATIC_FEATS)` is *not*
-    the width: since 75c39e8 made categorical encoding actually one-hot, a categorical static
-    occupies `size` columns rather than one -- Gender is 3 wide (Other/F/M), so Age + Gender is
-    4 columns, not 2. An entry point that passes the feature *count* as the static dimension
-    builds a classifier two columns too narrow and dies in the first forward pass with
-    `mat1 and mat2 shapes cannot be multiplied`. Arrays extracted before that commit were the
-    old width, so the mismatch only surfaces on a re-extraction.
+    The model side needs this too and must call it rather than reimplement it, so that the
+    layer widths cannot drift from the array widths. `len(STATIC_FEATS)` is not the width: a
+    categorical static is one-hot and occupies `size` columns, so Age + Gender is 4 columns
+    rather than 2, and sizing a layer by the feature count builds it too narrow.
 
     Args:
         var_properties: Parsed `variable_properties.yaml`.

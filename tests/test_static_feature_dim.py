@@ -90,16 +90,12 @@ def test_text_static_contributes_the_token_length():
 
 
 def test_entry_points_do_not_pass_the_feature_count():
-    """Guard every entry point at once: none of them may size statics by count again.
+    """Guard every entry point at once: none of them may size statics by count.
 
-    Enumerates what git tracks rather than listing filenames. An earlier version of this probe
-    named four files and so never looked at `run_experiment.py` -- which lives only on the
-    branches carrying the single-GPU runner, and is the one entry point the Phase 2 smoke test
-    actually invokes. It kept the bug through two rounds of fixes while this suite stayed green.
-
-    `git ls-files` rather than `os.walk` because the working tree also holds ignored local
-    copies of the entry points; those are nobody's deliverable, and walking the filesystem makes
-    the probe's verdict depend on which stray files a given checkout happens to have.
+    Enumerates what git tracks rather than a fixed list of filenames, so an entry point that
+    exists only on some branches is still covered. `git ls-files` rather than `os.walk` because
+    the working tree can hold ignored local copies of the entry points, which would make the
+    verdict depend on which stray files a checkout happens to have.
     """
     tracked = subprocess.run(
         ['git', 'ls-files', '*.py'],
