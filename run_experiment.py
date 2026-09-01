@@ -449,6 +449,14 @@ def main():
              'steps to measure the steady state: the first pass over the memory-mapped arrays '
              'pays page faults that later passes do not, and --profile_steps spans epochs.'
     )
+    parser.add_argument(
+        '--pin_memory', type=str, default='auto', choices=['auto', 'on', 'off'],
+        help='Whether the dataloader stages each batch into page-locked host memory. "auto" '
+             'is on whenever CUDA is present, which is what every run so far has used. Pinning '
+             'buys an asynchronous DMA at the cost of a full host-to-host copy of the batch on '
+             'a single thread, so it is a losing trade once the batch is large relative to the '
+             'compute it feeds. Use "off" to measure that.'
+    )
     args = parser.parse_args()
 
     # Profiling must exercise the training step, so it cannot be allowed to load existing
@@ -457,6 +465,8 @@ def main():
     force_finetune = args.force_finetune
     num_workers = args.num_workers
     mem_test_mode = args.mem_test_mode
+    pin_memory = (torch.cuda.is_available() if args.pin_memory == 'auto'
+                  else args.pin_memory == 'on')
 
     # One accelerator for the whole run. The accelerate version rebuilds it constantly
     # ("because it solves problems") -- those problems are process-group and FSDP-wrapper
@@ -588,7 +598,7 @@ def main():
             fold_dir,
             BATCH_SIZE,
             num_workers=num_workers,
-            pin_memory=torch.cuda.is_available(),
+            pin_memory=pin_memory,
             prefetch_factor=2 if num_workers > 0 else 1,
             # Text balancing exists to stop one rank in a distributed run receiving all the
             # text-heavy episodes. With one process there is nothing to balance against, and
@@ -701,6 +711,8 @@ def main():
             # Parsed by test_phase2_pipeline.py alongside the per-epoch line, so that the
             # --time recommendation is startup plus epochs rather than whole-process wall time
             # scaled by the epoch budget.
+            print(f"  pin_memory={pin_memory} (--pin_memory {args.pin_memory}), "
+                  f"num_workers={num_workers}", flush=True)
             print(f"\n{STARTUP_TIMING_PREFIX} "
                   f"{time.perf_counter() - _PROCESS_START:.2f}", flush=True)
             print(f"  Startup before the first training step: "

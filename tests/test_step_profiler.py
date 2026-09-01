@@ -15,7 +15,8 @@ import time
 
 import pytest
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO_ROOT)
 
 import test_phase2_pipeline
 from test_phase2_pipeline import EPOCH_LINE, STARTUP_LINE
@@ -270,3 +271,24 @@ class TestTheProfilerSpansEpochs:
             'expected a report both when the step budget completes and when the epoch budget '
             'runs out first'
         )
+
+
+class TestPinMemoryIsControllable:
+    """The dataloader's pinned staging copy is serial in the main process and scales with batch
+    size, not worker count, so it has to be measurable rather than hardcoded."""
+
+    def test_the_flag_offers_auto_on_and_off(self):
+        source = open(os.path.join(REPO_ROOT, 'run_experiment.py')).read()
+        assert "'--pin_memory'" in source
+        assert "choices=['auto', 'on', 'off']" in source
+
+    def test_the_dataloader_reads_the_resolved_value_not_cuda_availability(self):
+        source = open(os.path.join(REPO_ROOT, 'run_experiment.py')).read()
+        assert 'pin_memory=pin_memory,' in source
+        assert 'pin_memory=torch.cuda.is_available()' not in source
+
+    def test_auto_still_means_on_under_cuda(self):
+        """Every measurement so far ran with pinning on; the default must not quietly change."""
+        source = open(os.path.join(REPO_ROOT, 'run_experiment.py')).read()
+        assert ("pin_memory = (torch.cuda.is_available() if args.pin_memory == 'auto'"
+                in source)
