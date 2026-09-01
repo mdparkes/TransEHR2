@@ -25,7 +25,7 @@ from TransEHR2.models import MixedClassifier
 from TransEHR2.utils import DistributedTimer
 from TransEHR2.utils import format_pretraining_performance_table, generate_record_masks, get_param_shapes
 from TransEHR2.utils import print_peak_memory, move_batch_to_device
-from TransEHR2.utils import NullStepProfiler, StepProfiler
+from TransEHR2.utils import NullStepProfiler, StepProfiler, report_epoch_timing
 
 
 MetadataDict: TypeAlias = Dict[str, Any]
@@ -1112,7 +1112,14 @@ def pretrain_model(
     best_epoch_val_loss = best_epoch_val_losses['Optimization_Loss']
     early_stopping_counter = training_metadata.get('early_stopping_counter', 0) 
 
+    # Wall clock of each completed epoch -- training, validation, state extraction and
+    # checkpointing together. Reported at the end so a short run can be extrapolated on a
+    # per-epoch cost rather than on whole-process wall time, which carries fixed startup and
+    # teardown that do not scale with the epoch budget.
+    epoch_seconds = []
+
     for epoch in tqdm(range(start_epoch, total_epoch), disable=not accelerator.is_local_main_process):
+        epoch_start = time.perf_counter()
 
         # Set epoch for balanced sampler shuffling
         if hasattr(train_loader.sampler, 'set_epoch'):
@@ -1219,6 +1226,8 @@ def pretrain_model(
                 print("\n" + performance_table + "\n")
         
 
+        epoch_seconds.append(time.perf_counter() - epoch_start)
+
         # Early stopping check
         if early_stopping_counter == 30:
             if accelerator.is_main_process:
@@ -1229,6 +1238,9 @@ def pretrain_model(
         if (epoch + 1) % 50 == 0:
             scheduler.step()
     
+
+    if accelerator.is_main_process:
+        report_epoch_timing(epoch_seconds, total_epoch)
 
     # Save final best state and encoder weights to model directory
     if accelerator.is_main_process:

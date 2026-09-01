@@ -51,8 +51,10 @@ import time
 import numpy as np
 import yaml
 
+from TransEHR2.utils import EPOCH_TIMING_PREFIX, STARTUP_TIMING_PREFIX
 
-STAGES = ('environment', 'data', 'memory', 'pipeline')
+
+STAGES = ('environment', 'data', 'memory', 'pipeline', 'timing')
 
 # The miniature sweep. One hyperparameter selected on pretraining loss and one selected on
 # mortality, so both selection paths and both SLURM stages are exercised, at two values each so
@@ -731,68 +733,168 @@ def run_stage_pipeline(args, report, work_dir, base_config):
     return sum(pretrain_times) / len(pretrain_times) if pretrain_times else None
 
 
-def report_timing(args, report, mean_trial_seconds, base_config):
-    """Extrapolate a full-size trial's wall time and print the --time to request.
+EPOCH_LINE = re.compile(
+    rf'^{EPOCH_TIMING_PREFIX}\s+n=(\d+)\s+mean=([\d.]+)\s+first=([\d.]+)', re.MULTILINE)
+STARTUP_LINE = re.compile(rf'^{STARTUP_TIMING_PREFIX}\s+([\d.]+)', re.MULTILINE)
+
+
+def run_stage_timing(args, report, work_dir, base_config):
+    """Time full-size epochs directly, one short run per arm.
+
+    Extrapolating from the truncated pipeline stage cannot work: a trial's wall time is fixed
+    startup and teardown plus per-epoch cost, and dividing the whole by the epoch count then
+    scaling by the episode ratio multiplies the fixed part by both factors. At 2 epochs over
+    400 of 19,112 episodes that is a factor of about 4,800 on every startup second, which is
+    how a 0.6 h trial was once reported as 651 h.
+
+    Epochs at full size are cheap enough to measure outright, so this runs a few of them and
+    reads the per-epoch cost off `pretrain_model` directly. `--limit_episodes` is deliberately
+    absent.
 
     Args:
         args: Parsed command-line arguments.
         report: The Report to record into.
-        mean_trial_seconds: Mean seconds for one truncated pretraining trial.
+        work_dir: Scratch directory.
+        base_config: The real base config, copied per arm.
+
+    Returns:
+        {arm: {'startup': seconds, 'epoch': seconds, 'epochs': n}} for every arm that finished.
+    """
+    print("\n" + "=" * 70)
+    print("STAGE 5: per-epoch cost at full size")
+    print("=" * 70)
+    print(f"{args.timing_epochs} epochs over every episode in the fold, no truncation. The "
+          f"first")
+    print("epoch is discarded: it pays worker startup, cuDNN autotuning and allocator growth.")
+
+    import torch
+
+    if not torch.cuda.is_available():
+        report.note('No per-epoch timing: no GPU.')
+        return {}
+
+    timing_dir = os.path.abspath(os.path.join(work_dir, 'timing'))
+    os.makedirs(timing_dir, exist_ok=True)
+    timings = {}
+
+    for arm in args.arms:
+        config = dict(base_config)
+        config['EXPERIMENT_NAME'] = f'phase2_timing_{arm}'
+        config['POSITION_ENCODING'] = arm
+        config['MODEL_DIR'] = os.path.join(timing_dir, 'models')
+        config['PRETRAIN_TOTAL_EPOCH'] = args.timing_epochs
+        config_path = os.path.join(timing_dir, f'timing_{arm}.yaml')
+        with open(config_path, 'w') as f_out:
+            yaml.dump(config, f_out, default_flow_style=False, sort_keys=False)
+
+        # One arm's measurement is enough to recommend from, so a tight allocation should stop
+        # here rather than lose the run mid-epoch and report nothing.
+        estimate = None
+        if timings:
+            slowest = max(t['startup'] + t['epoch'] * args.timing_epochs
+                          for t in timings.values())
+            estimate = slowest * 1.5
+        allowed, reason = budget_allows(estimate, args.reserve_seconds)
+        if not allowed:
+            report.record('timing', f'{arm}: per-epoch cost measured', None,
+                          f'Skipped: {reason}')
+            continue
+
+        print(f"\n  {arm}: {args.timing_epochs} full-size epochs")
+        status, elapsed, text = run_subprocess(
+            [sys.executable, 'run_experiment.py', os.path.abspath(args.dataset_config),
+             config_path, '--folds', args.fold, '--tasks', 'none',
+             '--num_workers', str(args.num_workers)],
+            os.path.join(work_dir, 'logs', f'timing_{arm}.log')
+        )
+        epoch_match = EPOCH_LINE.search(text)
+        startup_match = STARTUP_LINE.search(text)
+        ok = status == 0 and epoch_match is not None and startup_match is not None
+        report.record(
+            'timing', f'{arm}: per-epoch cost measured', ok,
+            '\n'.join(text.strip().splitlines()[-15:]) if status else
+            f'the run finished but printed no {EPOCH_TIMING_PREFIX} / '
+            f'{STARTUP_TIMING_PREFIX} line, so there is nothing to size the request from'
+        )
+        if not ok:
+            continue
+
+        timings[arm] = {
+            'startup': float(startup_match.group(1)),
+            'epoch': float(epoch_match.group(2)),
+            'epochs': int(epoch_match.group(1)),
+            'first_epoch': float(epoch_match.group(3)),
+            'wall': elapsed,
+        }
+        entry = timings[arm]
+        print(f"    startup {entry['startup']:.1f}s, first epoch "
+              f"{entry['first_epoch']:.1f}s, steady {entry['epoch']:.1f}s/epoch")
+        report.note(
+            f"{arm}: {entry['epoch']:.1f}s per full-size epoch, {entry['startup']:.1f}s "
+            f"startup, {entry['first_epoch']:.1f}s first epoch."
+        )
+
+    return timings
+
+
+def report_timing(args, report, timings, base_config):
+    """Print the --time to request for each array, from the measured per-epoch cost.
+
+    Args:
+        args: Parsed command-line arguments.
+        report: The Report to record into.
+        timings: The mapping returned by run_stage_timing.
         base_config: The loaded base experiment config.
     """
     print("\n" + "=" * 70)
-    print("STAGE 5: what to request for the real jobs")
+    print("STAGE 6: what to request for the real jobs")
     print("=" * 70)
 
-    if mean_trial_seconds is None:
-        report.note('No timing: the pipeline stage did not complete a pretraining trial.')
+    if not timings:
+        report.note('No --time recommendation: no arm produced a per-epoch measurement.')
         return
 
-    with open(args.dataset_config, 'r') as f_in:
-        dataset_config = yaml.safe_load(f_in)
-    train_dir = os.path.join(dataset_config['DATA_DIR'], args.fold, 'train')
-    try:
-        n_train = int(np.load(os.path.join(train_dir, 'val_times.npy'), mmap_mode='r').shape[0])
-    except Exception:
-        report.note(f'Mean truncated trial: {mean_trial_seconds:.1f}s. Could not read the '
-                    f'training set size, so no extrapolation.')
-        return
+    pretrain_epochs = base_config.get('PRETRAIN_TOTAL_EPOCH', 200)
+    finetune_epochs = base_config.get('FINETUNE_TOTAL_EPOCH', 500)
 
-    used = min(args.limit_episodes, n_train)
-    scale = n_train / used
-    full_epochs = base_config.get('PRETRAIN_TOTAL_EPOCH', 200)
-    per_epoch = mean_trial_seconds / max(args.epochs, 1)
-    # Startup -- imports, dataset memory-mapping, model construction -- does not scale with
-    # the number of episodes, so treating the whole truncated run as if it did overstates the
-    # estimate. It is left in deliberately: the error is in the safe direction, and a job that
-    # is killed at its time limit loses everything since the last checkpoint.
-    estimated_seconds = per_epoch * scale * full_epochs
+    # The array shares one --time across its tasks, so the slowest arm sets it.
+    arm, entry = max(timings.items(),
+                     key=lambda kv: kv[1]['startup'] + kv[1]['epoch'] * pretrain_epochs)
+    pretrain_seconds = entry['startup'] + entry['epoch'] * pretrain_epochs
+    finetune_seconds = entry['startup'] + entry['epoch'] * finetune_epochs
+
+    def hours(seconds, buffer=1.5):
+        """Buffered seconds, rounded up to a whole hour, never below one."""
+        return max(1, int(seconds * buffer / 3600) + 1)
+
+    pretrain_hours = hours(pretrain_seconds)
+    finetune_hours = hours(finetune_seconds)
 
     report.note(
-        f'Truncated trial: {mean_trial_seconds:.1f}s for {args.epochs} epochs over {used} of '
-        f'{n_train} training episodes ({per_epoch:.1f}s per truncated epoch).'
-    )
-    report.note(
-        f'Extrapolated full trial: {estimated_seconds / 3600:.1f} h for {full_epochs} epochs '
-        f'over all {n_train} episodes (linear in episodes, startup not discounted).'
+        f'Full pretrain trial, {arm} (the slower arm): {pretrain_seconds / 3600:.2f} h for '
+        f'{pretrain_epochs} epochs at {entry["epoch"]:.1f}s each, plus '
+        f'{entry["startup"]:.1f}s startup.'
     )
 
-    # A 50% buffer over the extrapolation, rounded up to the hour. Early stopping fires after
-    # 30 epochs without improvement, so most trials will finish well short of the ceiling --
-    # but the ceiling is what SLURM charges the group for, so it is worth setting from a
-    # measurement rather than from the placeholder in the batch scripts.
-    recommended_hours = max(1, int(estimated_seconds * 1.5 / 3600) + 1)
     print()
-    print(f"  Recommended --time for the pretrain array:  {recommended_hours:02d}:00:00")
-    print(f"  (extrapolation x 1.5, rounded up to the hour)")
+    print(f"  Measured on the {arm} arm, which is the slower of those run.")
+    print(f"  Pretrain: {pretrain_epochs} epochs x {entry['epoch']:.1f}s + "
+          f"{entry['startup']:.1f}s startup = {pretrain_seconds / 3600:.2f} h")
+    print(f"  Finetune: {finetune_epochs} epochs, priced at the pretrain per-epoch cost, "
+          f"= {finetune_seconds / 3600:.2f} h")
     print()
-    print(f"  sbatch --time={recommended_hours:02d}:00:00 --array=0-21%8 \\")
+    print(f"  sbatch --time={pretrain_hours:02d}:00:00 --array=0-21%8 \\")
     print(f"      SLURM/slurm_tune_pretrain.sh <manifest>")
+    print(f"  sbatch --time={finetune_hours:02d}:00:00 --array=0-13%8 \\")
+    print(f"      SLURM/slurm_tune_finetune.sh <manifest>")
     print()
-    print("  Early stopping fires after 30 epochs without improvement, so most trials will")
-    print("  finish well short of this. The limit is what the scheduler charges against, so")
-    print("  lower it again once the first few real trials have reported their runtimes.")
-    report.note(f'Recommended --time: {recommended_hours:02d}:00:00')
+    print("  Both figures carry a 50% buffer and round up to the hour. The finetune number is")
+    print("  an upper bound: finetuning drops the generator, discriminator and THP, so its")
+    print("  epochs are cheaper than the pretrain epochs it is priced at here. Early stopping")
+    print("  fires after 30 epochs without improvement, so most trials finish well short of")
+    print("  either ceiling.")
+    report.note(f'Recommended --time: pretrain {pretrain_hours:02d}:00:00, '
+                f'finetune {finetune_hours:02d}:00:00.')
 
 
 def main(argv=None):
@@ -826,6 +928,9 @@ def main(argv=None):
                              'exercises the improvement check and the scheduler step.')
     parser.add_argument('--limit_episodes', type=int, default=400,
                         help='Episodes per partition in the pipeline stage')
+    parser.add_argument('--timing_epochs', type=int, default=3,
+                        help='Full-size epochs to run per arm in the timing stage. The first '
+                             'is discarded, so three gives two steady-state samples.')
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--span_chunk', type=int, default=4096,
                         help='Episodes per block when measuring temporal spans')
@@ -870,10 +975,18 @@ def main(argv=None):
     if 'memory' in stages:
         run_stage_memory(args, report, args.work_dir, base_config)
 
-    mean_trial_seconds = None
     if 'pipeline' in stages:
         mean_trial_seconds = run_stage_pipeline(args, report, args.work_dir, base_config)
-        report_timing(args, report, mean_trial_seconds, base_config)
+        if mean_trial_seconds is not None:
+            report.note(f'Truncated pipeline trial: {mean_trial_seconds:.1f}s of whole-process '
+                        f'wall time for {args.epochs} epochs over at most '
+                        f'{args.limit_episodes} episodes. Diagnostic only -- the --time '
+                        f'recommendation comes from the timing stage, not from this.')
+
+    # Its own stage, so `--only timing` can re-measure without re-running the sweep.
+    if 'timing' in stages:
+        timings = run_stage_timing(args, report, args.work_dir, base_config)
+        report_timing(args, report, timings, base_config)
 
     status = report.summarise()
     print(f"\nEverything the test wrote is under {args.work_dir}")

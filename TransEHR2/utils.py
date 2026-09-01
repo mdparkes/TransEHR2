@@ -1039,3 +1039,37 @@ class StepProfiler:
             print(f'  peak allocated: {torch.cuda.max_memory_allocated() / 2**30:.2f} GB'
                   f'   reserved: {torch.cuda.max_memory_reserved() / 2**30:.2f} GB')
         print(flush=True)
+
+
+# Prefix of the machine-readable timing line. test_phase2_pipeline.py parses it to size the
+# --time request for the real sweep, so the format is a contract: changing it silently returns
+# that estimate to whole-process wall time, which overstates a short run enormously.
+EPOCH_TIMING_PREFIX = 'PRETRAIN_EPOCH_SECONDS'
+STARTUP_TIMING_PREFIX = 'PRETRAIN_STARTUP_SECONDS'
+
+
+def report_epoch_timing(epoch_seconds: List[float], total_epoch: int) -> None:
+    """Print per-epoch wall times, including a line meant to be parsed.
+
+    The first epoch is excluded from the mean: it pays dataloader worker startup under the
+    `spawn` context, cuDNN algorithm selection and allocator growth, none of which recur. On a
+    run of one epoch there is nothing else to average, so that epoch is used and flagged.
+
+    Args:
+        epoch_seconds: Wall time of each completed epoch, in order.
+        total_epoch: The epoch budget the run was given, for the projection.
+    """
+    if not epoch_seconds:
+        print(f'{EPOCH_TIMING_PREFIX} n=0', flush=True)
+        return
+
+    steady = epoch_seconds[1:] or epoch_seconds
+    mean = sum(steady) / len(steady)
+    print(f'\n{EPOCH_TIMING_PREFIX} n={len(epoch_seconds)} '
+          f'mean={mean:.4f} first={epoch_seconds[0]:.4f} '
+          f'steady_n={len(steady)}', flush=True)
+    print(f'  {len(epoch_seconds)} epoch(s) completed. First {epoch_seconds[0]:.1f}s, '
+          f'mean of the rest {mean:.1f}s'
+          f'{" (only one epoch ran, so the mean is that epoch)" if len(epoch_seconds) == 1 else ""}.')
+    print(f'  At {mean:.1f}s/epoch, the {total_epoch}-epoch budget is '
+          f'{mean * total_epoch / 3600:.2f} h of training.', flush=True)

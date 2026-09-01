@@ -71,6 +71,7 @@ from TransEHR2.modules import EventDataEncoder, ValueDataEncoder
 from TransEHR2.routines_accelerate import pretrain_model, finetune_model, evaluate_finetuned_model
 from TransEHR2.routines_accelerate import reshape_flattened_state_dict
 from TransEHR2.utils import create_timer, convert_to_python_types, format_finetuning_performance_table, get_param_shapes
+from TransEHR2.utils import STARTUP_TIMING_PREFIX
 
 
 ALL_TASKS = ('mortality', 'length_of_stay', 'phenotype')
@@ -691,11 +692,15 @@ def main():
             model_save_path = f'{model_save_dir}/pretrained.pt'
             checkpoint_dir = f'./checkpoints/{EXPERIMENT_NAME}/{fold_name}/pretrained'
 
-            if args.profile_steps > 0:
-                print(f"\nStartup before the first training step: "
-                      f"{time.perf_counter() - _PROCESS_START:.1f}s "
-                      f"(imports, CUDA context, dataset load, model construction). This is "
-                      f"paid once per job, not once per epoch.\n", flush=True)
+            # Parsed by test_phase2_pipeline.py alongside the per-epoch line, so that the
+            # --time recommendation is startup plus epochs rather than whole-process wall time
+            # scaled by the epoch budget.
+            print(f"\n{STARTUP_TIMING_PREFIX} "
+                  f"{time.perf_counter() - _PROCESS_START:.2f}", flush=True)
+            print(f"  Startup before the first training step: "
+                  f"{time.perf_counter() - _PROCESS_START:.1f}s (imports, CUDA context, "
+                  f"dataset load, model construction). Paid once per job, not per epoch.\n",
+                  flush=True)
 
             timer.start_phase('pretrain', is_main_process=True)
             try:

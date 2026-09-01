@@ -5,11 +5,22 @@ read straight off the batch script's output. What has to hold is that it discard
 attributes intervals to the phase named at the closing mark, and stops the loop on schedule.
 """
 
+import argparse
+import ast
+import inspect
+import os
+import sys
+import textwrap
 import time
 
 import pytest
 
-from TransEHR2.utils import NullStepProfiler, StepProfiler
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import test_phase2_pipeline
+from test_phase2_pipeline import EPOCH_LINE, STARTUP_LINE
+from TransEHR2.utils import EPOCH_TIMING_PREFIX, STARTUP_TIMING_PREFIX
+from TransEHR2.utils import NullStepProfiler, StepProfiler, report_epoch_timing
 
 
 def test_null_profiler_never_stops_the_loop():
@@ -72,3 +83,90 @@ def test_report_extrapolates_with_the_step_count_it_is_given(capsys):
     out = capsys.readouterr().out
     assert '96 training steps per full epoch' in out
     assert 'implied training time per epoch' in out
+
+
+class TestEpochTimingReport:
+    """`report_epoch_timing` prints the line the smoke test sizes the sweep from."""
+
+    def test_the_first_epoch_is_excluded_from_the_mean(self, capsys):
+        """It carries worker spawn, cuDNN autotuning and allocator growth, none of which recur."""
+        report_epoch_timing([100.0, 10.0, 12.0], total_epoch=200)
+        out = capsys.readouterr().out
+        assert 'mean=11.0000' in out
+        assert 'first=100.0000' in out
+
+    def test_a_single_epoch_falls_back_to_itself(self, capsys):
+        report_epoch_timing([12.5], total_epoch=200)
+        out = capsys.readouterr().out
+        assert 'mean=12.5000' in out
+        assert 'only one epoch ran' in out
+
+    def test_no_epochs_still_emits_a_parseable_line(self, capsys):
+        """A killed or resumed-and-finished run must not leave the parser matching nothing."""
+        report_epoch_timing([], total_epoch=200)
+        assert capsys.readouterr().out.strip() == f'{EPOCH_TIMING_PREFIX} n=0'
+
+    def test_the_smoke_test_regexes_match_what_is_printed(self, capsys):
+        """The two modules are coupled by a text format, so pin it from both ends."""
+        report_epoch_timing([100.0, 10.0, 12.0], total_epoch=200)
+        out = capsys.readouterr().out
+        match = EPOCH_LINE.search(out)
+        assert match is not None
+        assert int(match.group(1)) == 3
+        assert float(match.group(2)) == pytest.approx(11.0)
+        assert float(match.group(3)) == pytest.approx(100.0)
+
+    def test_the_startup_regex_matches_the_line_run_experiment_prints(self):
+        line = f'\n{STARTUP_TIMING_PREFIX} 28.44\n'
+        match = STARTUP_LINE.search(line)
+        assert match is not None
+        assert float(match.group(1)) == pytest.approx(28.44)
+
+
+class TestTimingIsMeasuredNotExtrapolated:
+    """The old estimator divided whole-process wall time by the epoch count, which multiplied
+    fixed startup by both the epoch budget and the episode ratio -- a factor of ~4,800 that
+    reported a 0.6 h trial as 651 h. The timing stage must not reintroduce that."""
+
+    def test_the_timing_stage_does_not_truncate_its_episodes(self):
+        # Docstring stripped first: it names the flag to explain the absence, and matching that
+        # would keep this probe green whatever the code did.
+        tree = ast.parse(textwrap.dedent(
+            inspect.getsource(test_phase2_pipeline.run_stage_timing)))
+        function = tree.body[0]
+        if (isinstance(function.body[0], ast.Expr)
+                and isinstance(function.body[0].value, ast.Constant)):
+            function.body.pop(0)
+        literals = {node.value for node in ast.walk(function)
+                    if isinstance(node, ast.Constant) and isinstance(node.value, str)}
+        assert '--limit_episodes' not in literals
+
+    def test_report_timing_prices_from_a_per_epoch_measurement(self):
+        source = inspect.getsource(test_phase2_pipeline.report_timing)
+        # No episode-ratio scaling anywhere: the measurement is already at full size.
+        assert 'n_train' not in source
+        assert "entry['epoch']" in source or 'entry["epoch"]' in source
+
+    def test_report_timing_recommends_from_the_slower_arm(self):
+        """One --time covers the whole array, so the faster arm cannot set it."""
+        timings = {
+            'additive': {'startup': 30.0, 'epoch': 10.0, 'epochs': 3, 'first_epoch': 40.0,
+                         'wall': 100.0},
+            'rope': {'startup': 30.0, 'epoch': 20.0, 'epochs': 3, 'first_epoch': 50.0,
+                     'wall': 130.0},
+        }
+        args = argparse.Namespace(arms=['additive', 'rope'])
+        report = test_phase2_pipeline.Report()
+        test_phase2_pipeline.report_timing(
+            args, report, timings, {'PRETRAIN_TOTAL_EPOCH': 200, 'FINETUNE_TOTAL_EPOCH': 500}
+        )
+        # rope: 30 + 200*20 = 4030 s = 1.12 h; x1.5 -> 1.68 h -> 2 h.
+        assert any('pretrain 02:00:00' in note for note in report.notes)
+        assert any('rope' in note for note in report.notes)
+
+    def test_report_timing_says_nothing_when_no_arm_was_measured(self):
+        report = test_phase2_pipeline.Report()
+        test_phase2_pipeline.report_timing(
+            argparse.Namespace(arms=['additive']), report, {}, {'PRETRAIN_TOTAL_EPOCH': 200}
+        )
+        assert any('No --time recommendation' in note for note in report.notes)
