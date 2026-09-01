@@ -825,18 +825,22 @@ def run_stage_timing(args, report, work_dir, base_config, trial_estimate=None):
         )
         epoch_match = EPOCH_LINE.search(text)
         startup_match = STARTUP_LINE.search(text)
-        ran_no_epochs = ZERO_EPOCH_LINE.search(text) is not None
         ok = status == 0 and epoch_match is not None and startup_match is not None
-        if status:
-            detail = '\n'.join(text.strip().splitlines()[-15:])
-        elif ran_no_epochs:
-            detail = (f'the run completed zero epochs, so it measured nothing. It resumed from '
-                      f'a checkpoint at or past {args.timing_epochs} epochs -- check '
-                      f'checkpoints/{config["EXPERIMENT_NAME"]}/ and remove it.')
-        else:
-            detail = (f'the run finished but printed no {EPOCH_TIMING_PREFIX} / '
-                      f'{STARTUP_TIMING_PREFIX} line, so there is nothing to size the '
-                      f'request from')
+        # `record` prints whatever detail it is given, pass or fail, so a success must carry
+        # none. Building the explanation unconditionally attached "printed no timing line" to
+        # runs that had just printed one.
+        detail = ''
+        if not ok:
+            if status:
+                detail = '\n'.join(text.strip().splitlines()[-15:])
+            elif ZERO_EPOCH_LINE.search(text):
+                detail = (f'the run completed zero epochs, so it measured nothing. It resumed '
+                          f'from a checkpoint at or past {args.timing_epochs} epochs -- check '
+                          f'checkpoints/{config["EXPERIMENT_NAME"]}/ and remove it.')
+            else:
+                detail = (f'the run finished but printed no {EPOCH_TIMING_PREFIX} / '
+                          f'{STARTUP_TIMING_PREFIX} line, so there is nothing to size the '
+                          f'request from')
         report.record('timing', f'{arm}: per-epoch cost measured', ok, detail)
         if not ok:
             continue

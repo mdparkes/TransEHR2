@@ -200,3 +200,21 @@ class TestTimingStageRerunHazards:
         assert 'trial_estimate' in signature.parameters
         source = inspect.getsource(test_phase2_pipeline.run_stage_timing)
         assert 'estimate = trial_estimate' in source
+
+
+def test_a_passing_timing_check_carries_no_detail():
+    """`Report.record` prints detail on pass as well as fail, so a success must supply none.
+    Building the failure explanation unconditionally labelled good runs as having printed no
+    timing line."""
+    source = inspect.getsource(test_phase2_pipeline.run_stage_timing)
+    tree = ast.parse(textwrap.dedent(source))
+    # The detail branches must sit under `if not ok`, not run on every path.
+    guarded = [node for node in ast.walk(tree.body[0])
+               if isinstance(node, ast.If)
+               and isinstance(node.test, ast.UnaryOp)
+               and isinstance(node.test.op, ast.Not)
+               and getattr(node.test.operand, 'id', None) == 'ok'
+               and any('printed no' in getattr(c, 'value', '')
+                       for c in ast.walk(node) if isinstance(c, ast.Constant)
+                       and isinstance(c.value, str))]
+    assert guarded, 'the "printed no timing line" message is not guarded by `if not ok`'
