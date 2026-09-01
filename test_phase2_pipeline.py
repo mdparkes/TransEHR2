@@ -471,12 +471,18 @@ def write_test_spec(args, work_dir, base_config):
     Returns:
         The path of the spec written.
     """
-    spec_dir = os.path.join(work_dir, 'spec')
+    # Absolute, because every path below is written into the spec and load_spec() resolves a
+    # relative path in a spec *relative to that spec's own directory* -- the convention that lets
+    # the real phase2_spec.yaml name its base config as a bare filename. The SLURM wrapper
+    # defaults WORK_DIR to a relative `log/test_phase2_<jobid>`, so a relative BASE_CONFIG was
+    # joined onto the spec dir and doubled. OUTPUT_DIR and MANIFEST carried the same fault and
+    # would have failed next.
+    spec_dir = os.path.abspath(os.path.join(work_dir, 'spec'))
     os.makedirs(spec_dir, exist_ok=True)
 
     test_base = dict(base_config)
     test_base['EXPERIMENT_NAME'] = 'phase2_test_base'
-    test_base['MODEL_DIR'] = os.path.join(work_dir, 'models')
+    test_base['MODEL_DIR'] = os.path.abspath(os.path.join(work_dir, 'models'))
     test_base['PRETRAIN_TOTAL_EPOCH'] = args.epochs
     test_base['FINETUNE_TOTAL_EPOCH'] = args.epochs
     for name, entry in TEST_GRID.items():
@@ -727,6 +733,14 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     stages = list(args.only) if args.only else [s for s in STAGES if s not in args.skip]
+
+    # Everything derived from work_dir ends up in the generated spec, and load_spec() resolves a
+    # relative path in a spec *relative to that spec's own directory* -- the convention that lets
+    # the real phase2_spec.yaml name its base config as a bare filename. The SLURM wrapper
+    # defaults WORK_DIR to a relative `log/test_phase2_<jobid>`, so a relative BASE_CONFIG got
+    # joined onto the spec dir and doubled the path. Absolute here, once, and every path the spec
+    # carries is unambiguous.
+    args.work_dir = os.path.abspath(args.work_dir)
 
     print("=" * 70)
     print("Phase 2 pipeline smoke test")

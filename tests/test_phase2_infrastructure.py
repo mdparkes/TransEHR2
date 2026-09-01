@@ -19,6 +19,7 @@ The extraction layout is synthesised by `tests/test_seq_len_crop._build_arrays`,
 produces arrays in the shape `extract_mimic()` writes.
 """
 
+import argparse
 import os
 import subprocess
 import sys
@@ -557,3 +558,61 @@ def test_measure_spans_ignores_padding():
     assert measured['max_step_gap'] == pytest.approx(10.0)
     assert measured['min_step_gap'] == pytest.approx(10.0)
     assert measured['n_episodes_with_records'] == 2
+
+
+def test_generated_test_spec_survives_a_relative_work_dir(tmp_path, monkeypatch):
+    """The GPU smoke test's stage 4 must produce a spec whose paths load_spec() can resolve.
+
+    `load_spec` resolves a relative BASE_CONFIG/DATASET_CONFIG/OUTPUT_DIR/MANIFEST **relative to
+    the spec file's own directory** -- the convention that lets the real
+    `phase2_spec.yaml` name `phase2_base.yaml` as a bare filename sitting beside it.
+
+    `slurm_test_phase2.sh` defaults `WORK_DIR` to a *relative* `log/test_phase2_<jobid>`, so
+    `write_test_spec` wrote `BASE_CONFIG: log/test_phase2_27973/spec/phase2_test_base.yaml`,
+    which load_spec then joined onto the spec dir:
+
+        log/test_phase2_27973/spec/log/test_phase2_27973/spec/phase2_test_base.yaml
+
+    and generate_tuning_configs.py:48 raised. OUTPUT_DIR and MANIFEST had the same fault and
+    would have failed immediately after. The probe drives the writer with a relative work_dir --
+    the case the SLURM default actually produces -- and asserts every path round-trips.
+    """
+    import test_phase2_pipeline
+    from hp_tuning.spec import load_spec
+
+    # A relative work_dir is the whole point; resolve it against tmp_path, not the repo.
+    monkeypatch.chdir(tmp_path)
+    os.makedirs('log/test_phase2_relative', exist_ok=True)
+
+    dataset_config = os.path.join(
+        REPO_ROOT, 'TransEHR2', 'configs', 'datasets', 'mimic4.yaml')
+    base_config_path = os.path.join(
+        REPO_ROOT, 'TransEHR2', 'configs', 'experiments', 'tuning', 'phase2_base.yaml')
+    with open(base_config_path) as fh:
+        base_config = yaml.safe_load(fh)
+
+    args = argparse.Namespace(
+        dataset_config=dataset_config,
+        fold='fold0',
+        arms=['additive', 'rope'],
+        epochs=1,
+    )
+    spec_path = test_phase2_pipeline.write_test_spec(
+        args, 'log/test_phase2_relative', base_config
+    )
+
+    spec = load_spec(spec_path)
+
+    assert os.path.exists(spec['BASE_CONFIG']), spec['BASE_CONFIG']
+    # The doubling is the signature of the bug: the spec dir appearing twice in one path.
+    for key in ('BASE_CONFIG', 'DATASET_CONFIG', 'OUTPUT_DIR', 'MANIFEST'):
+        value = spec[key]
+        assert os.path.isabs(value), '%s is not absolute: %s' % (key, value)
+        assert value.count('log/test_phase2_relative') <= 1, (
+            '%s has the work dir doubled: %s' % (key, value))
+
+    # MODEL_DIR is read out of the base config, so it has to be absolute there too or the
+    # trials write their evaluation YAMLs somewhere the reporter will not look.
+    with open(spec['BASE_CONFIG']) as fh:
+        written_base = yaml.safe_load(fh)
+    assert os.path.isabs(written_base['MODEL_DIR']), written_base['MODEL_DIR']
