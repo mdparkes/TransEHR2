@@ -21,6 +21,7 @@ produces arrays in the shape `extract_mimic()` writes.
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 import time
@@ -639,3 +640,33 @@ def test_deadline_helpers_stop_before_the_allocation_ends(monkeypatch):
 
     # An unknown estimate cannot be judged, so the first trial always runs.
     assert gate.budget_allows(None, 420)[0] is True
+
+
+def test_environment_stage_imports_every_script_the_pipeline_runs():
+    """Stage 1's import list must cover the subprocesses stage 4 invokes.
+
+    The import check only pays off if the list stays in step with the `sys.executable` calls in
+    `run_stage_pipeline`. A script added there but not here is one whose dependencies go
+    unverified until it runs, which is after every pretrain and finetune.
+    """
+    import inspect
+    import test_phase2_pipeline as gate
+
+    source = inspect.getsource(gate.run_stage_pipeline)
+    invoked = set(re.findall(r"sys\.executable,\s*'([A-Za-z0-9_]+)\.py'", source))
+    assert invoked, 'no subprocess invocations found; the regex has drifted from the source'
+
+    missing = sorted(invoked - set(gate.PIPELINE_ENTRY_POINTS))
+    assert not missing, (
+        'stage 4 runs these but stage 1 never imports them, so a missing dependency would not '
+        'surface until they run: %s' % missing
+    )
+
+
+def test_pipeline_entry_points_import_cleanly():
+    """Each entry point must import without executing, so stage 1 can probe the environment."""
+    import importlib
+    import test_phase2_pipeline as gate
+
+    for module_name in gate.PIPELINE_ENTRY_POINTS:
+        importlib.import_module(module_name)

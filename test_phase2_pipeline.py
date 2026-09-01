@@ -63,6 +63,15 @@ TEST_GRID = {
 }
 TEST_ALIASES = {'PRETRAIN_LEARNING_RATE': 'lr', 'CMPNT_MASK_RATIO': 'cmask'}
 
+# Scripts the pipeline stage invokes as subprocesses. Stage 1 imports each one so a missing
+# dependency surfaces in the first seconds rather than in the subprocess that needs it.
+PIPELINE_ENTRY_POINTS = (
+    'generate_tuning_configs',
+    'run_experiment',
+    'report_tuning_results',
+    'select_tuned_hyperparameters',
+)
+
 
 class Report:
     """Collects check outcomes so the summary can be read without scrolling the log."""
@@ -140,6 +149,20 @@ def run_stage_environment(args, report):
     print("=" * 70)
 
     report.note(f"python {sys.version.split()[0]}, torch {torch.__version__}")
+
+    # Import every script the pipeline stage shells out to, before anything trains. Each has a
+    # __main__ guard, so importing only pulls its dependency chain -- which is the point: a
+    # package missing from the environment is otherwise not discovered until that subprocess
+    # runs, and the reporting scripts run last, after every pretrain and finetune.
+    for module_name in PIPELINE_ENTRY_POINTS:
+        try:
+            __import__(module_name)
+            report.record('environment', f'{module_name} imports', True)
+        except Exception as error:
+            report.record('environment', f'{module_name} imports', False,
+                          f'{type(error).__name__}: {error}. Stage 4 invokes this script; the '
+                          f'run would fail there instead of here. Check the environment '
+                          f'against requirements.txt.')
 
     if not torch.cuda.is_available():
         report.record('environment', 'CUDA is available', False,
