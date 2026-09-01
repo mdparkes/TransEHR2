@@ -1317,17 +1317,28 @@ def collate_tensorized(
         for f in range(n_multilabel_feats)
     ]
 
-    # Stack pre-computed text embeddings into [batch, max_ts, n_text_feats, embed_dim]
-    # Each b['val_text_embeddings'][f] has shape [max_ts_len, embed_dim]
-    # First stack features: [max_ts_len, n_text_feats, embed_dim] per episode
-    # Then stack episodes: [batch_size, max_ts_len, n_text_feats, embed_dim]
+    # Concatenate the sparse text embeddings, one flat COO-style block per feature. The dense
+    # (batch, ts_len, n_text_feats, embed_dim) form is built by `densify_text_embeddings` on the
+    # device the batch lands on; assembling it here would put ~99% of the batch's bytes through
+    # the worker boundary and a host-side copy to carry mostly zeros.
     if n_text_feats > 0:
-        val_text_embeddings = torch.stack([
-            torch.stack(b['val_text_embeddings'], dim=1)  # [max_ts, n_feats, embed_dim]
-            for b in batch
-        ], dim=0)  # [batch, max_ts, n_feats, embed_dim]
+        val_text_sparse = []
+        for f in range(n_text_feats):
+            episodes = torch.cat([
+                torch.full((b['val_text_embeddings'][f][0].numel(),), index,
+                           dtype=torch.int64)
+                for index, b in enumerate(batch)
+            ]) if batch else torch.zeros(0, dtype=torch.int64)
+            val_text_sparse.append({
+                'episode_index': episodes,
+                'timestep_index': torch.cat(
+                    [b['val_text_embeddings'][f][0] for b in batch]),
+                'values': torch.cat([b['val_text_embeddings'][f][1] for b in batch]),
+            })
+        text_embed_dim = batch[0]['val_text_embeddings'][0][1].shape[-1]
     else:
-        val_text_embeddings = None
+        val_text_sparse = None
+        text_embed_dim = 0
 
     # Stack targets
     mortality = torch.stack([b['mortality'] for b in batch], dim=0).unsqueeze(-1)
@@ -1369,10 +1380,15 @@ def collate_tensorized(
         },
     }
 
-    if val_text_embeddings is not None:
+    if val_text_sparse is not None:
         result['val_data']['text'] = {
             'indicators': val_text_ind,
-            'embedded_values': val_text_embeddings,
+            # Consumed and replaced by `densify_text_embeddings`, which every batch passes
+            # through in `move_batch_to_device`. Nothing downstream sees this key.
+            'sparse_embeddings': val_text_sparse,
+            'sparse_dense_shape': torch.tensor(
+                [len(batch), val_text_ind.shape[1], n_text_feats, text_embed_dim],
+                dtype=torch.int64),
         }
 
     return result

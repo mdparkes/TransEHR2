@@ -243,6 +243,14 @@ def _assert_items_equal(a, b, context):
         if isinstance(left, list):
             assert len(left) == len(right), f'{context}: {key} length'
             for f, (x, y) in enumerate(zip(left, right)):
+                # Text embeddings come out sparse, as (timestep_index, values) per feature.
+                if isinstance(x, tuple):
+                    assert len(x) == len(y), f'{context}: {key}[{f}] arity'
+                    for part, (u, v) in enumerate(zip(x, y)):
+                        assert u.shape == v.shape, \
+                            f'{context}: {key}[{f}][{part}] shape {u.shape} != {v.shape}'
+                        assert torch.equal(u, v), f'{context}: {key}[{f}][{part}] values'
+                    continue
                 assert x.shape == y.shape, f'{context}: {key}[{f}] shape {x.shape} != {y.shape}'
                 assert torch.equal(x, y), f'{context}: {key}[{f}] values'
         else:
@@ -387,10 +395,14 @@ def test_text_counts_exclude_cropped_entries():
         f'{cropped_counts} != {native_counts}'
     assert cropped_counts.sum() < full_counts.sum(), \
         'test data does not exercise dropped text entries'
-    # Cross-check against what __getitem__ actually materialises.
+    # Cross-check against what __getitem__ actually materialises. The sparse form carries one
+    # row per surviving note, so the row count is the count -- no need to scan for zeros, and
+    # unlike the dense form it cannot be confused by a genuinely all-zero embedding.
     for i in range(len(EPISODE_SPECS)):
-        nonzero = int((cropped[i]['val_text_embeddings'][0].abs().sum(dim=1) > 0).sum())
-        assert nonzero == cropped_counts[i], f'episode {i}: {nonzero} != {cropped_counts[i]}'
+        timesteps, values = cropped[i]['val_text_embeddings'][0]
+        assert timesteps.shape[0] == values.shape[0], f'episode {i}: index/row mismatch'
+        kept = int(timesteps.shape[0])
+        assert kept == cropped_counts[i], f'episode {i}: {kept} != {cropped_counts[i]}'
 
 
 def test_save_load_roundtrip_preserves_layout_and_crops():

@@ -238,6 +238,46 @@ def create_timer(results_dir: str = None, experiment_name: str = "experiment") -
     return DistributedTimer(results_path=results_path)
 
 
+def densify_text_embeddings(batch: MixedTensorDataset) -> MixedTensorDataset:
+    """Rebuild the dense text embedding tensor from the sparse form the collate function emits.
+
+    `collate_tensorized` ships one flat COO-style block per text feature -- episode index,
+    timestep index and the embedding rows -- rather than the dense
+    `(batch, ts_len, n_text_feats, embed_dim)` tensor the model consumes. Notes are rare against
+    a 550-step axis, so the dense form is about 99% of the batch by size and almost entirely
+    zeros; carrying it across the worker boundary costs a single-threaded pass over roughly
+    860 MiB per batch at batch size 200.
+
+    This runs inside `move_batch_to_device`, so it builds the dense tensor wherever the batch
+    has just landed. It is idempotent: a batch that already carries `embedded_values` is
+    returned untouched, which keeps any caller that densified earlier working.
+
+    Args:
+        batch: A batch whose text entry holds `sparse_embeddings` and `sparse_dense_shape`.
+
+    Returns:
+        The same batch, with `embedded_values` in place of the sparse keys.
+    """
+    text = batch.get('val_data', {}).get('text') if isinstance(batch, dict) else None
+    if not isinstance(text, dict) or 'sparse_embeddings' not in text:
+        return batch
+
+    blocks = text.pop('sparse_embeddings')
+    batch_size, ts_len, n_text_feats, embed_dim = (
+        int(v) for v in text.pop('sparse_dense_shape'))
+
+    reference = blocks[0]['values']
+    dense = torch.zeros(
+        (batch_size, ts_len, n_text_feats, embed_dim),
+        dtype=reference.dtype, device=reference.device
+    )
+    for feature, block in enumerate(blocks):
+        if block['values'].numel():
+            dense[block['episode_index'], block['timestep_index'], feature] = block['values']
+    text['embedded_values'] = dense
+    return batch
+
+
 def move_batch_to_device(batch: MixedTensorDataset, device: torch.device) -> MixedTensorDataset:
     """Recursively move all tensors in a batch to the specified device.
     
@@ -249,7 +289,8 @@ def move_batch_to_device(batch: MixedTensorDataset, device: torch.device) -> Mix
         device: Target device (e.g., accelerator.device)
         
     Returns:
-        The batch with all tensors moved to the specified device
+        The batch with all tensors moved to the specified device, and its text embeddings
+        densified on that device.
     """
     def _move_to_device(obj):
         if isinstance(obj, torch.Tensor):
@@ -262,8 +303,10 @@ def move_batch_to_device(batch: MixedTensorDataset, device: torch.device) -> Mix
             return tuple(_move_to_device(item) for item in obj)
         else:
             return obj
-    
-    return _move_to_device(batch)
+
+    # Densified after the move, so the dense tensor is allocated on the target device and only
+    # the sparse rows cross the host boundary.
+    return densify_text_embeddings(_move_to_device(batch))
 
 
 def ensure_float32(data: MixedDataset) -> MixedDataset:
@@ -416,6 +459,10 @@ def generate_record_masks(
             # Initialize indicator mask tensor
             indicator_mask = torch.zeros_like(feature_data['indicators'], device=batch_device)
             if feature_type == 'text':
+                # Densified if it has not been already. `move_batch_to_device` normally does
+                # this, but a caller that reads a collated batch directly would otherwise fail
+                # on a missing key; the call is idempotent and free once the tensor exists.
+                feature_data = densify_text_embeddings(data)['val_data'][feature_type]
                 # Text features use pre-computed embeddings; get dim from batch
                 text_embed_dim = feature_data['embedded_values'].shape[-1]
                 value_mask_shape = (batch_size, max_ts_len, text_embed_dim)
