@@ -1090,8 +1090,10 @@ class StepProfiler:
               f'{min(self.timings["TOTAL"]):>11.4f}{max(self.timings["TOTAL"]):>11.4f}')
         print('=' * 66)
         if steps_per_epoch:
+            epoch_seconds = total * steps_per_epoch
             print(f'  {steps_per_epoch} training steps per full epoch at this batch size')
-            print(f'  implied training time per epoch: {total * steps_per_epoch / 3600:.2f} h')
+            print(f'  implied training time per epoch: {epoch_seconds:.1f}s'
+                  f'{f" ({epoch_seconds / 3600:.2f} h)" if epoch_seconds >= 600 else ""}')
             print(f'  (validation is extra and is not in this figure)')
         if torch.cuda.is_available():
             print(f'  peak allocated: {torch.cuda.max_memory_allocated() / 2**30:.2f} GB'
