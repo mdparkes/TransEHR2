@@ -1133,3 +1133,83 @@ def report_epoch_timing(epoch_seconds: List[float], total_epoch: int) -> None:
           f'{" (only one epoch ran, so the mean is that epoch)" if len(epoch_seconds) == 1 else ""}.')
     print(f'  At {mean:.1f}s/epoch, the {total_epoch}-epoch budget is '
           f'{mean * total_epoch / 3600:.2f} h of training.', flush=True)
+
+
+# How the generator loss selects masked positions, per feature type. Numeric and multilabel are
+# masked component-wise and index a per-feature value mask; the rest are masked whole-record and
+# index the indicator mask's feature column. Mirrored here so the spike report describes the
+# same entries the loss scored.
+SPIKE_VALUE_KEY = {'text': 'embedded_values'}
+SPIKE_MASK_BY_VALUES = ('numeric', 'multilabel')
+SPIKE_FEATURE_TYPES = ('numeric', 'categorical', 'ordinal', 'multilabel', 'text')
+
+
+def _extreme_at_masked(prediction, mask):
+    """Largest absolute predicted value among masked positions, or None if there are none."""
+    selected = prediction[mask]
+    if selected.numel() == 0:
+        return None
+    return float(selected.abs().max())
+
+
+def describe_loss_spike(predictions, masked_targets, record_masks, gen_loss, reference):
+    """Report the largest predicted and target magnitudes behind an outlying generator loss.
+
+    Numeric features are scored by squared error, so a single large residual can dominate an
+    epoch's mean while the median stays where the validation loss is. That residual is either a
+    target the standardization left far out in the tail, or a prediction the model produced.
+    The two call for different remedies, and only their magnitudes tell them apart.
+
+    Targets arrive in the sparse masked format, holding only the values the loss scored, so
+    their extreme is taken directly. Predictions are full tensors and are indexed by the same
+    mask the loss uses.
+
+    Args:
+        predictions: The generator's output, keyed by feature type.
+        masked_targets: Targets at masked positions, keyed by feature type.
+        record_masks: The masks the loss scored against.
+        gen_loss: The step's generator loss.
+        reference: The reference it is being judged against, i.e. the running median.
+
+    Returns:
+        A formatted multi-line report.
+    """
+    lines = [
+        f'  generator loss {gen_loss:.1f} against a running median of {reference:.4f} '
+        f'({gen_loss / reference:,.0f}x)',
+        f'    {"feature type":<14}{"masked":>10}{"max |pred|":>14}{"max |target|":>14}',
+    ]
+
+    for feature_type in SPIKE_FEATURE_TYPES:
+        if feature_type not in predictions or feature_type not in masked_targets:
+            continue
+        values_key = SPIKE_VALUE_KEY.get(feature_type, 'values')
+        prediction_list = predictions[feature_type].get(values_key)
+        target_list = masked_targets[feature_type].get(values_key)
+        if prediction_list is None or target_list is None:
+            continue
+
+        masks = record_masks[feature_type]
+        worst_prediction, worst_target, masked = 0.0, 0.0, 0
+        for feature, (prediction, target) in enumerate(zip(prediction_list, target_list)):
+            if target.numel() == 0:
+                continue
+            if feature_type in SPIKE_MASK_BY_VALUES:
+                mask = masks['values'][feature].bool()
+            else:
+                mask = masks['indicators'][:, :, feature].bool()
+            extreme = _extreme_at_masked(prediction, mask)
+            if extreme is not None:
+                worst_prediction = max(worst_prediction, extreme)
+            worst_target = max(worst_target, float(target.abs().max()))
+            masked += int(target.numel())
+
+        if masked:
+            lines.append(f'    {feature_type:<14}{masked:>10,}{worst_prediction:>14,.1f}'
+                         f'{worst_target:>14,.1f}')
+
+    lines.append(
+        '    A target far larger than any prediction points at the standardization; a '
+        'prediction\n    far larger than any target points at the model.'
+    )
+    return '\n'.join(lines)

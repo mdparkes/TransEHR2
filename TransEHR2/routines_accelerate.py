@@ -26,9 +26,13 @@ from TransEHR2.utils import DistributedTimer
 from TransEHR2.utils import format_pretraining_performance_table, generate_record_masks, get_param_shapes
 from TransEHR2.utils import print_peak_memory, move_batch_to_device
 from TransEHR2.utils import NullStepProfiler, StepProfiler, report_epoch_timing
+from TransEHR2.utils import describe_loss_spike
 
 
 MetadataDict: TypeAlias = Dict[str, Any]
+
+# Steps required before the running median is a usable reference for spike detection.
+SPIKE_MIN_STEPS = 10
 StateDict: TypeAlias = OrderedDict[str, Tensor]
 
 
@@ -409,6 +413,8 @@ def pretrain_one_epoch(
     desc: str = "Training",
     mem_test_mode: bool = False,
     profiler: Optional[Any] = None,
+    spike_factor: float = 10.0,
+    spike_report_limit: int = 3,
 ) -> Dict[str, float]:
     """Execute one epoch of pretraining.
 
@@ -417,6 +423,9 @@ def pretrain_one_epoch(
             the whole run rather than restarting each epoch -- the steady state is in the second
             epoch onward, once the page cache over the memory-mapped arrays is warm. None runs
             the epoch uninstrumented.
+        spike_factor: Multiple of the running median generator loss above which a step is
+            described. Zero or below disables the report.
+        spike_report_limit: Most reports per epoch, so a pathological epoch cannot fill the log.
 
     Returns dictionary of average losses for the epoch.
     """
@@ -425,6 +434,8 @@ def pretrain_one_epoch(
 
     if profiler is None:
         profiler = NullStepProfiler()
+
+    spikes_reported = 0
     
     train_losses = []
     train_gen_losses = []
@@ -503,7 +514,28 @@ def pretrain_one_epoch(
         profiler.mark('loss compute')
 
         train_losses.append(loss.item())
-        train_gen_losses.append(gen_loss.item())
+        gen_value = gen_loss.item()
+
+        # An outlying step is worth describing while its tensors are still in hand: the epoch
+        # mean records that a spike happened, not what was in it. Judged against the median of
+        # the steps so far, which needs a few steps to mean anything, and capped so a bad epoch
+        # cannot fill the log. Costs one comparison on a value already computed.
+        if (spike_factor > 0 and spikes_reported < spike_report_limit
+                and len(train_gen_losses) >= SPIKE_MIN_STEPS):
+            reference = float(np.median(train_gen_losses))
+            if reference > 0 and gen_value > spike_factor * reference:
+                spikes_reported += 1
+                if accelerator.is_main_process:
+                    try:
+                        print(f'\n  STEP {i}: generator loss spike\n' + describe_loss_spike(
+                            generator_preds, electra_output['masked_targets'],
+                            value_associated_data_masks, gen_value, reference), flush=True)
+                    except Exception as error:
+                        # Diagnostics must never be the reason a trial dies.
+                        print(f'\n  STEP {i}: generator loss {gen_value:.1f} against a median '
+                              f'of {reference:.4f}; could not describe it ({error})', flush=True)
+
+        train_gen_losses.append(gen_value)
         train_disc_losses.append(disc_loss.item())
         profiler.mark('loss readback')
 
