@@ -1,0 +1,109 @@
+# Phase 3 pre-admission history sweep: one arm, six history lengths, mortality on fold0.
+#
+# Expand with:
+#     python generate_tuning_configs.py TransEHR2/configs/experiments/tuning/phase3_spec.yaml
+#
+# THIS SPEC DEPENDS ON PHASE 2 HAVING FINISHED. BASE_CONFIG below is not in the repository:
+# it is written by the selection step, which picks the encoding arm and the five tuned
+# hyperparameters out of the Phase 2 results and assembles them into one complete config.
+#
+#     python select_tuned_hyperparameters.py \
+#         TransEHR2/configs/experiments/tuning/phase2_manifest.yaml \
+#         --output TransEHR2/configs/experiments/tuning/phase3_base.yaml \
+#         --experiment_name phase3_base
+#
+# Running the generator before that step fails with a message saying so, rather than quietly
+# sweeping history against untuned settings.
+#
+# The sweep is the same additive shape as Phase 2 with a grid of one, so it needs no new
+# machinery and no new SLURM scripts -- the same manifest-driven arrays run it:
+#     python tuning_trial.py <manifest> --stage pretrain  --count   ->  7
+#     python tuning_trial.py <manifest> --stage finetune  --count   ->  7
+# Every trial is selected on mortality, so every pretrain has a finetune. Fourteen runs in two
+# stages, seven wide, against a suggested %8 throttle that therefore never binds.
+
+SPEC_NAME: phase3
+
+BASE_CONFIG: phase3_base.yaml
+DATASET_CONFIG: ../../datasets/mimic4.yaml
+OUTPUT_DIR: phase3
+MANIFEST: phase3_manifest.yaml
+
+# The same tuning fold as Phase 2, and for the same reason: fold0 is held out of the manuscript
+# results, so decisions made on it do not contaminate them.
+FOLD: fold0
+
+# One arm. Everything that defines it -- POSITION_ENCODING and the five tuned hyperparameters --
+# already sits in the assembled base config, so the arm adds nothing of its own. The name is
+# what appears in trial directories and in the tables.
+ARMS:
+  tuned: {}
+
+ALIASES:
+  HISTORY_LEN_STEPS: hist
+
+# History reaches only the value encoder, so `val_history` alone is the binding count, and that
+# distribution is too bimodal for evenly spaced step counts to say anything: 33.5% of episodes
+# carry no value history at all and 76.4% are settled by a cap of 5. The arms are therefore
+# spaced by history *record mass* rather than by step count, at roughly even quintiles:
+#
+#     500 -> 225   225 episodes,  4.8%,  25% of record mass dropped
+#     225 -> 100   450 episodes,  9.6%,  51%
+#     100 ->  40   749 episodes, 16.0%,  74%
+#      40 ->   5 1,109 episodes, 23.6%,  94%
+#       5 ->   0 3,123 episodes, 66.5%, 100%
+#
+# 500 is the extraction capacity (MAX_HISTORY_LEN_STEPS in the dataset config), so it is
+# censoring rather than a natural maximum -- 1.9% of episodes sit at the cap with unknown true
+# history length. It is the centre here because it is the no-crop condition.
+#
+# 0 is a genuine arm rather than a degenerate one: `history_len_steps=0` resolves to a crop
+# window starting at MAX_HISTORY_LEN_STEPS, which keeps the in-stay episode intact and removes
+# pre-admission history alone.
+#
+# Report every arm on the subset it actually affects rather than on the full cohort, where the
+# differences dilute to nothing. The 225 arm is weak on episode count but completes the
+# dose-response curve, which is what a reviewer reads.
+GRID:
+
+  HISTORY_LEN_STEPS:
+    values: [500, 225, 100, 40, 5, 0]
+    select_on: mortality
+
+# ------------------------------------------------------------------------------------------
+# Ablation, riding along in the idle slots
+# ------------------------------------------------------------------------------------------
+#
+# NOTE ON DIRECTION. The revision plan proposes this the other way round -- run a *narrowed*
+# event ladder against a shared one -- but that is stale. The narrowed event ladder already
+# landed: every config carries EVENT_LADDER_P_MAX = 3000 (~63 x 48 h) against the value
+# stream's 8.05e6, and TransEHR2/test_rope_encoding.py asserts the resulting band counts. The
+# differentiated ladder is the default, so the missing half of the comparison is the shared
+# one, and that is what this trial runs.
+#
+# What it tests: after fix 03 the event encoder sees only in-stay records, so its gaps span
+# 1-48 h while the value encoder still spans five orders of magnitude. Matching the ladder to
+# the narrower range buys ~59 informative bands per scale against ~29 under the value ladder,
+# a 2x gain in effective temporal resolution. That is a prediction, not a measurement, and
+# this is the run that measures it.
+#
+# Why it is free: the sweep is 6 wide in each of two stages against an 8-wide node, so a
+# seventh trial fills an idle slot in each. Fourteen runs instead of twelve, same two stages,
+# same critical path. It does cost the two allocations themselves -- free in wall clock, not
+# in GPU hours.
+EXTRA_TRIALS:
+
+  - name: sharedladder
+    arm: tuned
+    select_on: mortality
+    overrides:
+      # Must equal VALUE_LADDER_P_MAX in the base config, which is what makes the ladder
+      # shared. A literal rather than a reference, so it has to be updated whenever that
+      # bound is re-derived; test_ablation_puts_the_event_stream_on_the_value_ladder fails
+      # if the two drift apart.
+      EVENT_LADDER_P_MAX: 8.05e+6
+    description: >
+      Event stream on the value stream's ladder, against the centre's differentiated one.
+      Identical to the centre in every other respect, including HISTORY_LEN_STEPS = 500, so
+      the pair is a head-to-head on the same fold and the same task. No retuning: the ladder
+      is a frozen buffer and changing its span does not touch the optimizer setup.

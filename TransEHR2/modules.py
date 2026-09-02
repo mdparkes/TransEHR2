@@ -17,6 +17,7 @@ from TransEHR2.constants import (
 from TransEHR2.data.custom_types import EventAssociatedTensorData, ValueAssociatedTensorData
 from TransEHR2.layers import (
     EncoderLayer,
+    RotaryTemporalEncoding,
     TemporalPositionEncoding,
     TransformerBatchNormEncoderLayer,
     build_key_padding_attention_mask,
@@ -223,6 +224,60 @@ class GradientTraceableLLM(torch.nn.Module):
         return results
 
 
+POSITION_ENCODING_SCHEMES = ('additive', 'rope')
+
+
+def _resolve_position_encoding(
+    position_encoding: str,
+    n_head: int,
+    d_head: int,
+    ladder_p_min: Optional[float],
+    ladder_p_max: Optional[float],
+    query_key_transform: Optional[torch.nn.Module]
+) -> Optional[torch.nn.Module]:
+    """Validate an encoding arm and build its query/key transform, if it has one.
+
+    Args:
+        position_encoding (str): Either 'additive' or 'rope'.
+        n_head (int): The number of attention heads.
+        d_head (int): The per-head width of q and k.
+        ladder_p_min (float, optional): The shortest band period, in the units of the timestamps.
+        ladder_p_max (float, optional): The longest band period.
+        query_key_transform (torch.nn.Module, optional): A transform supplied by the caller.
+
+    Returns:
+        torch.nn.Module | None: The transform to install in every attention layer.
+
+    Raises:
+        ValueError: If the scheme is unknown, if 'rope' is asked for without ladder bounds, or if
+            'rope' is combined with a caller-supplied transform.
+
+    Note:
+        Both arms share one ladder specification, which is what lets them share a hyperparameter
+        grid: the additive arm spans `TemporalPositionEncoding` over [p_min, p_max] and the rotary
+        arm spans its rotation over the same range. Neither has parameters. Leaving the bounds unset
+        keeps the inherited `1e4` ladder, so an existing config is unchanged by this argument
+        existing -- but the inherited ladder is not a baseline anyone should be running: see
+        `build_frequency_ladder`.
+    """
+    if position_encoding not in POSITION_ENCODING_SCHEMES:
+        raise ValueError(
+            f'position_encoding: expected one of {POSITION_ENCODING_SCHEMES}, got {position_encoding}.'
+        )
+    if position_encoding == 'additive':
+        return query_key_transform
+    if query_key_transform is not None:
+        raise ValueError(
+            "position_encoding='rope' builds its own query_key_transform; pass one or the other."
+        )
+    if ladder_p_min is None or ladder_p_max is None:
+        raise ValueError(
+            "position_encoding='rope' needs ladder_p_min and ladder_p_max. There is no defensible "
+            'default: the bounds follow from the gap range the encoder actually sees.'
+        )
+    return RotaryTemporalEncoding(n_head, d_head, ladder_p_min, ladder_p_max)
+
+
 class EventDataEncoder(torch.nn.Module): 
     # NOTE Originally from https://github.com/SimiaoZuo/Transformer-Hawkes-Process/blob/master/transformer/Models.py,
     # specifically the Encoder class.
@@ -248,6 +303,9 @@ class EventDataEncoder(torch.nn.Module):
             d_v: int,
             dropout: float,
             normalize_before: bool = False,
+            position_encoding: str = 'additive',
+            ladder_p_min: Optional[float] = None,
+            ladder_p_max: Optional[float] = None,
             query_key_transform: Optional[torch.nn.Module] = None
     ):
         """Initialize an instance.
@@ -264,10 +322,33 @@ class EventDataEncoder(torch.nn.Module):
             normalize_before (bool, optional): Whether to apply layer normalization before the attention and
                 feed-forward layers in each encoder layer. If False, layer normalization is applied after.
                 Defaults to False.
+            position_encoding (str, optional): The encoding arm, 'additive' or 'rope'. 'additive' adds
+                `TemporalPositionEncoding` to the embedding; 'rope' installs `RotaryTemporalEncoding` in the
+                attention instead and keeps only the dropout and padding mask of the additive layer.
+                Defaults to 'additive'.
+            ladder_p_min (float, optional): The shortest band period, in the units of the timestamps.
+                Required for 'rope'; with 'additive' it re-spans `TemporalPositionEncoding`, and leaving it
+                unset keeps the inherited `1e4` ladder. Defaults to None.
+            ladder_p_max (float, optional): The longest band period. Defaults to None.
             query_key_transform (torch.nn.Module, optional): A position-dependent transform applied to the query
                 and key tensors inside every attention layer -- the seam a rotary position encoding occupies.
                 See `MultiHeadAttention` for the contract. The one instance is shared by every block, so it must
-                be stateless across calls. Defaults to None, which leaves the attention unchanged.
+                be stateless across calls. Mutually exclusive with `position_encoding='rope'`, which builds its
+                own. Defaults to None, which leaves the attention unchanged.
+
+        Raises:
+            ValueError: If the encoding arm or its ladder bounds are not a buildable combination.
+
+        Note:
+            The event stream's rotary ladder holds `n_head * d_k / 2` distinct frequencies against the
+            additive arm's `d_model / 2`, so the two arms run the same ladder resolution only when
+            `n_head * d_k == d_model`. Unlike the value encoder, which derives its per-head width from
+            `d_model`, this one takes `d_k` as its own config value -- and `THP_ENCODER_D_K` is 128 in
+            every shipped config for exactly this reason, up from the 64 the submitted model used.
+            `THP_ENCODER_D_V` stays at 64: only q and k are rotated, so only their width sets the band
+            count, and the softmax temperature is `d_k ** 0.5` regardless. Lowering `d_k` reopens a
+            spectral deficit that no amount of partitioning across heads can close, and a win for the
+            additive arm would then be unattributable.
         """
 
         super().__init__()
@@ -280,7 +361,12 @@ class EventDataEncoder(torch.nn.Module):
         self.d_v = d_v
         self.dropout = dropout
         self.normalize_before = normalize_before
-        self.query_key_transform = query_key_transform
+        self.position_encoding = position_encoding
+        self.ladder_p_min = ladder_p_min
+        self.ladder_p_max = ladder_p_max
+        self.query_key_transform = _resolve_position_encoding(
+            position_encoding, n_head, d_k, ladder_p_min, ladder_p_max, query_key_transform
+        )
         
         # NOTE Xu et al. used a torch.nn.Embedding layer to project event types to the model dimension. That worked
         # because the original implementation of the forward pass expected one event ID per timestep (i.e. [batch_size, 
@@ -294,7 +380,13 @@ class EventDataEncoder(torch.nn.Module):
         # encoder, but not to the position encoding of the event-associated data encoder. To keep things consistent,
         # dropout will also be applied to the position encoding of the event-associated data encoder in this 
         # implementation.
-        self.position_encoding_layer = TemporalPositionEncoding(d_model=self.d_model, dropout=0.1)
+        self.position_encoding_layer = TemporalPositionEncoding(
+            d_model=self.d_model,
+            dropout=0.1,
+            p_min=ladder_p_min,
+            p_max=ladder_p_max,
+            additive=position_encoding == 'additive',
+        )
         enc_args, enc_kwargs = (
             [self.d_model, self.d_inner, self.n_head, self.d_k, self.d_v],
             {
@@ -432,6 +524,9 @@ class ValueDataEncoder(torch.nn.Module):
         activation: str = 'gelu',
         norm: str = 'BatchNorm',
         normalize_before: bool = False,
+        position_encoding: str = 'additive',
+        ladder_p_min: Optional[float] = None,
+        ladder_p_max: Optional[float] = None,
         query_key_transform: Optional[torch.nn.Module] = None,
     ):
         r"""Initialize an instance.
@@ -456,17 +551,31 @@ class ValueDataEncoder(torch.nn.Module):
                 `torch.nn.MultiheadAttention` and cannot. No shipped experiment config selects 'BatchNorm'.
             normalize_before (bool, optional): Whether to apply normalization before attention and feedforward 
                 operations (Pre-LN). If False, normalization is applied after (Post-LN). Defaults to False.
+            position_encoding (str, optional): The encoding arm, 'additive' or 'rope'. 'additive' adds
+                `TemporalPositionEncoding` to the embedding; 'rope' installs `RotaryTemporalEncoding` in the
+                attention instead and keeps only the dropout and padding mask of the additive layer. 'rope'
+                requires `norm='LayerNorm'`. Defaults to 'additive'.
+            ladder_p_min (float, optional): The shortest band period, in the units of the timestamps.
+                Required for 'rope'; with 'additive' it re-spans `TemporalPositionEncoding`, and leaving it
+                unset keeps the inherited `1e4` ladder. Defaults to None.
+            ladder_p_max (float, optional): The longest band period. Defaults to None.
             query_key_transform (torch.nn.Module, optional): A position-dependent transform applied to the query
                 and key tensors inside every attention layer -- the seam a rotary position encoding occupies.
                 See `MultiHeadAttention` for the contract. The one instance is shared by every block, so it must
                 be stateless across calls. Only the `norm='LayerNorm'` stack can carry one; passing a transform
                 alongside `norm='BatchNorm'` raises, because that layer delegates to
                 `torch.nn.MultiheadAttention`, which does not expose q and k between projection and dot product.
-                Defaults to None, which leaves the attention unchanged.
+                Mutually exclusive with `position_encoding='rope'`, which builds its own. Defaults to None.
 
         Raises:
             ValueError: If `norm` is not 'LayerNorm' or 'BatchNorm', if `d_model` is not divisible by
-                `n_heads`, or if `query_key_transform` is given with `norm='BatchNorm'`.
+                `n_heads`, if a query/key transform is asked for alongside `norm='BatchNorm'`, or if the
+                encoding arm and its ladder bounds are not a buildable combination.
+
+        Note:
+            With a square projection -- `n_heads * (d_model // n_heads) == d_model` -- the rotary ladder
+            holds `d_model / 2` distinct frequencies, exactly matching the additive arm's. That parity is
+            what makes a win for either arm attributable to the mechanism rather than to band count.
         """
 
         super().__init__()
@@ -477,9 +586,9 @@ class ValueDataEncoder(torch.nn.Module):
                 f'd_model ({d_model}) must be divisible by n_heads ({n_heads}) so that the per-head width '
                 'd_model // n_heads is exact.'
             )
-        if query_key_transform is not None and norm != 'LayerNorm':
+        if (query_key_transform is not None or position_encoding == 'rope') and norm != 'LayerNorm':
             raise ValueError(
-                "query_key_transform requires norm='LayerNorm'; the BatchNorm block uses "
+                "a query/key transform requires norm='LayerNorm'; the BatchNorm block uses "
                 'torch.nn.MultiheadAttention, which does not expose the query and key tensors.'
             )
         self.n_features = n_features
@@ -490,12 +599,17 @@ class ValueDataEncoder(torch.nn.Module):
         self.dim_feedforward = dim_feedforward
         self.norm = norm
         self.normalize_before = normalize_before
-        self.query_key_transform = query_key_transform
+        self.position_encoding = position_encoding
+        self.ladder_p_min = ladder_p_min
+        self.ladder_p_max = ladder_p_max
         # torch.nn.MultiheadAttention splits d_model evenly across heads, so the migrated stack has to do the
         # same: EncoderLayer takes d_k and d_v explicitly and would otherwise silently run at a different
         # attention width than the layer it replaces.
         self.d_k = self.d_v = d_model // n_heads
         self.owns_attention = norm == 'LayerNorm'
+        self.query_key_transform = _resolve_position_encoding(
+            position_encoding, n_heads, self.d_k, ladder_p_min, ladder_p_max, query_key_transform
+        )
         # NOTE Xu et al. only used the value_input_projection_layer in their code, but in the paper they described
         # using two separate projection layers for the indicator and value-associated data. We follow the paper.
         # The value input projection uses bias, but the indicator input projection does not.
@@ -505,7 +619,13 @@ class ValueDataEncoder(torch.nn.Module):
         # encoder, but not to the position encoding of the event-associated data encoder. To keep things consistent,
         # dropout will also be applied to the position encoding of the event-associated data encoder in this 
         # implementation.
-        self.position_encoding_layer = TemporalPositionEncoding(d_model=d_model, dropout=0.1)
+        self.position_encoding_layer = TemporalPositionEncoding(
+            d_model=d_model,
+            dropout=0.1,
+            p_min=ladder_p_min,
+            p_max=ladder_p_max,
+            additive=position_encoding == 'additive',
+        )
         # Blocks are built independently rather than deep-copied from a prototype. nn.TransformerEncoder
         # clones its prototype with copy.deepcopy, which has two consequences we do not want: every block
         # starts from identical weights, so a deeper stack behaves differently from a freshly constructed

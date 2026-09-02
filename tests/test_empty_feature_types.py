@@ -12,10 +12,8 @@ cannot be sliced per episode.
 
 The substitute must still be two-dimensional `(timesteps, features)`. `collate_tensorized` stacks
 per-episode indicators into `(batch, timesteps, features)`, and `_gen_val_assoc_feat_mask` unpacks
-exactly three dimensions from that. A bare `torch.empty(0)` collates to `(batch, 0)` and the first
-pretraining batch dies with `not enough values to unpack (expected 3, got 2)` -- observed on the
-re-extracted MIMIC-IV arrays, on both encoding arms, roughly eight minutes into the Phase 2 smoke
-test's memory stage.
+exactly three dimensions from that. A bare `torch.empty(0)` collates to `(batch, 0)`, and the
+first pretraining batch fails with `not enough values to unpack (expected 3, got 2)`.
 """
 
 import numpy as np

@@ -25,6 +25,7 @@ from TransEHR2.models import MixedClassifier
 from TransEHR2.utils import DistributedTimer
 from TransEHR2.utils import format_pretraining_performance_table, generate_record_masks, get_param_shapes
 from TransEHR2.utils import print_peak_memory, move_batch_to_device
+from TransEHR2.utils import NullStepProfiler, StepProfiler, report_epoch_timing
 
 
 MetadataDict: TypeAlias = Dict[str, Any]
@@ -407,13 +408,23 @@ def pretrain_one_epoch(
     accelerator: Accelerator,
     desc: str = "Training",
     mem_test_mode: bool = False,
+    profiler: Optional[Any] = None,
 ) -> Dict[str, float]:
     """Execute one epoch of pretraining.
-    
+
+    Args:
+        profiler: A StepProfiler owned by the caller, so that its step budget and warmup span
+            the whole run rather than restarting each epoch -- the steady state is in the second
+            epoch onward, once the page cache over the memory-mapped arrays is warm. None runs
+            the epoch uninstrumented.
+
     Returns dictionary of average losses for the epoch.
     """
 
     model.train()
+
+    if profiler is None:
+        profiler = NullStepProfiler()
     
     train_losses = []
     train_gen_losses = []
@@ -427,7 +438,12 @@ def pretrain_one_epoch(
     
     for i, batch in tqdm(enumerate(loader), desc=desc, leave=False, disable=disable_tqdm):
 
+        # Closes the interval that began when the previous step ended, so it measures how long
+        # the loop waited on the dataloader rather than any work of its own.
+        profiler.mark('dataloader wait')
+
         batch = move_batch_to_device(batch, device=accelerator.device)
+        profiler.mark('move to device')
         value_associated_data_masks, _ = generate_record_masks(
             batch,
             feature_sample_rate=record_mask_ratio,
@@ -435,6 +451,7 @@ def pretrain_one_epoch(
             subsample_rate=cmpnt_mask_ratio
         )
         accelerator.wait_for_everyone()
+        profiler.mark('generate masks')
 
         electra_output = model(
             batch,
@@ -444,6 +461,7 @@ def pretrain_one_epoch(
             compute_intensities=True,
             thp_loss_mc_samples=thp_loss_mc_samples
         )
+        profiler.mark('forward')
 
         generator_preds = electra_output['generator']
         discriminator_preds = electra_output['discriminator']
@@ -480,15 +498,25 @@ def pretrain_one_epoch(
             train_thp_type_losses.append(0.0)
             train_thp_time_losses.append(0.0)
 
+        # Four of the seven per-step `.item()` calls sit in the THP branch above, so their
+        # synchronization cost is inside 'loss compute' rather than here.
+        profiler.mark('loss compute')
+
         train_losses.append(loss.item())
         train_gen_losses.append(gen_loss.item())
         train_disc_losses.append(disc_loss.item())
+        profiler.mark('loss readback')
 
         optimizer.zero_grad()
         accelerator.backward(loss)
+        profiler.mark('backward')
         accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         accelerator.wait_for_everyone()
+        profiler.mark('clip + optimizer')
+
+        if profiler.end_step():
+            break
 
         if mem_test_mode and i == 1:
             if accelerator.is_main_process:
@@ -505,6 +533,19 @@ def pretrain_one_epoch(
     train_thp_type_losses = accelerator.gather(torch.tensor(train_thp_type_losses, device=accelerator.device))
     train_thp_time_losses = accelerator.gather(torch.tensor(train_thp_time_losses, device=accelerator.device))
     
+    # The generator term is the only unbounded one in the objective -- numeric features are
+    # scored by squared error, everything else by cross-entropy, BCE or a cosine distance in
+    # [0, 1]. A single step with a large residual therefore moves the epoch mean a long way, and
+    # the mean alone cannot distinguish a uniformly bad epoch from a good one with a few spikes.
+    # Printed for the generator only, since that is where the question arises.
+    if accelerator.is_main_process and train_gen_losses.numel():
+        ordered = train_gen_losses.sort().values
+        print(f"\n  generator loss over {train_gen_losses.numel()} steps: "
+              f"mean {train_gen_losses.mean().item():.4f}, "
+              f"median {ordered[ordered.numel() // 2].item():.4f}, "
+              f"p90 {ordered[int(0.9 * (ordered.numel() - 1))].item():.4f}, "
+              f"max {ordered[-1].item():.4f}", flush=True)
+
     # Compute mean on main process, keep as tensor for broadcast
     if accelerator.is_main_process:
         curr_train_loss = train_losses.mean()
@@ -931,7 +972,10 @@ def pretrain_model(
     timer: Optional[DistributedTimer] = None,
     accelerator: Accelerator = None,
     mem_test_mode: bool = False,
-    ordinal_features: Optional[List[int]] = None
+    ordinal_features: Optional[List[int]] = None,
+    profile_steps: int = 0,
+    profile_warmup: int = 3,
+    profile_steps_per_epoch: Optional[int] = None
 ) -> Tuple[Dict[str, float], Dict[str, float]]:
     """Pre-train an ELECTRA-style model with Accelerate support (FSDP or DDP).
     
@@ -958,9 +1002,19 @@ def pretrain_model(
         accelerator: Accelerator instance for distributed training
         mem_test_mode: If True, runs the forward and backward passes on a single batch, reports memory usage, and 
             raises an Exception to terminate. Useful for figuring out batch size limits.
-    
+        profile_steps: If positive, run this many training steps with a per-phase wall-clock
+            breakdown, print it, and return without validating, checkpointing or saving. The
+            phase boundaries synchronize the CUDA stream, so the totals are an upper bound on
+            real throughput; the ratios between phases are the usable output. The budget spans
+            epochs, so a value above one epoch's step count carries on into the next.
+        profile_warmup: Leading steps discarded before measuring. Set it to a whole epoch's step
+            count to measure the steady state: the first pass over the memory-mapped arrays pays
+            page faults that later passes do not, so it is not the cost a multi-epoch budget
+            should be priced from.
+
     Returns:
-        Tuple of (best_train_losses, best_val_losses) dictionaries
+        Tuple of (best_train_losses, best_val_losses) dictionaries. Both are empty under
+        profile_steps, which trains nothing worth keeping.
     """
 
     report_freq = 10
@@ -989,16 +1043,23 @@ def pretrain_model(
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=learning_rate_decay)
 
     # Initialize loss functions
+    #
+    # These are moved to the accelerator's device, which matters for exactly one of them and
+    # is free for the other two. MaskedGeneratorLoss holds a BetaLoss per ordinal feature, and
+    # BetaLoss registers its class-probability table as a buffer. Left on the CPU, that buffer
+    # is indexed by target classes that live on the GPU, and every ordinal feature raises
+    # "indices should be either on cpu or on the same device as the indexed tensor". The data
+    # has three ordinal features (the GCS scales), so this fires on the first batch.
     gen_loss_fn = MaskedGeneratorLoss(
         ordinal_features=ordinal_features
-    )
-    disc_loss_fn = MaskedDiscriminatorLoss(weight=disc_loss_weight)
+    ).to(accelerator.device)
+    disc_loss_fn = MaskedDiscriminatorLoss(weight=disc_loss_weight).to(accelerator.device)
     thp_loss_fn = TransformerHawkesLoss(
         add_prediction_loss=use_thp_pred_loss,
         nll_weight=thp_loss_nll_weight,
         type_weight=thp_pred_loss_type_wt,
         time_weight=thp_pred_loss_time_wt
-    )
+    ).to(accelerator.device)
 
     if accelerator.is_main_process:
         param_shapes = get_param_shapes(model)
@@ -1064,7 +1125,17 @@ def pretrain_model(
     best_epoch_val_loss = best_epoch_val_losses['Optimization_Loss']
     early_stopping_counter = training_metadata.get('early_stopping_counter', 0) 
 
+    profiler = (StepProfiler(profile_steps, warmup=profile_warmup, device=accelerator.device)
+                if profile_steps > 0 else NullStepProfiler())
+
+    # Wall clock of each completed epoch -- training, validation, state extraction and
+    # checkpointing together. Reported at the end so a short run can be extrapolated on a
+    # per-epoch cost rather than on whole-process wall time, which carries fixed startup and
+    # teardown that do not scale with the epoch budget.
+    epoch_seconds = []
+
     for epoch in tqdm(range(start_epoch, total_epoch), disable=not accelerator.is_local_main_process):
+        epoch_start = time.perf_counter()
 
         # Set epoch for balanced sampler shuffling
         if hasattr(train_loader.sampler, 'set_epoch'):
@@ -1084,8 +1155,21 @@ def pretrain_model(
             cmpnt_mask_ratio=cmpnt_mask_ratio,
             accelerator=accelerator,
             desc=f"Epoch {epoch + 1} Training",
-            mem_test_mode=mem_test_mode
+            mem_test_mode=mem_test_mode,
+            profiler=profiler
         )
+
+        if profiler.enabled:
+            # Skip validation, checkpointing and the improvement check while profiling: they
+            # would dominate a run of a few dozen steps, and nothing here is worth keeping.
+            if not profiler.done:
+                continue
+            if accelerator.is_main_process:
+                profiler.report(
+                    steps_per_epoch=profile_steps_per_epoch or len(train_loader))
+                print('Profiling run: stopped before validation. Nothing was saved.',
+                      flush=True)
+            return {}, {}
 
         # Validation phase
         curr_epoch_val_losses = pretrain_validate(
@@ -1163,6 +1247,8 @@ def pretrain_model(
                 print("\n" + performance_table + "\n")
         
 
+        epoch_seconds.append(time.perf_counter() - epoch_start)
+
         # Early stopping check
         if early_stopping_counter == 30:
             if accelerator.is_main_process:
@@ -1173,6 +1259,19 @@ def pretrain_model(
         if (epoch + 1) % 50 == 0:
             scheduler.step()
     
+
+    if profiler.enabled:
+        # Reached only when the epoch budget ran out before the step budget, e.g. a 192-step
+        # profile against a 1-epoch config. Report what was measured rather than nothing.
+        if accelerator.is_main_process:
+            profiler.report(steps_per_epoch=profile_steps_per_epoch or len(train_loader))
+            print(f'Profiling run: the {total_epoch}-epoch budget ended before '
+                  f'{profile_steps} steps were taken. Raise PRETRAIN_TOTAL_EPOCH to profile '
+                  f'deeper. Nothing was saved.', flush=True)
+        return {}, {}
+
+    if accelerator.is_main_process:
+        report_epoch_timing(epoch_seconds, total_epoch)
 
     # Save final best state and encoder weights to model directory
     if accelerator.is_main_process:
@@ -1577,16 +1676,23 @@ def pretrain_with_hyperparameter(
 
 
     # Initialize loss functions
+    #
+    # These are moved to the accelerator's device, which matters for exactly one of them and
+    # is free for the other two. MaskedGeneratorLoss holds a BetaLoss per ordinal feature, and
+    # BetaLoss registers its class-probability table as a buffer. Left on the CPU, that buffer
+    # is indexed by target classes that live on the GPU, and every ordinal feature raises
+    # "indices should be either on cpu or on the same device as the indexed tensor". The data
+    # has three ordinal features (the GCS scales), so this fires on the first batch.
     gen_loss_fn = MaskedGeneratorLoss(
         ordinal_features=ordinal_features
-    )
-    disc_loss_fn = MaskedDiscriminatorLoss(weight=disc_loss_weight)
+    ).to(accelerator.device)
+    disc_loss_fn = MaskedDiscriminatorLoss(weight=disc_loss_weight).to(accelerator.device)
     thp_loss_fn = TransformerHawkesLoss(
         add_prediction_loss=use_thp_pred_loss,
         nll_weight=thp_loss_nll_weight,
         type_weight=thp_pred_loss_type_wt,
         time_weight=thp_pred_loss_time_wt
-    )
+    ).to(accelerator.device)
 
 
     # Get the parameter shapes for unflattening later

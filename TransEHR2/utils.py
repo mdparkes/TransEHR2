@@ -8,7 +8,7 @@ import yaml
 from accelerate import Accelerator
 from datetime import timedelta
 from torch import Tensor
-from typing import Any, Dict, List, OrderedDict, Tuple, Union
+from typing import Any, Dict, List, Optional, OrderedDict, Tuple, Union
 
 from TransEHR2.data.datasets import MixedDataset
 from TransEHR2.data.custom_types import MixedTensorDataset
@@ -238,6 +238,46 @@ def create_timer(results_dir: str = None, experiment_name: str = "experiment") -
     return DistributedTimer(results_path=results_path)
 
 
+def densify_text_embeddings(batch: MixedTensorDataset) -> MixedTensorDataset:
+    """Rebuild the dense text embedding tensor from the sparse form the collate function emits.
+
+    `collate_tensorized` ships one flat COO-style block per text feature -- episode index,
+    timestep index and the embedding rows -- rather than the dense
+    `(batch, ts_len, n_text_feats, embed_dim)` tensor the model consumes. Notes are rare against
+    a 550-step axis, so the dense form is about 99% of the batch by size and almost entirely
+    zeros; carrying it across the worker boundary costs a single-threaded pass over roughly
+    860 MiB per batch at batch size 200.
+
+    This runs inside `move_batch_to_device`, so it builds the dense tensor wherever the batch
+    has just landed. It is idempotent: a batch that already carries `embedded_values` is
+    returned untouched, which keeps any caller that densified earlier working.
+
+    Args:
+        batch: A batch whose text entry holds `sparse_embeddings` and `sparse_dense_shape`.
+
+    Returns:
+        The same batch, with `embedded_values` in place of the sparse keys.
+    """
+    text = batch.get('val_data', {}).get('text') if isinstance(batch, dict) else None
+    if not isinstance(text, dict) or 'sparse_embeddings' not in text:
+        return batch
+
+    blocks = text.pop('sparse_embeddings')
+    batch_size, ts_len, n_text_feats, embed_dim = (
+        int(v) for v in text.pop('sparse_dense_shape'))
+
+    reference = blocks[0]['values']
+    dense = torch.zeros(
+        (batch_size, ts_len, n_text_feats, embed_dim),
+        dtype=reference.dtype, device=reference.device
+    )
+    for feature, block in enumerate(blocks):
+        if block['values'].numel():
+            dense[block['episode_index'], block['timestep_index'], feature] = block['values']
+    text['embedded_values'] = dense
+    return batch
+
+
 def move_batch_to_device(batch: MixedTensorDataset, device: torch.device) -> MixedTensorDataset:
     """Recursively move all tensors in a batch to the specified device.
     
@@ -249,7 +289,8 @@ def move_batch_to_device(batch: MixedTensorDataset, device: torch.device) -> Mix
         device: Target device (e.g., accelerator.device)
         
     Returns:
-        The batch with all tensors moved to the specified device
+        The batch with all tensors moved to the specified device, and its text embeddings
+        densified on that device.
     """
     def _move_to_device(obj):
         if isinstance(obj, torch.Tensor):
@@ -262,8 +303,10 @@ def move_batch_to_device(batch: MixedTensorDataset, device: torch.device) -> Mix
             return tuple(_move_to_device(item) for item in obj)
         else:
             return obj
-    
-    return _move_to_device(batch)
+
+    # Densified after the move, so the dense tensor is allocated on the target device and only
+    # the sparse rows cross the host boundary.
+    return densify_text_embeddings(_move_to_device(batch))
 
 
 def ensure_float32(data: MixedDataset) -> MixedDataset:
@@ -416,6 +459,10 @@ def generate_record_masks(
             # Initialize indicator mask tensor
             indicator_mask = torch.zeros_like(feature_data['indicators'], device=batch_device)
             if feature_type == 'text':
+                # Densified if it has not been already. `move_batch_to_device` normally does
+                # this, but a caller that reads a collated batch directly would otherwise fail
+                # on a missing key; the call is idempotent and free once the tensor exists.
+                feature_data = densify_text_embeddings(data)['val_data'][feature_type]
                 # Text features use pre-computed embeddings; get dim from batch
                 text_embed_dim = feature_data['embedded_values'].shape[-1]
                 value_mask_shape = (batch_size, max_ts_len, text_embed_dim)
@@ -936,3 +983,153 @@ def convert_model_to_dtype(model: torch.nn.Module, dtype: torch.dtype = torch.bf
             continue
         buffer.data = buffer.data.to(dtype)
     return model
+
+
+class NullStepProfiler:
+    """Stand-in used when profiling is off, so the training loop calls the same methods."""
+
+    enabled = False
+    done = False
+
+    def mark(self, phase: str) -> None:
+        pass
+
+    def end_step(self) -> bool:
+        return False
+
+    def report(self, steps_per_epoch: Optional[int] = None) -> None:
+        pass
+
+
+class StepProfiler:
+    """Wall-clock breakdown of one training step, by phase.
+
+    Every `mark` synchronizes the CUDA stream before reading the clock, so work lands in the
+    phase that launched it rather than in whichever later call happened to block. That makes an
+    instrumented step slower than an uninstrumented one, and the totals here are therefore an
+    upper bound on real throughput. What they are good for is the ratio between phases, which is
+    what identifies the bottleneck.
+
+    The first `warmup` steps are recorded and discarded. They carry one-time costs -- cuDNN
+    algorithm selection, allocator growth, dataloader worker startup, and a cold page cache over
+    the memory-mapped arrays -- that do not recur and would otherwise dominate a short
+    measurement. Setting `warmup` to a whole epoch's worth of steps measures the steady state
+    rather than the first pass, which is the number a multi-epoch budget should be priced from.
+
+    One profiler spans the whole run rather than one epoch, so `total_steps` may exceed the
+    steps in a single epoch.
+
+    Args:
+        total_steps: Steps to run before the loop stops, warmup included.
+        warmup: Leading steps to discard.
+        device: Device whose stream is synchronized. CPU-only runs skip the sync.
+    """
+
+    enabled = True
+
+    def __init__(self, total_steps: int, warmup: int = 3, device: Optional[Any] = None):
+        self.total_steps = max(total_steps, warmup + 1)
+        self.warmup = warmup
+        self.device = device
+        self.step = 0
+        self.timings: Dict[str, List[float]] = {}  # insertion-ordered, so phases print in loop order
+        self._last = None
+        self._start_of_step = None
+
+    @property
+    def done(self) -> bool:
+        """Whether every requested step has been taken, warmup included."""
+        return self.step >= self.total_steps
+
+    def _sync(self) -> None:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+    def mark(self, phase: str) -> None:
+        """Close the interval that started at the previous mark and attribute it to `phase`."""
+        self._sync()
+        now = time.perf_counter()
+        if self._last is not None and self.step >= self.warmup:
+            self.timings.setdefault(phase, []).append(now - self._last)
+        self._last = now
+        if self._start_of_step is None:
+            self._start_of_step = now
+
+    def end_step(self) -> bool:
+        """Close the step. Returns True when the loop should stop."""
+        self._sync()
+        now = time.perf_counter()
+        if self._start_of_step is not None and self.step >= self.warmup:
+            self.timings.setdefault('TOTAL', []).append(now - self._start_of_step)
+        self.step += 1
+        self._last = now
+        self._start_of_step = now
+        return self.done
+
+    def report(self, steps_per_epoch: Optional[int] = None) -> None:
+        """Print the per-phase breakdown and, given a step count, the implied epoch cost."""
+        measured = self.step - self.warmup
+        if measured <= 0 or 'TOTAL' not in self.timings:
+            print('\nSTEP PROFILE: no steps completed past warmup.', flush=True)
+            return
+
+        total = sum(self.timings['TOTAL']) / len(self.timings['TOTAL'])
+        print(f'\n{"=" * 66}')
+        print(f'STEP PROFILE  ({measured} steps measured, {self.warmup} discarded as warmup)')
+        print('=' * 66)
+        print(f'{"phase":<24}{"mean s":>10}{"share":>9}{"min s":>11}{"max s":>11}')
+        print('-' * 66)
+        for phase, samples in self.timings.items():
+            if phase == 'TOTAL':
+                continue
+            mean = sum(samples) / len(samples)
+            print(f'{phase:<24}{mean:>10.4f}{mean / total:>8.1%}{min(samples):>11.4f}'
+                  f'{max(samples):>11.4f}')
+        print('-' * 66)
+        print(f'{"TOTAL":<24}{total:>10.4f}{1.0:>8.1%}'
+              f'{min(self.timings["TOTAL"]):>11.4f}{max(self.timings["TOTAL"]):>11.4f}')
+        print('=' * 66)
+        if steps_per_epoch:
+            epoch_seconds = total * steps_per_epoch
+            print(f'  {steps_per_epoch} training steps per full epoch at this batch size')
+            print(f'  implied training time per epoch: {epoch_seconds:.1f}s'
+                  f'{f" ({epoch_seconds / 3600:.2f} h)" if epoch_seconds >= 600 else ""}')
+            print(f'  (validation is extra and is not in this figure)')
+        if torch.cuda.is_available():
+            print(f'  peak allocated: {torch.cuda.max_memory_allocated() / 2**30:.2f} GB'
+                  f'   reserved: {torch.cuda.max_memory_reserved() / 2**30:.2f} GB')
+        print(flush=True)
+
+
+# Prefix of the machine-readable timing line. test_phase2_pipeline.py parses it to size the
+# --time request for the real sweep, so the format is a contract: changing it silently returns
+# that estimate to whole-process wall time, which overstates a short run enormously.
+EPOCH_TIMING_PREFIX = 'PRETRAIN_EPOCH_SECONDS'
+STARTUP_TIMING_PREFIX = 'PRETRAIN_STARTUP_SECONDS'
+
+
+def report_epoch_timing(epoch_seconds: List[float], total_epoch: int) -> None:
+    """Print per-epoch wall times, including a line meant to be parsed.
+
+    The first epoch is excluded from the mean: it pays dataloader worker startup under the
+    `spawn` context, cuDNN algorithm selection and allocator growth, none of which recur. On a
+    run of one epoch there is nothing else to average, so that epoch is used and flagged.
+
+    Args:
+        epoch_seconds: Wall time of each completed epoch, in order.
+        total_epoch: The epoch budget the run was given, for the projection.
+    """
+    if not epoch_seconds:
+        print(f'{EPOCH_TIMING_PREFIX} n=0', flush=True)
+        return
+
+    steady = epoch_seconds[1:] or epoch_seconds
+    mean = sum(steady) / len(steady)
+    print(f'\n{EPOCH_TIMING_PREFIX} n={len(epoch_seconds)} '
+          f'mean={mean:.4f} first={epoch_seconds[0]:.4f} '
+          f'steady_n={len(steady)}', flush=True)
+    print(f'  {len(epoch_seconds)} epoch(s) completed. First {epoch_seconds[0]:.1f}s, '
+          f'mean of the rest {mean:.1f}s'
+          f'{" (only one epoch ran, so the mean is that epoch)" if len(epoch_seconds) == 1 else ""}.')
+    print(f'  At {mean:.1f}s/epoch, the {total_epoch}-epoch budget is '
+          f'{mean * total_epoch / 3600:.2f} h of training.', flush=True)

@@ -11,9 +11,9 @@ Three things are being asked:
   entirely padding, which is the case that used to produce NaN.
 * Does it learn something that needs the time axis? The finetuning probe labels an episode by the
   *sign of its trend*, which no readout can recover from a bag of timesteps.
-* Is the rotary seam usable end to end? The same runs are repeated with a stand-in rotation
-  installed at the seam, forward and backward, to show a position transform trains rather than
-  merely evaluating.
+* Do both encoding arms train, and do they differ only where they are supposed to? Every run is
+  repeated under `position_encoding='rope'`, and the rotary arm's predictions are checked to be
+  invariant to a shift of the time origin where the additive arm's are not.
 
 Run directly (``python -m TransEHR2.test_encoder_simulated_training``) or under pytest.
 """
@@ -43,23 +43,10 @@ N_VAL_FEATURES = len(NUMERIC_DIMS)
 TOTAL_FEAT_DIM = sum(NUMERIC_DIMS)
 
 
-class _Rotator(torch.nn.Module):
-    """A parameter-free, position-dependent rotation of q and k.
-
-    Not RoPE -- every channel pair turns at the same rate rather than on a ladder of frequencies --
-    but it has the shape of one, which is what the seam has to carry: no parameters, no state
-    between calls, and a gradient path back through the encoder.
-    """
-
-    def forward(self, q, k, positions):
-        angle = positions[:, None, :, None] * 0.25
-        return self._rotate(q, angle), self._rotate(k, angle)
-
-    @staticmethod
-    def _rotate(x, angle):
-        even, odd = x[..., 0::2], x[..., 1::2]
-        cos, sin = torch.cos(angle), torch.sin(angle)
-        return torch.stack([even * cos - odd * sin, even * sin + odd * cos], dim=-1).flatten(-2)
+ARMS = ('additive', 'rope')
+# The simulated stays run 4-24 h on an irregular grid, so the event encoder's bounds fit:
+# P_min = 2 * delta_min, P_max = 63 * delta_max.
+LADDER_P_MIN, LADDER_P_MAX = 2.0, 3000.0
 
 
 # --------------------------------------------------------------------------------------------
@@ -128,12 +115,13 @@ def _simulate_cohort(n_episodes=24, max_steps=12, seed=0, all_padding_episode=Tr
     return batch, labels
 
 
-def _build_electra(transform=None):
+def _build_electra(arm='additive'):
     torch.manual_seed(0)
     common = dict(
         n_features=N_VAL_FEATURES, feat_dim=TOTAL_FEAT_DIM, d_model=D_MODEL, n_heads=N_HEADS,
         n_encoder_blocks=2, dim_feedforward=DIM_FF, dropout=0.1, activation='gelu',
-        norm='LayerNorm', normalize_before=True, query_key_transform=transform,
+        norm='LayerNorm', normalize_before=True, position_encoding=arm,
+        ladder_p_min=LADDER_P_MIN, ladder_p_max=LADDER_P_MAX,
     )
     generator = MaskedTokenGenerator(
         encoder=ValueDataEncoder(**common), d_model=D_MODEL, numeric_dims=NUMERIC_DIMS,
@@ -148,24 +136,25 @@ def _build_electra(transform=None):
         encoder=EventDataEncoder(
             num_types=N_EVENT_TYPES, d_model=D_MODEL, d_inner=DIM_FF, n_layers=2, n_head=N_HEADS,
             d_k=D_MODEL // N_HEADS, d_v=D_MODEL // N_HEADS, dropout=0.1, normalize_before=True,
-            query_key_transform=transform,
+            position_encoding=arm, ladder_p_min=LADDER_P_MIN, ladder_p_max=LADDER_P_MAX,
         ),
         num_types=N_EVENT_TYPES,
     )
     return ELECTRA(generator=generator, discriminator=discriminator, hawkes=hawkes)
 
 
-def _build_classifier(transform=None):
+def _build_classifier(arm='additive'):
     torch.manual_seed(0)
+    ladder = dict(position_encoding=arm, ladder_p_min=LADDER_P_MIN, ladder_p_max=LADDER_P_MAX)
     value_encoder = ValueDataEncoder(
         n_features=N_VAL_FEATURES, feat_dim=TOTAL_FEAT_DIM, d_model=D_MODEL, n_heads=N_HEADS,
         n_encoder_blocks=2, dim_feedforward=DIM_FF, dropout=0.1, activation='gelu',
-        norm='LayerNorm', normalize_before=True, query_key_transform=transform,
+        norm='LayerNorm', normalize_before=True, **ladder,
     )
     event_encoder = EventDataEncoder(
         num_types=N_EVENT_TYPES, d_model=D_MODEL, d_inner=DIM_FF, n_layers=1, n_head=N_HEADS,
         d_k=D_MODEL // N_HEADS, d_v=D_MODEL // N_HEADS, dropout=0.1, normalize_before=True,
-        query_key_transform=transform,
+        **ladder,
     )
     return MixedClassifier(
         event_encoder=event_encoder, val_encoder=value_encoder, d_event_enc=D_MODEL,
@@ -177,7 +166,7 @@ def _build_classifier(transform=None):
 # Pretraining
 # --------------------------------------------------------------------------------------------
 
-def _run_pretraining(transform=None, steps=30, seed=0):
+def _run_pretraining(arm='additive', steps=30, seed=0):
     """A short ELECTRA pretraining run over one fixed simulated cohort."""
     torch.manual_seed(seed)
     # No all-padding episode here: the Hawkes likelihood gates its base intensity on event index
@@ -185,7 +174,7 @@ def _run_pretraining(transform=None, steps=30, seed=0):
     # encoders' own handling of that case is covered by test_encoder_refactor.py and by
     # test_classifier_output_is_finite_for_an_all_padding_episode below.
     batch, _ = _simulate_cohort(seed=seed, all_padding_episode=False)
-    electra = _build_electra(transform)
+    electra = _build_electra(arm)
     electra.train()
 
     generator_loss_fn = MaskedGeneratorLoss()
@@ -224,16 +213,17 @@ def _run_pretraining(transform=None, steps=30, seed=0):
     return electra, losses
 
 
-def test_electra_pretrains_on_simulated_data():
-    """Pretraining must run, stay finite and come down."""
-    _, losses = _run_pretraining()
+def test_both_arms_pretrain_on_simulated_data():
+    """Pretraining must run, stay finite and come down, under either encoding."""
+    for arm in ARMS:
+        _, losses = _run_pretraining(arm)
 
-    assert all(torch.isfinite(torch.tensor(value)) for value in losses), (
-        f'pretraining loss went non-finite: {losses}'
-    )
-    first, last = sum(losses[:5]) / 5, sum(losses[-5:]) / 5
-    assert last < first, f'pretraining loss did not fall: {first:.4f} -> {last:.4f}'
-    print(f'  pretraining loss {first:.4f} -> {last:.4f} over {len(losses)} steps')
+        assert all(torch.isfinite(torch.tensor(value)) for value in losses), (
+            f'{arm}: pretraining loss went non-finite: {losses}'
+        )
+        first, last = sum(losses[:5]) / 5, sum(losses[-5:]) / 5
+        assert last < first, f'{arm}: pretraining loss did not fall: {first:.4f} -> {last:.4f}'
+        print(f'  {arm:8s} pretraining loss {first:.4f} -> {last:.4f} over {len(losses)} steps')
 
 
 def test_pretraining_gradients_reach_every_encoder_parameter():
@@ -242,7 +232,7 @@ def test_pretraining_gradients_reach_every_encoder_parameter():
     Under DDP an unused parameter raises at the reduction step rather than being ignored, so a
     block that quietly falls out of the graph is a distributed-only failure.
     """
-    electra, _ = _run_pretraining(steps=1)
+    electra, _ = _run_pretraining('rope', steps=1)
     encoders = {
         'generator.encoder': electra.generator.encoder,
         'discriminator.encoder': electra.discriminator.encoder,
@@ -257,30 +247,28 @@ def test_pretraining_gradients_reach_every_encoder_parameter():
         assert not unused, f'{len(unused)} parameter(s) never received a gradient: {unused[:6]}'
 
 
-def test_pretraining_runs_with_a_transform_at_the_rotary_seam():
-    """A position transform must survive a real optimization loop, not just a forward pass."""
-    _, plain = _run_pretraining()
-    _, rotated = _run_pretraining(transform=_Rotator())
+def test_the_two_arms_are_actually_different_models():
+    """A guard against the arm switch quietly doing nothing.
 
-    assert all(torch.isfinite(torch.tensor(value)) for value in rotated), (
-        f'pretraining with a transform installed went non-finite: {rotated}'
+    Both arms start from the same seed and the same weights -- they are parameter-identical -- so if
+    the encoding were not reaching the model the first step's loss would match to the bit.
+    """
+    _, additive = _run_pretraining('additive', steps=1)
+    _, rope = _run_pretraining('rope', steps=1)
+    assert abs(additive[0] - rope[0]) > 1e-6, (
+        'the two arms gave the same loss at step 0 -- the encoding is not reaching the model'
     )
-    assert sum(rotated[-5:]) / 5 < sum(rotated[:5]) / 5, 'the transformed run did not train'
-    assert abs(plain[0] - rotated[0]) > 1e-6, (
-        'installing the transform changed nothing -- it is not reaching the attention'
-    )
-    print(f'  with rotation at the seam: {sum(rotated[:5]) / 5:.4f} -> {sum(rotated[-5:]) / 5:.4f}')
 
 
 # --------------------------------------------------------------------------------------------
 # Finetuning
 # --------------------------------------------------------------------------------------------
 
-def _run_finetuning(transform=None, steps=250, seed=0):
+def _run_finetuning(arm='additive', steps=250, seed=0):
     """Fit the trend-sign task on one fixed simulated cohort."""
     torch.manual_seed(seed)
     batch, labels = _simulate_cohort(n_episodes=32, seed=seed, all_padding_episode=False)
-    model = _build_classifier(transform)
+    model = _build_classifier(arm)
     model.train()
 
     loss_fn = torch.nn.BCEWithLogitsLoss()
@@ -303,18 +291,22 @@ def _run_finetuning(transform=None, steps=250, seed=0):
     return losses, accuracy
 
 
-def test_classifier_learns_a_task_that_needs_the_time_axis():
+def test_both_arms_learn_a_task_that_needs_the_time_axis():
     """The label is the sign of the trend, so a bag of timesteps cannot separate the classes.
 
     Both classes draw from the same marginal distribution of values; only the order differs. An
     encoder whose attention ran across the batch instead of across time -- the bug this stack was
-    rebuilt on top of -- cannot beat chance here.
+    rebuilt on top of -- cannot beat chance here. This says both arms can represent order at all;
+    it is not the arm comparison, which is a question for the real cohort.
     """
-    losses, accuracy = _run_finetuning()
+    for arm in ARMS:
+        losses, accuracy = _run_finetuning(arm)
 
-    assert all(torch.isfinite(torch.tensor(value)) for value in losses), 'finetuning loss went non-finite'
-    assert accuracy > 0.85, f'trend-sign accuracy only reached {accuracy:.2f}'
-    print(f'  trend-sign loss {losses[0]:.4f} -> {losses[-1]:.4f}, accuracy {accuracy:.2f}')
+        assert all(torch.isfinite(torch.tensor(value)) for value in losses), (
+            f'{arm}: finetuning loss went non-finite'
+        )
+        assert accuracy > 0.85, f'{arm}: trend-sign accuracy only reached {accuracy:.2f}'
+        print(f'  {arm:8s} trend-sign loss {losses[0]:.4f} -> {losses[-1]:.4f}, accuracy {accuracy:.2f}')
 
 
 def test_classifier_output_is_finite_for_an_all_padding_episode():
@@ -331,11 +323,39 @@ def test_classifier_output_is_finite_for_an_all_padding_episode():
     assert torch.isfinite(logits).all(), f'an all-padding episode produced {logits.flatten()}'
 
 
-def test_finetuning_runs_with_a_transform_at_the_rotary_seam():
-    losses, accuracy = _run_finetuning(transform=_Rotator())
-    assert all(torch.isfinite(torch.tensor(value)) for value in losses), 'finetuning went non-finite'
-    assert losses[-1] < losses[0], 'the transformed run did not train'
-    print(f'  with rotation at the seam: loss {losses[0]:.4f} -> {losses[-1]:.4f}, accuracy {accuracy:.2f}')
+def test_a_trained_rotary_classifier_ignores_the_time_origin():
+    """Through the whole model, not just the attention: the rotary arm sees gaps and nothing else.
+
+    Shifting an entire admission later on the clock leaves every within-stay gap intact, so the
+    rotary arm must return the same logits. The additive arm must not, because its encoding is a
+    function of absolute time -- and that is the factor the Phase 2 comparison isolates.
+    """
+    shift = 5_000.0
+    logits = {}
+    for arm in ARMS:
+        model = _build_classifier(arm)
+        model.eval()
+        batch, _ = _simulate_cohort(n_episodes=8, seed=4, all_padding_episode=False)
+        # Shifted in float64 so the shift is exact and the encoding is what is under test; the cost
+        # of float32 storage is measured in test_rope_encoding.py.
+        shifted = copy.deepcopy(batch)
+        for stream in ('val_data', 'event_data'):
+            shifted[stream]['times'] = batch[stream]['times'].double() + shift
+        with torch.no_grad():
+            logits[arm] = (
+                model(copy.deepcopy(batch)).squeeze(-1),
+                model(shifted).squeeze(-1),
+            )
+
+    rope_delta = (logits['rope'][0] - logits['rope'][1]).abs().max().item()
+    additive_delta = (logits['additive'][0] - logits['additive'][1]).abs().max().item()
+    print(f'  logit change under a {shift:.0f} h shift: rope {rope_delta:.2e}, additive {additive_delta:.2e}')
+
+    assert rope_delta < 1e-4, f'the rotary arm moved by {rope_delta:.3e} under a shift of the origin'
+    assert additive_delta > 1e-3, (
+        'the additive arm did not move under a shift of the origin -- the two arms no longer '
+        'differ in the way the comparison claims'
+    )
 
 
 if __name__ == '__main__':

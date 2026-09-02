@@ -255,11 +255,10 @@ class MixedDataset(Dataset):
         """Indicator tensor for a feature type the extraction produced no features for.
 
         `load_dataset` substitutes a `(0, 0, 0)` array whenever metadata reports zero features
-        of a type, so the per-episode slice cannot be taken. The replacement still has to be
+        of a type, so the per-episode slice cannot be taken. The replacement must still be
         two-dimensional `(timesteps, features)`: `collate_tensorized` stacks these into
         `(batch, timesteps, features)` and `_gen_val_assoc_feat_mask` unpacks exactly three
-        dimensions. Returning a bare `torch.empty(0)` collates to `(batch, 0)` and raises
-        `not enough values to unpack (expected 3, got 2)` on the first batch.
+        dimensions from the result.
         """
         return torch.zeros((self.ts_len, 0), dtype=torch.float32)
 
@@ -269,29 +268,36 @@ class MixedDataset(Dataset):
         """
         ts_start, ts_end = self.ts_start, self.ts_end
 
-        # Reconstruct dense text embeddings from sparse storage. Sparse timesteps are absolute
-        # indices into the extracted axis, so entries outside the crop window are dropped and
-        # the survivors are shifted into the cropped frame.
-        text_embeddings_dense = []
+        # Text embeddings stay sparse here. Densified to (ts_len, embed_dim) per feature they are
+        # about 99% of the batch by size -- notes are rare against a 550-step axis -- and every
+        # byte crosses the worker boundary and one host-side copy before reaching the GPU.
+        # `densify_text_embeddings` rebuilds the dense form on the device the batch lands on.
+        #
+        # Stored timesteps are absolute indices into the extracted axis, so entries outside the
+        # crop window are dropped and the survivors shifted into the cropped frame.
+        text_embeddings_sparse = []
 
         for f in range(self.n_text_feats):
-            dense_embeds = np.zeros(
-                (self.ts_len, self.text_embed_dim), dtype=np.float32
-            )
-
             start = int(self.val_text_offsets[f][idx])
             end = int(self.val_text_offsets[f][idx + 1])
 
             if end > start and len(self.val_text_embeddings) > f:
-                timesteps = self.val_text_timesteps[f][start:end]
-                embeddings = self.val_text_embeddings[f][start:end]
-
-                for i in range(end - start):
-                    ts = int(timesteps[i])
-                    if ts_start <= ts < ts_end:
-                        dense_embeds[ts - ts_start] = embeddings[i]
-
-            text_embeddings_dense.append(torch.from_numpy(dense_embeds))
+                timesteps = np.asarray(self.val_text_timesteps[f][start:end])
+                keep = (timesteps >= ts_start) & (timesteps < ts_end)
+                # `keep` may select nothing, in which case both tensors are empty and the
+                # feature contributes no rows to the batch. That is the common case.
+                text_embeddings_sparse.append((
+                    torch.from_numpy(
+                        (timesteps[keep] - ts_start).astype(np.int64)),
+                    torch.from_numpy(
+                        np.asarray(self.val_text_embeddings[f][start:end])[keep]
+                        .astype(np.float32, copy=True)),
+                ))
+            else:
+                text_embeddings_sparse.append((
+                    torch.zeros(0, dtype=torch.int64),
+                    torch.zeros((0, self.text_embed_dim), dtype=torch.float32),
+                ))
 
         # Return tensors (copy from mmap)
         return {
@@ -304,7 +310,7 @@ class MixedDataset(Dataset):
             'val_multilabel_indicators': torch.from_numpy(self.val_multilabel_indicators[idx, ts_start:ts_end].copy()) if self.val_multilabel_indicators.size > 0 else self._empty_indicators(),
             'val_multilabel_values': [torch.from_numpy(v[idx, ts_start:ts_end].copy()) for v in self.val_multilabel_values],
             'val_text_indicators': torch.from_numpy(self.val_text_indicators[idx, ts_start:ts_end].copy()),
-            'val_text_embeddings': text_embeddings_dense,
+            'val_text_embeddings': text_embeddings_sparse,
             'val_times': torch.from_numpy(self.val_times[idx, ts_start:ts_end].copy()),
             'val_masks': torch.from_numpy(self.val_masks[idx, ts_start:ts_end].copy()),
             'event_indicators': torch.from_numpy(self.event_indicators[idx, ts_start:ts_end].copy()),
