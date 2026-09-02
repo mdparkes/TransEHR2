@@ -91,6 +91,15 @@ checkpoints/
 # Test configs
 TransEHR2/configs/**/test*.yaml
 
+# Sweep output. generate_tuning_configs.py writes these from the spec, and load_spec resolves
+# the spec's relative paths against the spec's own directory, so the manifest and the generated
+# trial configs carry absolute paths belonging to whichever machine produced them. Regenerate
+# them on the machine that will run the sweep; committing them ships one host's paths and a
+# snapshot of the base config that goes stale the moment the base config is edited.
+TransEHR2/configs/experiments/tuning/phase2/
+TransEHR2/configs/experiments/tuning/phase3/
+TransEHR2/configs/experiments/tuning/*_manifest.yaml
+
 # Test scripts
 # tests/ is tracked: the fix verification probes have to travel with the commits they defend,
 # including to the IBD fork, which takes them by cherry-pick.
