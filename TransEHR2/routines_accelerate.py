@@ -533,6 +533,19 @@ def pretrain_one_epoch(
     train_thp_type_losses = accelerator.gather(torch.tensor(train_thp_type_losses, device=accelerator.device))
     train_thp_time_losses = accelerator.gather(torch.tensor(train_thp_time_losses, device=accelerator.device))
     
+    # The generator term is the only unbounded one in the objective -- numeric features are
+    # scored by squared error, everything else by cross-entropy, BCE or a cosine distance in
+    # [0, 1]. A single step with a large residual therefore moves the epoch mean a long way, and
+    # the mean alone cannot distinguish a uniformly bad epoch from a good one with a few spikes.
+    # Printed for the generator only, since that is where the question arises.
+    if accelerator.is_main_process and train_gen_losses.numel():
+        ordered = train_gen_losses.sort().values
+        print(f"\n  generator loss over {train_gen_losses.numel()} steps: "
+              f"mean {train_gen_losses.mean().item():.4f}, "
+              f"median {ordered[ordered.numel() // 2].item():.4f}, "
+              f"p90 {ordered[int(0.9 * (ordered.numel() - 1))].item():.4f}, "
+              f"max {ordered[-1].item():.4f}", flush=True)
+
     # Compute mean on main process, keep as tensor for broadcast
     if accelerator.is_main_process:
         curr_train_loss = train_losses.mean()
