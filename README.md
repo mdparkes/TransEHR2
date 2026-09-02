@@ -56,6 +56,48 @@ See the `mimic4dataprep` documentation for instructions on how to extract the do
 ## Using TransEHR2
 TransEHR2 includes scripts for extracting MIMIC-IV data that has been prepared by `mimic4dataprep` (`extract_data.py`), hyperparameter tuning (`tune_hyperparameters_accelerate.py`), and executing experiments (`run_experiment_accelerate.py`). An experiment generally consists of pretraining, finetuning, and evaluating TransEHR2's performance on a test set. These scripts rely on configuration files in `TransEHR2/configs/`. Edit them to modify the scripts' parameters. Multi-GPU computing is facilitated by the `Accelerate` library and is configured by `accelerate_config_ddp.yaml` and `accelerate_config_fsdp.yaml`. Use FSDP when inputting text features to the model; this will shard the LLM module across GPUs to relieve memory pressure.
 
+### Re-running an experiment
+
+The training scripts skip work whose output already exists, so a job that
+is requeued after a time limit resumes instead of starting over. The same
+behaviour means that re-running an experiment *deliberately* — after a
+code or configuration change — will silently reuse the previous run's
+results unless its outputs are cleared first.
+
+Everything is keyed on `EXPERIMENT_NAME` from the experiment config, with
+`MODEL_DIR` from the same file. `checkpoints/` and `log/` are relative to
+the working directory the script is launched from.
+
+| Artefact | Path | Effect on a re-run |
+|---|---|---|
+| Pretrained weights | `<MODEL_DIR>/<EXPERIMENT_NAME>/<fold>/pretrained/*.pt` | **Pretraining is skipped entirely.** Any `.pt` in the directory counts; the most recently written is loaded. |
+| Finetuned weights | `<MODEL_DIR>/<EXPERIMENT_NAME>/<fold>/pretrained/finetuned_<task>.pt` | Finetuning is skipped for that task. Evaluation still runs. |
+| Task evaluation | `<MODEL_DIR>/<EXPERIMENT_NAME>/<fold>/<task>/evaluation/evaluation_<task>.yaml` | That task is skipped entirely, finetuning and evaluation both. |
+| Checkpoints | `checkpoints/<EXPERIMENT_NAME>/<fold>/{pretrained,finetuned}/` | Training resumes from the recorded epoch. **Removed automatically when a run completes**, so these are present only after a job was killed. |
+| TensorBoard logs | `log/<EXPERIMENT_NAME>/<fold>/{pretrained,finetuned_<task>}/` | Nothing is skipped, but `SummaryWriter` appends: old and new curves are drawn together at overlapping steps. |
+| Pretraining evaluation | `<MODEL_DIR>/<EXPERIMENT_NAME>/<fold>/pretrained/evaluation/evaluation_pretrained.yaml` | Overwritten. Stale only if pretraining was skipped. |
+
+To re-run an experiment from scratch, remove its model tree and its logs:
+
+```bash
+rm -rf <MODEL_DIR>/<EXPERIMENT_NAME> log/<EXPERIMENT_NAME> checkpoints/<EXPERIMENT_NAME>
+```
+
+`--force_pretrain` and `--force_finetune` retrain without deleting
+anything, which is useful when the previous weights are still wanted.
+They are not equivalent to removing the tree: they overwrite the files a
+run writes, and leave any other `.pt` in the pretrained directory in
+place, where a later run that does not force will find it.
+
+After a job is killed at its time limit, verify what it left before
+requeueing. A checkpoint is what makes the requeue resume, and a
+checkpoint from a superseded configuration is what makes it resume the
+wrong run:
+
+```bash
+ls checkpoints/
+```
+
 ## Reporting results for publication
 
 Three scripts turn finetuned predictions into manuscript tables formatted
