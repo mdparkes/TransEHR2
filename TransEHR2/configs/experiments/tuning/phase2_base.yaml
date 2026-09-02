@@ -36,12 +36,13 @@ PREDICT_INDICATORS: False
 # Both arms run the same frozen ladder, spaced log-uniformly in period between P_MIN and P_MAX.
 # The bounds follow the informative-band criterion 0.1 <= gap/lambda <= pi, which in periods is
 # P_MIN = 2 * gap_min and P_MAX ~ 63 * gap_max.
-#   Value stream: gaps 1 - 125,073 h (history included).  Event stream: 1 - 48 h, in-stay only.
-# CONFIRM VALUE_LADDER_P_MAX against the re-extracted arrays before launching the sweep --
-# 125,073 h is a measured maximum from the pre-re-extraction data, not the 500-step cap.
+#   Value stream: gaps 1 - 127,829 h (history included).  Event stream: 1 - 48 h, in-stay only.
+# 127,829 h is measured on the re-extracted arrays and is a censored maximum, not the 500-step
+# cap. Re-measure and re-derive both bounds after any re-extraction.
 POSITION_ENCODING: 'additive'
 VALUE_LADDER_P_MIN: 2.0
-VALUE_LADDER_P_MAX: 7.9e+6   # yaml 1.1 needs the sign, or this parses as a string
+VALUE_LADDER_P_MAX: 8.05e+6  # 63 x 127,829 h. yaml 1.1 needs the sign, or this parses as a
+                             # string, and a string reaches the ladder builder as a bad bound
 EVENT_LADDER_P_MIN: 2.0
 EVENT_LADDER_P_MAX: 3000.0
 

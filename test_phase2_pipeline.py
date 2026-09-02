@@ -14,9 +14,9 @@ What it checks, in the order it checks it:
 
 2. **Data and the frequency ladder.** Loads the tuning fold and measures the largest temporal
    span the value and event encoders actually see, then checks the configured ladder bounds
-   against it. This is open item 2 in the revision plan: ``VALUE_LADDER_P_MAX: 7.9e+6`` follows
-   from a Δ_max of 125,073 h measured on the *pre*-re-extraction data, and the whole argument
-   for re-spanning collapses if the new arrays disagree.
+   against it. ``VALUE_LADDER_P_MAX: 8.05e+6`` follows from a Δ_max of 127,829 h measured on
+   the extracted arrays, so the check fails whenever a re-extraction moves that span and the
+   bound has not been re-derived.
 
 3. **Memory.** Runs two batches of pretraining at the real batch size for each encoding arm and
    reports peak VRAM. Single-GPU packing is a premise of the entire phase, not a measurement,
@@ -364,10 +364,9 @@ def run_stage_data(args, report, base_config):
                 f"configured {float(p_max):.3g} h, but 63 x the measured max span "
                 f"({measured['max_span']:,.0f} h) is {required_p_max:.3g} h -- a factor of "
                 f"{ratio:.2g} out.\n"
-                f"The configured bound was derived from a max gap of 125,073 h measured on "
-                f"the data as it stood BEFORE re-extraction. If the re-extracted arrays "
-                f"disagree, update {p_max_key} in the base config before generating the "
-                f"sweep: the whole argument for re-spanning rests on this number."
+                f"The configured bound is derived from the largest gap in the extracted "
+                f"arrays, so a re-extraction moves it. Re-derive {p_max_key} as 63 x the span "
+                f"above and update the base config before generating the sweep."
             )
 
         # P_MIN = 2 x the finest resolution. Below that the fastest band aliases.

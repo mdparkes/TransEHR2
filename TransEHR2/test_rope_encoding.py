@@ -41,9 +41,11 @@ D_MODEL = 256
 N_HEADS = 2
 THP_D_K = 128
 
-# Ladder bounds from the plan: P_min = 2 * delta_min, P_max = 63 * delta_max.
-VALUE_GAP_MAX = 125_073.0
-VALUE_P_MIN, VALUE_P_MAX = 2.0, 7.9e6
+# Ladder bounds from the plan: P_min = 2 * delta_min, P_max = 63 * delta_max. The value gap
+# maximum is measured on the extracted arrays and is censored by MAX_HISTORY_LEN_STEPS, so it
+# moves with a re-extraction; P_max has to be re-derived when it does.
+VALUE_GAP_MAX = 127_829.0
+VALUE_P_MIN, VALUE_P_MAX = 2.0, 8.05e6
 EVENT_P_MIN, EVENT_P_MAX = 2.0, 3000.0
 
 # Small shapes for the end-to-end probes.
@@ -584,7 +586,7 @@ def test_every_construction_site_takes_the_encoding_arm():
 
 
 def test_the_shipped_tuning_config_parses_to_numbers():
-    """YAML 1.1 reads `7.9e6` as a string -- the exponent needs an explicit sign.
+    """YAML 1.1 reads `8.05e6` as a string -- the exponent needs an explicit sign.
 
     A string reaches `build_frequency_ladder` and compares against a float, so the failure is a
     TypeError inside model construction with nothing pointing at the config file.

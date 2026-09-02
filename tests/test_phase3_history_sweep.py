@@ -144,7 +144,7 @@ def test_ablation_puts_the_event_stream_on_the_value_ladder(sweep):
     """Direction check.
 
     The differentiated event ladder is already the default -- EVENT_LADDER_P_MAX = 3000 against
-    the value stream's 7.9e6, asserted band-for-band in TransEHR2/test_rope_encoding.py. So the
+    the value stream's 8.05e6, asserted band-for-band in TransEHR2/test_rope_encoding.py. So the
     missing half of the comparison is the *shared* ladder, and that is what the ablation must
     run. Getting this backwards would run the default twice and measure nothing.
     """
