@@ -63,7 +63,7 @@ GRID:
 
   # 0.002 is not in the grid. Held for a full run it diverged in nine of the fourteen trials
   # that carried it, in both arms and under four different hyperparameters, while none of the
-  # eight trials at a lower sustained rate diverged. The centre has to be stable for an
+  # seven trials at a lower sustained rate that ran to completion diverged. The centre has to be stable for an
   # additive sweep to mean anything, because every other arm inherits it.
   #
   # The replacement spans a decade in half-decade steps around a centre that did not diverge.
