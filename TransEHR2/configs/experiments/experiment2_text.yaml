@@ -79,3 +79,10 @@ CMPNT_MASK_RATIO: 0.25
 FINETUNE_LEARNING_RATE: 0.0002
 FINETUNE_TOTAL_EPOCH: 500
 FINETUNE_LEARNING_RATE_DECAY: 0.9
+
+# Tasks whose binary cross entropy weights the positive term by the ratio of negatives to
+# positives over the training split, so that the two classes contribute equally. Applies to
+# the validation loss as well, which early stopping selects on. Phenotyping is excluded: it
+# is multi-label, and a per-label weight there ranks rare labels above common ones.
+FINETUNE_POS_WEIGHT_TASKS:
+  - mortality
