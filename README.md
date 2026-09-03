@@ -91,7 +91,7 @@ place, where a later run that does not force will find it.
 
 After a job is killed at its time limit, verify what it left before
 requeueing. A checkpoint is what makes the requeue resume, and a
-checkpoint from a superseded configuration is what makes it resume the
+checkpoint from a superseded configuration makes it resume the
 wrong run:
 
 ```bash
@@ -137,10 +137,6 @@ split is also required for the two classification tasks, because that is
 where the decision threshold is calibrated. Length of stay needs only
 `test`, and the reporting scripts never read the `train` split. Use
 `--split` to report a split other than `test`.
-
-**Every experiment in one table must share the same folds.** The
-statistical test is paired on folds, so the scripts refuse to run if the
-fold counts differ. Use `--folds` to restrict to a common set.
 
 **Install the dependencies.** Reporting adds `python-docx` to
 `requirements.txt`:
@@ -217,19 +213,6 @@ and adjusted P value:
 python report_mortality.py --experiments 3 9 1 2 7 --control 3 \
     --stats-csv stats/table1_mortality.csv --quiet
 ```
-
-### Reading the output
-
-
-Column headings are abbreviated on screen only, with a legend above the
-table, so that a five-column table still fits a terminal; the Word output
-always carries the full headings. The **statistical detail** block holds
-what the table omits, and `--quiet` suppresses it. The **folds used**
-block records which folds were found and which thresholds were chosen —
-worth checking whenever a number looks surprising.
-
-Column headings come from `reporting_labels.yaml`. Edit that file, or
-point `--labels` at another one, to change how a model is described.
 
 ### Statistical comparisons
 
