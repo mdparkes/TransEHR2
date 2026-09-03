@@ -98,26 +98,6 @@ wrong run:
 ls checkpoints/
 ```
 
-## Reporting results for publication
-
-Three scripts turn finetuned predictions into manuscript tables formatted
-according to JMIR Publications' [Guidelines for Reporting
-Statistics](https://support.jmir.org/hc/en-us/articles/360019690851-Guidelines-for-Reporting-Statistics)
-and [table house
-style](https://support.jmir.org/hc/en-us/articles/115004167607-How-should-tables-and-textboxes-be-formatted):
-
-| Script | Prediction task | Metrics |
-|---|---|---|
-| `report_mortality.py` | In-hospital mortality | Binary classification |
-| `report_length_of_stay.py` | Length of stay | Regression |
-| `report_phenotype.py` | Diagnosis / phenotype | Multi-label classification, micro- and macro-averaged |
-
-Each one prints its table to stdout and, given `--output`, writes it as a
-real Word table that can be pasted straight into the manuscript. Each
-also runs the statistical comparisons against a control model that you
-nominate, so a table and its P values are always produced together from
-the same numbers.
-
 ### Before you start
 
 **Predictions must already be dumped.** The reporting scripts read the
@@ -228,7 +208,7 @@ python report_phenotype.py --experiments 3 9 1 2 7 --control 3 \
     --output tables/sensitivity_fixed_threshold.docx --append
 ```
 
-**5. Keep the full statistics for the response to reviewers.** The Word
+**5. Keep the full statistics.** The Word
 table carries P values only. `--stats-csv` writes every per-fold value,
 mean difference, *t* statistic, degrees of freedom, and both unadjusted
 and adjusted P value:
@@ -237,12 +217,6 @@ and adjusted P value:
 python report_mortality.py --experiments 3 9 1 2 7 --control 3 \
     --stats-csv stats/table1_mortality.csv --quiet
 ```
-
-**6. Paste the tables into the manuscript.** JMIR requires tables to live
-in the manuscript's own Word file, built with the Word table function,
-each placed just after its first mention in the text. Copy each table and
-its caption and footnotes out of the generated document rather than
-submitting the generated document itself.
 
 ### Reading the output
 
@@ -350,24 +324,6 @@ labels, whose calibration split holds few positive examples.
 
 AUROC and AUPRC are threshold-free and are unaffected by any of this.
 
-### JMIR formatting applied automatically
-
-- Cells read `0.845 (SE 0.004; P=.03)` — the variability statistic is
-  named rather than implied by a `±` sign, and the semicolon separates
-  unrelated statistics.
-- P values carry no leading zero, take 2 decimal places, and take 3 when
-  `P<.01` or when rounding would cross the significance level (`P=.048`).
-  A P value is never reported as 0 or 1: `P<.001` and `P>.99` are used.
-- Footnote markers are superscript letters, not asterisks tied to
-  significance levels.
-- Column and row headings are in sentence case, with units separated by a
-  comma ("Mean absolute error, hours").
-- Category headings ("Microaverages", "Macroaverages") are bold and
-  merged with the subcategory column, so subcategories appear indented.
-- *F*₁-score is set with an italic *F* and a subscript 1.
-- Negative values use an en dash.
-- The header row repeats when a table breaks across pages.
-
 ### Option reference
 
 Common to all three scripts:
@@ -417,23 +373,3 @@ Classification tasks only (`report_mortality.py`, `report_phenotype.py`):
 | `Experiment number N is ambiguous` | Two directories match `experimentN_*`. Rename one. |
 | `Unknown metric(s): ...` | A `--metrics` key is not defined for that task. Use `--list-metrics` to see the valid keys. |
 | `has no metric 'KEY'` | The dump for one experiment is incomplete, so a metric other experiments have is missing. Re-dump that experiment. |
-
-### Relationship to the older scripts
-
-`evaluate_finetuned_predictions.py` still writes the `*_evaluation.yaml`
-summaries and is unchanged; use it when all you want is per-fold metrics
-at a fixed threshold. The reporting scripts recompute those metrics from
-the same prediction CSVs, using identical formulas, so the two agree at
-the same threshold — with one exception: the concordance index is
-computed from Kendall's tau rather than by enumerating pairs, which is
-the same quantity in O(*n* log *n*) instead of O(*n*²).
-
-`t_tests.R` is superseded. It used an unpaired Student *t* test on values
-read from the YAMLs; the reporting scripts use the paired corrected
-resampled test and apply a false discovery rate correction.
-
-Tests for the reporting code:
-
-```shell
-python -m pytest tests/test_jmir_reporting.py
-```
