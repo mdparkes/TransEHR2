@@ -124,7 +124,7 @@ THP_LOSS_NLL_WEIGHT: 0.01
 THP_PRED_LOSS_TYPE_WT: 1.0
 
 # --- Tuned: the first value of each grid, i.e. the centre of the sweep ---------------------
-PRETRAIN_LEARNING_RATE: 0.002
+PRETRAIN_LEARNING_RATE: 0.0002
 PRETRAIN_LEARNING_RATE_DECAY: 0.90
 CMPNT_MASK_RATIO: 0.25
 RECORD_MASK_RATIO: 0.15
