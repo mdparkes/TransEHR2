@@ -28,6 +28,7 @@ from TransEHR2.modules import EventDataEncoder, ValueDataEncoder
 from TransEHR2.routines_accelerate import pretrain_model, finetune_model, evaluate_finetuned_model
 from TransEHR2.routines_accelerate import reshape_flattened_state_dict
 from TransEHR2.utils import create_timer, convert_to_python_types, format_finetuning_performance_table, get_param_shapes
+from TransEHR2.utils import positive_class_weight
 
 
 def initialize_accelerator(use_text: bool) -> Accelerator:
@@ -224,6 +225,11 @@ if __name__ == "__main__":
     FINETUNE_LEARNING_RATE = experiment_config.get('FINETUNE_LEARNING_RATE', 2e-4)
     FINETUNE_TOTAL_EPOCH = experiment_config.get('FINETUNE_TOTAL_EPOCH', 500)
     FINETUNE_LEARNING_RATE_DECAY = experiment_config.get('FINETUNE_LEARNING_RATE_DECAY', 0.9)
+    # Tasks whose loss weights the positive term by the inverse prevalence of the positive
+    # class. Single-label only by default: under a multi-label task the same weighting
+    # ranks rare labels above common ones, which is a modelling stance, not a correction.
+    FINETUNE_POS_WEIGHT_TASKS = tuple(
+        experiment_config.get('FINETUNE_POS_WEIGHT_TASKS', ['mortality']))
     USE_HISTORICAL_RECORDS = experiment_config.get('USE_HISTORICAL_RECORDS', True)
     # Runtime sequence-length caps. None uses everything that was extracted; smaller values crop
     # at load time, which is equivalent to re-extracting with the shorter limit.
@@ -666,7 +672,8 @@ if __name__ == "__main__":
                         total_epoch=FINETUNE_TOTAL_EPOCH,
                         checkpoint_dir=checkpoint_dir,
                         accelerator=accelerator,
-                        mem_test_mode=mem_test_mode
+                        mem_test_mode=mem_test_mode,
+                        pos_weight_tasks=FINETUNE_POS_WEIGHT_TASKS
                     )
                 except Exception as e:
                     if accelerator.is_main_process:
@@ -767,12 +774,19 @@ if __name__ == "__main__":
             # Prepare the model and dataloader with Accelerator and evaluate on test set
             downstream_predictor = accelerator.prepare(downstream_predictor)
             accelerator.wait_for_everyone()
+            # Recomputed from the training split, so the reported test loss is on the same
+            # scale as the train and validation losses beside it in the results table.
+            test_pos_weight = None
+            if task in FINETUNE_POS_WEIGHT_TASKS:
+                test_pos_weight = positive_class_weight(train_loader.dataset, task)
+
             best_test_scores = evaluate_finetuned_model(
                 model=downstream_predictor,
                 loader=test_loader,
                 task=task,
                 accelerator=accelerator,
-                mem_test_mode=mem_test_mode
+                mem_test_mode=mem_test_mode,
+                pos_weight=test_pos_weight
             )
 
 

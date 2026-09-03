@@ -18,13 +18,14 @@ from torch import Tensor
 from torch.distributed.fsdp import FullStateDictConfig, StateDictType
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from tqdm import tqdm
-from typing import Any, Dict, List, Optional, OrderedDict, Tuple, TypeAlias
+from typing import Any, Dict, List, Optional, OrderedDict, Sequence, Tuple, TypeAlias
 
 from TransEHR2.losses import MaskedDiscriminatorLoss, MaskedGeneratorLoss, TransformerHawkesLoss
 from TransEHR2.models import MixedClassifier
 from TransEHR2.utils import DistributedTimer
 from TransEHR2.utils import format_pretraining_performance_table, generate_record_masks, get_param_shapes
 from TransEHR2.utils import print_peak_memory, move_batch_to_device
+from TransEHR2.utils import positive_class_weight, describe_class_weights
 from TransEHR2.utils import NullStepProfiler, StepProfiler, report_epoch_timing
 from TransEHR2.utils import describe_loss_spike
 
@@ -863,7 +864,8 @@ def evaluate_finetuned_model(
     prefix: str = '',
     global_step: int = 0,
     writer: Optional[torch.utils.tensorboard.SummaryWriter] = None,
-    mem_test_mode: bool = False
+    mem_test_mode: bool = False,
+    pos_weight: Optional[Tensor] = None
 ) -> Dict[str, Any]:
     """Evaluates model performance for different tasks with Accelerate support.
 
@@ -876,6 +878,9 @@ def evaluate_finetuned_model(
         global_step: Current training step
         writer: TensorBoard SummaryWriter object for logging
         mem_test_mode: If True, runs only one batch for memory testing
+        pos_weight: Weight applied to the positive term of the binary cross entropy, for a
+            binary task. Must match the weight the model was trained under; a model selected
+            on one objective and trained on another is selected for the wrong thing.
 
     Returns:
         Task-specific losses and performance metrics
@@ -887,6 +892,9 @@ def evaluate_finetuned_model(
         raise ValueError(f'task: Expected one of "mortality", "length_of_stay", or "phenotype", got {task}')
     
     model.eval()
+
+    if pos_weight is not None:
+        pos_weight = pos_weight.to(accelerator.device)
 
     # Accumulate predictions, targets, and losses locally on each rank
     val_preds = []
@@ -909,7 +917,8 @@ def evaluate_finetuned_model(
             # Calculate and store loss and predictions
             targets = batch['targets'][task]
             if task == 'mortality' or task == 'phenotype':
-                loss = torch.nn.functional.binary_cross_entropy_with_logits(logits, targets)
+                loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                    logits, targets, pos_weight=pos_weight)
                 preds = torch.sigmoid(logits).detach()
             else:
                 loss = torch.nn.functional.mse_loss(logits, targets)
@@ -1351,7 +1360,8 @@ def finetune_model(
     resume_from_checkpoint: bool = True,
     timer: Optional[DistributedTimer] = None,
     accelerator: Accelerator = None,
-    mem_test_mode: bool = False
+    mem_test_mode: bool = False,
+    pos_weight_tasks: Sequence[str] = ('mortality',)
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Fine-tune a pretrained model with Accelerate support (FSDP or DDP).
     
@@ -1370,6 +1380,15 @@ def finetune_model(
         accelerator: Accelerator instance for distributed training
         mem_test_mode: If True, runs the forward and backward passes on a single batch and reports memory usage. Useful
             for figuring out batch size limits.
+        pos_weight_tasks: Tasks whose binary cross entropy weights the positive term by the
+            inverse prevalence of the positive class, so that the two classes contribute
+            equally to the loss. Applies to the validation loss as well, because early
+            stopping selects on it and selection must target what training optimises.
+
+            Only sensible for a single-label task. Under a multi-label task the same
+            weighting expresses a preference for correctly classifying rare labels over
+            common ones, which is a modelling stance rather than a correction, so
+            'phenotype' is not included by default.
     
     Returns:
         Tuple of (best_train_scores, best_val_scores) dictionaries
@@ -1398,6 +1417,17 @@ def finetune_model(
         train_loader, val_loader, _ = loaders
     else:
         raise ValueError(f'`loaders` must be a tuple with 2 (train, val) or 3 members (train, val, test)')
+
+    # Taken from the dataset, not the loader: the prevalence of the positive class is a
+    # property of the training split, and reading it here keeps it identical on every rank
+    # and independent of how episodes fall into batches.
+    pos_weight = None
+    if task in pos_weight_tasks:
+        pos_weight = positive_class_weight(train_loader.dataset, task)
+        if accelerator.is_main_process:
+            print(describe_class_weights(pos_weight, task, train_loader.dataset), flush=True)
+    if pos_weight is not None:
+        pos_weight = pos_weight.to(accelerator.device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=learning_rate_decay)
@@ -1474,7 +1504,8 @@ def finetune_model(
         
             targets = batch['targets'][task]
             if task == 'mortality' or task == 'phenotype':
-                loss = torch.nn.functional.binary_cross_entropy_with_logits(logits, targets)
+                loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                    logits, targets, pos_weight=pos_weight)
                 preds = torch.sigmoid(logits).detach()
             else:
                 loss = torch.nn.functional.mse_loss(logits, targets)
@@ -1548,7 +1579,8 @@ def finetune_model(
             global_step=(epoch + 1),
             prefix='val',
             writer=writer,
-            mem_test_mode=mem_test_mode
+            mem_test_mode=mem_test_mode,
+            pos_weight=pos_weight
         )
 
         # Check for improvement

@@ -1104,6 +1104,71 @@ class StepProfiler:
 # Prefix of the machine-readable timing line. test_phase2_pipeline.py parses it to size the
 # --time request for the real sweep, so the format is a contract: changing it silently returns
 # that estimate to whole-process wall time, which overstates a short run enormously.
+BINARY_TASKS = ('mortality', 'phenotype')
+
+
+def positive_class_weight(dataset, task: str) -> Optional[Tensor]:
+    """The BCE `pos_weight` that makes the positive class count for as much as the negative.
+
+    For a label whose prevalence among the training episodes is p, positives are outnumbered
+    (1 - p) / p to one. Weighting each positive term by that ratio equalises the total
+    contribution of the two classes, so a model is no longer rewarded for predicting the
+    majority class everywhere.
+
+    `binary_cross_entropy_with_logits` applies the weight to the positive term only:
+
+        loss = -[ w * y * log(sigmoid(x)) + (1 - y) * log(1 - sigmoid(x)) ]
+
+    Counts come from the dataset arrays rather than from a loader, so the weight does not
+    depend on how episodes are distributed across ranks or on the batch composition.
+
+    Args:
+        dataset: The training dataset, carrying `mortality` (n,) or `phenotype` (n, labels).
+        task: One of 'mortality' or 'phenotype'. Anything else returns None.
+
+    Returns:
+        A 1-D tensor broadcastable against the targets, or None when the task is not binary
+        or the counts do not support a weight. A label with no positives or no negatives
+        keeps a weight of 1.0: the ratio is undefined there, and substituting a large number
+        would let a label the model cannot learn dominate the gradient.
+    """
+    if task not in BINARY_TASKS:
+        return None
+
+    labels = getattr(dataset, task, None)
+    if labels is None:
+        return None
+
+    labels = np.asarray(labels)
+    if labels.ndim == 1:
+        labels = labels[:, None]
+    positives = np.count_nonzero(labels > 0.5, axis=0).astype(np.float64)
+    negatives = labels.shape[0] - positives
+
+    weights = np.ones_like(positives)
+    usable = (positives > 0) & (negatives > 0)
+    weights[usable] = negatives[usable] / positives[usable]
+    return torch.from_numpy(weights).float()
+
+
+def describe_class_weights(weights: Optional[Tensor], task: str, dataset) -> str:
+    """One line per run recording what the weighting is doing, for the log."""
+    if weights is None:
+        return f'{task}: unweighted loss'
+    labels = np.asarray(getattr(dataset, task))
+    if labels.ndim == 1:
+        labels = labels[:, None]
+    prevalence = np.count_nonzero(labels > 0.5, axis=0) / max(labels.shape[0], 1)
+    values = weights.tolist()
+    if len(values) == 1:
+        return (f'{task}: pos_weight {values[0]:.3f} '
+                f'(prevalence {prevalence[0]:.4f} over {labels.shape[0]:,} episodes)')
+    return (f'{task}: pos_weight over {len(values)} labels, '
+            f'min {min(values):.3f} / median {float(np.median(values)):.3f} / '
+            f'max {max(values):.3f} '
+            f'(prevalence {prevalence.min():.4f} to {prevalence.max():.4f})')
+
+
 EPOCH_TIMING_PREFIX = 'PRETRAIN_EPOCH_SECONDS'
 STARTUP_TIMING_PREFIX = 'PRETRAIN_STARTUP_SECONDS'
 
