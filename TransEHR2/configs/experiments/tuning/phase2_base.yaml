@@ -93,6 +93,21 @@ FINETUNE_LEARNING_RATE: 0.0002
 FINETUNE_TOTAL_EPOCH: 500
 FINETUNE_LEARNING_RATE_DECAY: 0.9
 
+# Tasks whose binary cross entropy weights the positive term by the ratio of negatives to
+# positives, measured over the training split, so that the two classes contribute equally.
+# Deaths are roughly one episode in ten, and an unweighted loss over that split rewards
+# predicting survival everywhere.
+#
+# The weighting applies to the validation loss as well. Early stopping selects on it, and
+# selecting on an objective other than the one being optimised selects for the wrong thing.
+#
+# Phenotyping is excluded. It is multi-label, so the same rule sets a separate weight per
+# label, and a label at 2% prevalence is then weighted fifty times one at 50%. That ranks
+# rare labels above common ones, which is a statement about what the model should be good at
+# rather than a correction for imbalance.
+FINETUNE_POS_WEIGHT_TASKS:
+  - mortality
+
 DISC_LOSS_WEIGHT: 1.0
 
 USE_THP_PRED_LOSS: True
