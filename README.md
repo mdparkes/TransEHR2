@@ -149,7 +149,7 @@ fold counts differ. Use `--folds` to restrict to a common set.
 pip install -r requirements.txt
 ```
 
-### Step by step: rebuilding the manuscript tables
+### Step by step: tabulating results
 
 **1. Decide the columns and the control.** Experiment numbers are given
 in the order their columns should appear, left to right, and one of them
@@ -220,35 +220,6 @@ python report_mortality.py --experiments 3 9 1 2 7 --control 3 \
 
 ### Reading the output
 
-```
-Table 1. In-hospital mortality evaluation results.
-
-Columns:
-  Expt 3 (control) = In-stay records only, 1B parameter LLM
-  Expt 9 = Historical records only, text features, 1B parameter LLM
-  Expt 1 = Historical + in-stay records, no text features, 1B parameter LLM
-
-Metric[a,b,c]              Expt 3 (control)  Expt 9                    Expt 1
------------------------------------------------------------------------------
-Accuracy                   0.742 (SE 0.006)  0.705 (SE 0.004; P=.005)  0.745 (SE 0.004; P=.86)
-F1-score                   0.386 (SE 0.009)  0.291 (SE 0.005; P=.008)  0.393 (SE 0.007; P=.86)
-...
-
-a)  Values are the mean across the 5 cross-validation folds, ...
-b)  P values are from 2-tailed corrected resampled t tests against ...
-c)  Within each fold the decision threshold was set on the val split ...
-
-Statistical detail (corrected resampled t tests versus experiment 3)
-==============================================================================
-Metric                       Expt   Difference        t (df)           P   P adjusted
--------------------------------------------------------------------------------------
-accuracy                        9      –0.0432     –7.73 (4)      P=.002        P=.04
-accuracy                        1       0.0028      0.51 (4)       P=.64        P=.86
-...
-
-Folds used:
-  experiment 3 (experiment3_nohistory): fold1, ..., fold5; threshold median 0.377, range 0.366-0.381
-```
 
 Column headings are abbreviated on screen only, with a legend above the
 table, so that a five-column table still fits a terminal; the Word output
@@ -263,7 +234,7 @@ point `--labels` at another one, to change how a model is described.
 ### Statistical comparisons
 
 Models are compared with the **corrected resampled *t* test** of [Nadeau
-and Bengio (2003)](https://doi.org/10.1023/A:1024068626366) rather than a
+and Bengio (2003)](https://doi.org/10.1023/A:1024068626366), paired on folds, rather than a
 Student *t* test. Because the training sets of the folds overlap, the
 per-fold performance estimates are positively correlated and their sample
 variance underestimates the variance of the mean difference. The
@@ -276,25 +247,13 @@ t = mean(d) / sqrt((1/n + n_test/n_train) * var(d, ddof=1))
 
 on *n* − 1 degrees of freedom, where *d* holds the per-fold differences.
 Without repeated folds, the **fixed adjustment** applies: for one run of
-*k*-fold cross-validation, `n_test/n_train = 1/(k − 1)`. At *k* = 5 the
-multiplier is 1/5 + 1/4 = 0.45 against 1/5 for the uncorrected paired
-test, so the standard error is inflated by a factor of 1.5.
-
-Note that this test is *paired* on folds, whereas `t_tests.R` used an
-unpaired two-sample test. Switching changes P values in **both**
-directions: the pairing recovers power where fold-to-fold variation is
-large and shared, while the variance inflation and the drop from 8 to 4
-degrees of freedom cost power elsewhere. Expect to rewrite the Results
-text in both directions, not just to soften it.
+*k*-fold cross-validation, `n_test/n_train = 1/(k − 1)`.
 
 P values are adjusted for multiple comparisons with the
 Benjamini-Hochberg procedure. `--fdr-scope` selects the family: `table`
 (the default: every comparison in the table), `row` (the comparisons
 within one metric), or `none`. `--show-raw-p` reports the unadjusted
 value alongside the adjusted one.
-
-Prevalence gets no P value. It is a property of the data split, identical
-in every column, and a P value can never equal 1; a footnote says so.
 
 ### Decision thresholds
 
