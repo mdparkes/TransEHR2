@@ -61,10 +61,12 @@ ALIASES:
 # why seven of the eleven trials per arm are also finetuned.
 GRID:
 
-  # 0.002 is not in the grid. Held for a full run it diverged in nine of the fourteen trials
-  # that carried it, in both arms and under four different hyperparameters, while none of the
-  # seven trials at a lower sustained rate that ran to completion diverged. The centre has to be stable for an
-  # additive sweep to mean anything, because every other arm inherits it.
+  # 0.002 is not in the grid. Nine of the eighteen trials that carried it diverged, spanning
+  # both encoding arms and four hyperparameters, and none of the three completed trials at a
+  # lower rate did. That association is suggestive rather than decisive: the decay arm does not
+  # separate from 0.002 here, because the schedule steps only every fifty epochs and a run that
+  # stops earlier never decays at all. The centre has to be stable regardless -- an additive
+  # sweep measures every hyperparameter against it, so instability there reaches all five.
   #
   # The replacement spans a decade in half-decade steps around a centre that did not diverge.
   # A divergence inside this arm is self-limiting: it reaches no other trial, because the other
