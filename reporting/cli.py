@@ -6,7 +6,7 @@ differ in which metrics they report and how those metrics are grouped.
 Everything the three have in common lives here: argument parsing,
 resolving experiment numbers to column headings, running the corrected
 resampled t tests, controlling the false discovery rate, and assembling
-the result into a :class:`~jmir_reporting.tables.Table`.
+the result into a :class:`~reporting.jmir.tables.Table`.
 """
 
 import argparse
@@ -19,10 +19,10 @@ import numpy as np
 import yaml
 
 from .evaluation import evaluate_experiment
-from .formatting import fmt_cell, fmt_number, fmt_p_value, fmt_t_statistic
+from .jmir.formatting import fmt_cell, fmt_number, fmt_p_value, fmt_t_statistic
 from .stats import (benjamini_hochberg, corrected_resampled_ttest,
                     mean_of_folds, standard_error_of_mean)
-from .tables import Table, build_document, render_text, strip_markup
+from .jmir.tables import Table, build_document, render_text, strip_markup
 
 DEFAULT_LABEL_FILE = 'reporting_labels.yaml'
 
@@ -34,7 +34,7 @@ class MetricSpec:
 
     Attributes:
         key: The metric name as produced by
-            :mod:`jmir_reporting.evaluation`.
+            :mod:`reporting.evaluation`.
         label: The row heading, in sentence case, which may contain
             inline markup.
         level: ``0`` for a top-level row, ``1`` for a row beneath a
@@ -306,7 +306,7 @@ def column_heading(number, labels, result):
     Args:
         number: The experiment number.
         labels: Mapping from number to heading.
-        result: The :class:`~jmir_reporting.evaluation.ExperimentResult`,
+        result: The :class:`~reporting.evaluation.ExperimentResult`,
             used as a fallback.
 
     Returns:
@@ -330,7 +330,7 @@ class Comparison:
         mean: Mean across folds.
         se: Standard error of the mean.
         folds: Per-fold values.
-        test: The :class:`~jmir_reporting.stats.TestResult`, or ``None``
+        test: The :class:`~reporting.stats.TestResult`, or ``None``
             for the control column and for non-comparable metrics.
         p_adjusted: The false-discovery-rate-adjusted P value, or
             ``None``.
@@ -363,7 +363,7 @@ def compare_experiments(results, order, control, metric_specs, fdr_scope):
 
     Args:
         results: Mapping from experiment number to
-            :class:`~jmir_reporting.evaluation.ExperimentResult`.
+            :class:`~reporting.evaluation.ExperimentResult`.
         order: Experiment numbers in column order.
         control: The control experiment number.
         metric_specs: The :class:`MetricSpec` objects to report.
@@ -430,14 +430,14 @@ def build_table(args, results, order, control, specs, labels,
                 threshold_note=None):
     """Assemble the manuscript table.
 
-    Footnotes are registered in the order JMIR requires, which is left to
+    Footnotes are registered in the order the house style requires, which is left to
     right and then top to bottom: the notes attached to the stub heading
     come first, then any note attached to a row further down.
 
     Args:
         args: The parsed arguments.
         results: Mapping from experiment number to
-            :class:`~jmir_reporting.evaluation.ExperimentResult`.
+            :class:`~reporting.evaluation.ExperimentResult`.
         order: Experiment numbers in column order.
         control: The control experiment number.
         specs: A sequence of :class:`MetricSpec` and :class:`CategorySpec`
@@ -591,7 +591,7 @@ def print_statistical_detail(comparisons, order, control, metric_specs,
         control: The control experiment number.
         metric_specs: The reported :class:`MetricSpec` objects.
         results: Mapping from experiment number to
-            :class:`~jmir_reporting.evaluation.ExperimentResult`.
+            :class:`~reporting.evaluation.ExperimentResult`.
         alpha: Significance level.
     """
     print()
@@ -644,7 +644,7 @@ def write_stats_csv(path, comparisons, order, control, metric_specs,
         control: The control experiment number.
         metric_specs: The reported :class:`MetricSpec` objects.
         results: Mapping from experiment number to
-            :class:`~jmir_reporting.evaluation.ExperimentResult`.
+            :class:`~reporting.evaluation.ExperimentResult`.
 
     Returns:
         The path written.
@@ -843,7 +843,7 @@ def describe_threshold(args, results):
     Args:
         args: The parsed arguments.
         results: Mapping from experiment number to
-            :class:`~jmir_reporting.evaluation.ExperimentResult`.
+            :class:`~reporting.evaluation.ExperimentResult`.
 
     Returns:
         The sentence, or ``None`` when the task has no threshold.

@@ -1,6 +1,6 @@
 # Column headings for the manuscript tables, keyed by experiment number.
 #
-# Headings are written in sentence case, as JMIR requires, with acronyms
+# Headings are written in sentence case, as the house style requires, with acronyms
 # and model sizes left capitalised. Override with --labels PATH.
 #
 # Experiment descriptions (see experiment_descriptions.md):

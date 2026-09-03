@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Report diagnosis (phenotype) prediction results in JMIR table format.
+"""Report diagnosis (phenotype) prediction results as a formatted table.
 
 Reads the per-fold prediction CSVs written by
 ``dump_finetuned_predictions.py``, computes micro- and macro-averaged
@@ -27,7 +27,7 @@ Usage:
 
 import sys
 
-from jmir_reporting.cli import (F1_LABEL, CategorySpec, MetricSpec,
+from reporting.cli import (F1_LABEL, CategorySpec, MetricSpec,
                                 build_parser, describe_threshold, run)
 
 TASK = 'phenotype'

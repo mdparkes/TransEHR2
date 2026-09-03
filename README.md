@@ -6,7 +6,13 @@ TransEHR, originally presented by [Xu *et al.*](https://proceedings.mlr.press/v2
 
 TransEHR consists of a generator network, a discriminator network, and a transformer Hawkes process network. During self-supervised pre-training, the generator learns to simulate the values of randomly masked records. The discriminator network learns to identify which records are simulated and which ones are original. The transformer Hawkes process learns the temporal dynamics of different types of features captured in the medical records. TransEHR is pretrained to minimize the sum of losses from these three networks. Finetuning is fully supervised and aims to maximize performance on a given downstream prediction task.
 
-TransEHR2 improves upon the original TransEHR model. It supports additional data types for input, namely: vector-valued features, categorical features, and text. In contrast, the original TransEHR model only supported scalar value-associated features. TransEHR2 also distinguishes between records collected before and after a reference time. For example, it can be set up to distinguish between medical records collected before and after admission to ICU. TransEHR can thus leverage information that only appears in antecedent records, such as discharge summaries from previous hospitalizations. Whereas TransEHR was originally evaluated on MIMIC-III data (among other datasets), TransEHR2 is set up to work with MIMIC-IV. TransEHR2 also corrects known errors in Xu *et al.*'s loss calculations for the transformer Hawkes process. It also supports cross-validation, which was not implemented in Xu *et al.*'s code.
+TransEHR2 improves upon the original TransEHR model:
+
+- It supports vector-valued, categorical and text features, where the original supported only scalar value-associated features.
+- It distinguishes between records collected before and after a reference time, so it can use information that appears only in antecedent records, such as discharge summaries from previous hospitalizations.
+- It is set up to work with MIMIC-IV, where the original was evaluated on MIMIC-III among other datasets.
+- It corrects known errors in Xu *et al.*'s loss calculations for the transformer Hawkes process.
+- It supports cross-validation, which was not implemented in Xu *et al.*'s code.
 
 ## Installation
 
@@ -27,10 +33,10 @@ pip install -r requirements.txt
 deactivate
 ```
 
-
-If you intend to use text features, you will require authorization to use Meta's Llama model. TransEHR2 uses HuggingFace to obtain the Llama module, and the exact version is specified in `TransEHR2/constants.py`. You must have an authorization token to use the model. TransEHR2 assumes that the authorization token is stored in a .env file at the root of the local repository. You will have to create this file with your own token.
+The text encoder is named by `LLM_NAME` in `TransEHR2/constants.py`, along with the token limit and the pooling rule. It must be available to the machine that runs `embed_text.py`. If you point it at a gated model, put a HuggingFace token in a `.env` file at the repository root as `HF_READ_TOKEN`.
 
 ### Installing optional libraries for MIMIC-IV data
+
 If you intend to use MIMIC-IV data with TransEHR2, install the MIMIC-IV data prep libraries. Create a separate virtual environment for the data prep library to avoid dependency conflicts (optional but advisable).
 
 ```shell
@@ -53,20 +59,66 @@ wget -r -N -c -np --user ${PHYSIONET_USERNAME} --ask-password https://physionet.
 
 See the `mimic4dataprep` documentation for instructions on how to extract the downloaded MIMIC-IV data.
 
-## Using TransEHR2
-TransEHR2 includes scripts for extracting MIMIC-IV data that has been prepared by `mimic4dataprep` (`extract_data.py`), hyperparameter tuning (`tune_hyperparameters_accelerate.py`), and executing experiments (`run_experiment_accelerate.py`). An experiment generally consists of pretraining, finetuning, and evaluating TransEHR2's performance on a test set. These scripts rely on configuration files in `TransEHR2/configs/`. Edit them to modify the scripts' parameters. Multi-GPU computing is facilitated by the `Accelerate` library and is configured by `accelerate_config_ddp.yaml` and `accelerate_config_fsdp.yaml`. Use FSDP when inputting text features to the model; this will shard the LLM module across GPUs to relieve memory pressure.
+## Repository layout
+
+```
+TransEHR2/
+├── TransEHR2/                     Package: model, losses, training routines, data pipeline
+│   ├── configs/
+│   │   ├── datasets/              Dataset configs (paths, feature selection, sequence lengths)
+│   │   └── experiments/           Experiment configs, and tuning specs under tuning/
+│   ├── constants.py               Text encoder, token limit, pooling, device selection
+│   ├── losses.py                  Generator, discriminator and Hawkes process losses
+│   ├── model.py                   Encoders, MixedClassifier
+│   ├── routines_accelerate.py     Pretrain, finetune and evaluation loops
+│   └── data/                      Dataset, collation, standardization
+├── hp_tuning/                     Sweep specs, trial expansion, result ranking
+├── reporting/                     Evaluation, statistics and table building
+│   └── jmir/                      Publisher house style: number formatting, table layout
+├── tests/                         Test suite (pytest)
+├── extract_data.py                MIMIC-IV episodes -> tensorized arrays
+├── embed_text.py                  Pre-embed text features with the frozen encoder
+├── run_experiment.py              Pretrain, finetune, evaluate (single GPU)
+├── generate_tuning_configs.py     Expand a tuning spec into one config per trial
+├── tuning_trial.py                Look one trial up in a manifest, for job arrays
+├── report_tuning_results.py       Rank a sweep's trials
+├── select_tuned_hyperparameters.py  Assemble the winning config
+├── dump_finetuned_predictions.py  Per-fold prediction CSVs
+├── report_mortality.py            Result tables
+├── report_length_of_stay.py
+├── report_phenotype.py
+└── experiment_descriptions.md     What each experiment number means
+```
+
+## Running an experiment
+
+An experiment consists of pretraining, finetuning and evaluating on a test set. Scripts take a dataset config and an experiment config, both under `TransEHR2/configs/`; edit those to change parameters.
+
+**1. Extract the prepared data.** Reads the episode files `mimic4dataprep` produced and writes tensorized arrays.
+
+```shell
+python extract_data.py TransEHR2/configs/datasets/mimic4.yaml
+```
+
+**2. Embed text**, if the experiment uses text features. Scans the extracted dataset directories and writes one embedding per note.
+
+```shell
+python embed_text.py --data-dir ${DATA_DIR}
+```
+
+**3. Train and evaluate.**
+
+```shell
+python run_experiment.py TransEHR2/configs/datasets/mimic4.yaml TransEHR2/configs/experiments/experiment1_baseline.yaml
+```
+
+`--folds` restricts the run to particular folds and `--tasks` to particular tasks, which is how the work is spread across jobs. `fold0` is reserved for hyperparameter tuning and is excluded from reported results.
 
 ### Re-running an experiment
 
-The training scripts skip work whose output already exists, so a job that
-is requeued after a time limit resumes instead of starting over. The same
-behaviour means that re-running an experiment *deliberately* — after a
-code or configuration change — will silently reuse the previous run's
-results unless its outputs are cleared first.
+The training scripts skip work whose output already exists, so a job that is requeued after a time limit resumes instead of starting over. The same behaviour means that re-running an experiment *deliberately* — after a code or configuration change — will silently reuse the previous run's results unless its outputs are cleared first.
 
-Everything is keyed on `EXPERIMENT_NAME` from the experiment config, with
-`MODEL_DIR` from the same file. `checkpoints/` and `log/` are relative to
-the working directory the script is launched from.
+Everything is keyed on `EXPERIMENT_NAME` from the experiment config, with `MODEL_DIR` from the same file. `checkpoints/` and `log/` are relative to the working directory the script is launched from.
 
 | Artefact | Path | Effect on a re-run |
 |---|---|---|
@@ -83,34 +135,42 @@ To re-run an experiment from scratch, remove its model tree and its logs:
 rm -rf <MODEL_DIR>/<EXPERIMENT_NAME> log/<EXPERIMENT_NAME> checkpoints/<EXPERIMENT_NAME>
 ```
 
-`--force_pretrain` and `--force_finetune` retrain without deleting
-anything, which is useful when the previous weights are still wanted.
-They are not equivalent to removing the tree: they overwrite the files a
-run writes, and leave any other `.pt` in the pretrained directory in
-place, where a later run that does not force will find it.
+`--force_pretrain` and `--force_finetune` retrain without deleting anything, which is useful when the previous weights are still wanted. They are not equivalent to removing the tree: they overwrite the files a run writes, and leave any other `.pt` in the pretrained directory in place, where a later run that does not force will find it.
 
-After a job is killed at its time limit, verify what it left before
-requeueing. A checkpoint is what makes the requeue resume, and a
-checkpoint from a superseded configuration makes it resume the
-wrong run:
+After a job is killed at its time limit, verify what it left before requeueing. A checkpoint is what makes the requeue resume, and a checkpoint from a superseded configuration makes it resume the wrong run:
 
 ```bash
 ls checkpoints/
 ```
 
-### Before you start
+## Hyperparameter tuning
 
-**Predictions must already be dumped.** The reporting scripts read the
-per-fold prediction CSVs written by `dump_finetuned_predictions.py`, not
-the aggregated `*_evaluation.yaml` files, because calibrating a decision
-threshold needs the raw predicted probabilities. Run the dump for every
-experiment that will appear in a table:
+A sweep is described by a spec under `TransEHR2/configs/experiments/tuning/`. The sweep is additive: an all-defaults centre per encoding arm, plus one trial for each non-default value of each hyperparameter. Each trial becomes a standalone experiment config that one job can run.
+
+```shell
+# Expand the spec into one config per trial, plus a manifest
+python generate_tuning_configs.py TransEHR2/configs/experiments/tuning/phase2_spec.yaml
+
+# Run trial $SLURM_ARRAY_TASK_ID; prints the config path for run_experiment.py
+python tuning_trial.py ${MANIFEST} ${SLURM_ARRAY_TASK_ID}
+
+# Rank the results. Safe to run before every trial has finished.
+python report_tuning_results.py ${MANIFEST} --progress
+
+# Write the winning config
+python select_tuned_hyperparameters.py ${MANIFEST} --arm ${ARM} --output ${CONFIG}
+```
+
+Trials are ranked on the criterion each hyperparameter's grid entry names in the spec: `select_on: pretrain` ranks on pretraining loss, `select_on: mortality` on mortality validation performance.
+
+## Reporting results
+
+### Dumping predictions
+
+The reporting scripts read per-fold prediction CSVs, not the aggregated `*_evaluation.yaml` files, because calibrating a decision threshold needs the raw predicted probabilities. Run the dump for every experiment that will appear in a table:
 
 ```shell
 python dump_finetuned_predictions.py ${DATASET_CONFIG} ${EXPERIMENT_CONFIG} ${EXPERIMENT_NAME}
-
-# or, across several GPUs
-accelerate launch dump_finetuned_predictions.py ${DATASET_CONFIG} ${EXPERIMENT_CONFIG} ${EXPERIMENT_NAME}
 ```
 
 This produces one CSV per fold, task and split:
@@ -131,138 +191,57 @@ models/
     └── ...
 ```
 
-`fold0` is reserved for hyperparameter tuning and is always ignored. By
-default the `test` split supplies the reported numbers, and the `val`
-split is also required for the two classification tasks, because that is
-where the decision threshold is calibrated. Length of stay needs only
-`test`, and the reporting scripts never read the `train` split. Use
-`--split` to report a split other than `test`.
+By default the `test` split supplies the reported numbers, and the `val` split is also required for the two classification tasks, because that is where the decision threshold is calibrated. Length of stay needs only `test`, and the reporting scripts never read the `train` split. Use `--split` to report a split other than `test`.
 
-**Install the dependencies.** Reporting adds `python-docx` to
-`requirements.txt`:
+### Building tables
+
+Experiment numbers are given in the order their columns should appear, left to right, and one is nominated as the control that every other column is tested against. Numbers are resolved by globbing `experiment{N}_*` under `--model-dir`, so `--experiments 3` finds `experiment3_nohistory`. See `experiment_descriptions.md` for what each number is.
+
+Omit `--output` and nothing is written, which is the way to check a table on screen first:
 
 ```shell
-pip install -r requirements.txt
+python report_mortality.py --experiments 3 1 2 --control 3
 ```
 
-### Step by step: tabulating results
-
-**1. Decide the columns and the control.** Experiment numbers are given
-in the order their columns should appear, left to right, and one of them
-is nominated as the control that every other column is tested against.
-Numbers are resolved by globbing `experiment{N}_*` under `--model-dir`,
-so `--experiments 3` finds `experiment3_nohistory`. See
-`experiment_descriptions.md` for what each number is.
-
-The published tables use two column sets: experiments 3, 9, 1, 2, 7 for
-the full dataset with experiment 3 as the control, and experiments 6, 4,
-5 for the discharge summary subset with experiment 6 as the control.
-
-**2. Check one table on screen before writing any files.** Omit
-`--output` and nothing is written:
+`--append` adds to an existing document instead of replacing it, so several tables can go into one file:
 
 ```shell
-python report_mortality.py --experiments 3 9 1 2 7 --control 3
-```
-
-**3. Build all six tables into one document.** `--append` adds to an
-existing document instead of replacing it:
-
-```shell
-OUT=tables/manuscript_tables.docx
+OUT=tables/results.docx
 rm -f $OUT
-
-# Full dataset, control = experiment 3
-python report_mortality.py       --experiments 3 9 1 2 7 --control 3 --table-number 1 --output $OUT --append
-python report_length_of_stay.py  --experiments 3 9 1 2 7 --control 3 --table-number 2 --output $OUT --append
-python report_phenotype.py       --experiments 3 9 1 2 7 --control 3 --table-number 3 --output $OUT --append
-
-# Discharge summary subset, control = experiment 6
-python report_mortality.py       --experiments 6 4 5 --control 6 --table-number 4 --output $OUT --append \
-    --caption "In-hospital mortality prediction in the subset of patients with at least one discharge summary in their history."
-python report_length_of_stay.py  --experiments 6 4 5 --control 6 --table-number 5 --output $OUT --append \
-    --caption "Length-of-stay prediction in the subset of patients with at least one discharge summary in their history."
-python report_phenotype.py       --experiments 6 4 5 --control 6 --table-number 6 --output $OUT --append \
-    --caption "Diagnosis prediction in the subset of patients with at least one discharge summary in their history."
+python report_mortality.py      --experiments 3 1 2 --control 3 --table-number 1 --output $OUT --append
+python report_length_of_stay.py --experiments 3 1 2 --control 3 --table-number 2 --output $OUT --append
+python report_phenotype.py      --experiments 3 1 2 --control 3 --table-number 3 --output $OUT --append
 ```
 
-Delete the output file first, or `--append` will add a seventh table to
-the six already there.
+Delete the output file first, or `--append` will add to the tables already there.
 
-**4. Run the fixed-threshold sensitivity analysis.** Repeat the two
-classification tasks with `--threshold 0.5` into a separate file. If the
-ranking of experiments is unchanged, the conclusions do not rest on the
-threshold rule, which is the answer a reviewer asking "why this
-threshold?" actually needs:
+The Word table carries P values only. `--stats-csv` writes every per-fold value, mean difference, *t* statistic, degrees of freedom, and both unadjusted and adjusted P value:
 
 ```shell
-python report_mortality.py --experiments 3 9 1 2 7 --control 3 \
-    --threshold 0.5 --table-number 1 \
-    --output tables/sensitivity_fixed_threshold.docx --append
-python report_phenotype.py --experiments 3 9 1 2 7 --control 3 \
-    --threshold 0.5 --table-number 3 \
-    --output tables/sensitivity_fixed_threshold.docx --append
-```
-
-**5. Keep the full statistics.** The Word
-table carries P values only. `--stats-csv` writes every per-fold value,
-mean difference, *t* statistic, degrees of freedom, and both unadjusted
-and adjusted P value:
-
-```shell
-python report_mortality.py --experiments 3 9 1 2 7 --control 3 \
+python report_mortality.py --experiments 3 1 2 --control 3 \
     --stats-csv stats/table1_mortality.csv --quiet
 ```
 
 ### Statistical comparisons
 
-Models are compared with the **corrected resampled *t* test** of [Nadeau
-and Bengio (2003)](https://doi.org/10.1023/A:1024068626366), paired on folds, rather than a
-Student *t* test. Because the training sets of the folds overlap, the
-per-fold performance estimates are positively correlated and their sample
-variance underestimates the variance of the mean difference. The
-correction inflates that variance by the ratio of test set size to
-training set size:
+Models are compared with the corrected resampled *t* test of [Nadeau and Bengio (2003)](https://doi.org/10.1023/A:1024068626366), paired on folds. Because the training sets of the folds overlap, the per-fold estimates are correlated and their sample variance underestimates the variance of the mean difference; the correction inflates it by the ratio of test set size to training set size:
 
 ```
 t = mean(d) / sqrt((1/n + n_test/n_train) * var(d, ddof=1))
 ```
 
-on *n* − 1 degrees of freedom, where *d* holds the per-fold differences.
-Without repeated folds, the **fixed adjustment** applies: for one run of
-*k*-fold cross-validation, `n_test/n_train = 1/(k − 1)`.
+on *n* − 1 degrees of freedom, where *d* holds the per-fold differences. For one run of *k*-fold cross-validation, `n_test/n_train = 1/(k − 1)`.
 
-P values are adjusted for multiple comparisons with the
-Benjamini-Hochberg procedure. `--fdr-scope` selects the family: `table`
-(the default: every comparison in the table), `row` (the comparisons
-within one metric), or `none`. `--show-raw-p` reports the unadjusted
-value alongside the adjusted one.
+P values are adjusted with the Benjamini-Hochberg procedure. `--fdr-scope` selects the family: `table` (the default), `row`, or `none`.
 
 ### Decision thresholds
 
-`--threshold` controls how predicted probabilities become hard class
-labels for the two classification tasks:
+`--threshold` controls how predicted probabilities become hard class labels for the two classification tasks:
 
-- **`prevalence`** (the default) — within each fold the threshold is set
-  on the `--calibration-split` (default `val`) so that the predicted
-  positive rate matches the observed prevalence, then applied unchanged
-  to the reported split. The threshold is never chosen on the split being
-  reported, and the same rule is applied to every model including the
-  control. This keeps the predicted positive count honest and is stable
-  to estimate for rare labels, since it inverts a quantile of a smooth
-  distribution rather than maximising a jagged objective. The thresholds
-  actually used are recorded in a table footnote.
-- **a fixed number**, e.g. `--threshold 0.5` — no calibration, and the
-  `val` split is not needed. Use it for the sensitivity analysis in
-  step 4 above.
+- **`prevalence`** (the default) — within each fold the threshold is set on the `--calibration-split` (default `val`) so that the predicted positive rate matches the observed prevalence, then applied unchanged to the reported split. The threshold is never chosen on the split being reported, and the same rule is applied to every model including the control. The thresholds used are recorded in a table footnote.
+- **a fixed number**, e.g. `--threshold 0.5` — no calibration, and the `val` split is not needed.
 
-For the multi-label diagnosis task,
-`--phenotype-threshold-scope per-label` (the default) calibrates each of
-the 25 labels independently, which lifts the macro averages because a
-single shared threshold is dominated by the common labels and the rare
-ones rarely cross it. `--phenotype-threshold-scope global` shares one
-threshold across all labels, which is more conservative for the rarest
-labels, whose calibration split holds few positive examples.
+For the multi-label diagnosis task, `--phenotype-threshold-scope per-label` (the default) calibrates each of the 25 labels independently. `global` shares one threshold across all labels, which is more conservative for the rarest labels, whose calibration split holds few positive examples.
 
 AUROC and AUPRC are threshold-free and are unaffected by any of this.
 
@@ -315,3 +294,9 @@ Classification tasks only (`report_mortality.py`, `report_phenotype.py`):
 | `Experiment number N is ambiguous` | Two directories match `experimentN_*`. Rename one. |
 | `Unknown metric(s): ...` | A `--metrics` key is not defined for that task. Use `--list-metrics` to see the valid keys. |
 | `has no metric 'KEY'` | The dump for one experiment is incomplete, so a metric other experiments have is missing. Re-dump that experiment. |
+
+## Distributed training is unsupported
+
+`run_experiment_accelerate.py`, `tune_hyperparameters_accelerate.py`, `accelerate_config_ddp.yaml` and `accelerate_config_fsdp.yaml` are present in the repository but are **not currently supported and should not be expected to work as-is.** They have not been kept in step with the single-GPU path, and no part of the workflow above depends on them.
+
+Use `run_experiment.py`. Work is spread across GPUs by running independent jobs — one per fold, task, or configuration file — rather than by distributing a single run.

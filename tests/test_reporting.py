@@ -1,7 +1,7 @@
-"""Tests for the JMIR manuscript reporting utilities.
+"""Tests for the result reporting utilities.
 
 Covers the three parts that a wrong answer would silently corrupt: the
-JMIR number formatting rules, the corrected resampled t test and the
+house style number formatting rules, the corrected resampled t test and the
 Benjamini-Hochberg adjustment, and the metric computations. The
 concordance index is checked against the O(n^2) pair-enumeration version
 in ``evaluate_finetuned_predictions.py``, which is the definition of
@@ -18,25 +18,25 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from evaluate_finetuned_predictions import concordance_index as brute_force
-from jmir_reporting.evaluation import (
+from reporting.evaluation import (
     binary_metrics,
     calibrate_thresholds,
     concordance_index,
     phenotype_metrics,
     prevalence_matched_threshold,
 )
-from jmir_reporting.formatting import (
+from reporting.jmir.formatting import (
     fmt_cell,
     fmt_number,
     fmt_p_value,
     fmt_t_statistic,
 )
-from jmir_reporting.stats import (
+from reporting.stats import (
     benjamini_hochberg,
     corrected_resampled_ttest,
     standard_error_of_mean,
 )
-from jmir_reporting.tables import (
+from reporting.jmir.tables import (
     Table,
     build_document,
     parse_markup,
@@ -386,7 +386,7 @@ def test_phenotype_metrics_match_the_evaluation_script():
 
 def test_length_of_stay_metrics_match_the_evaluation_script():
     from evaluate_finetuned_predictions import compute_los_metrics
-    from jmir_reporting.evaluation import length_of_stay_metrics
+    from reporting.evaluation import length_of_stay_metrics
 
     rng = np.random.default_rng(13)
     observed = np.abs(rng.lognormal(4.4, 0.8, 300)).reshape(-1, 1)

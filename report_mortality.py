@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Report in-hospital mortality prediction results in JMIR table format.
+"""Report in-hospital mortality prediction results as a formatted table.
 
 Reads the per-fold prediction CSVs written by
 ``dump_finetuned_predictions.py``, computes the binary classification
@@ -20,7 +20,7 @@ Usage:
 
 import sys
 
-from jmir_reporting.cli import (F1_LABEL, MetricSpec, build_parser,
+from reporting.cli import (F1_LABEL, MetricSpec, build_parser,
                                 describe_threshold, run)
 
 TASK = 'mortality'

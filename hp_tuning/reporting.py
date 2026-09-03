@@ -1,6 +1,6 @@
 """Rendering tuning results as tables.
 
-Reuses the table model in :mod:`jmir_reporting.tables`, so a tuning table prints to a terminal
+Reuses the table model in :mod:`reporting.jmir.tables`, so a tuning table prints to a terminal
 and writes to Word through exactly the same path the manuscript tables use. These are working
 tables rather than manuscript ones -- they exist so the sweep can be read at a glance and so
 the choice of each hyperparameter is on record next to the numbers it was made from.
@@ -12,7 +12,7 @@ import os
 
 from typing import Any, Dict, List, Optional
 
-from jmir_reporting.tables import Table, build_document, render_text
+from reporting.jmir.tables import Table, build_document, render_text
 
 from hp_tuning.results import compare_arms, rank_hyperparameter, read_result
 from hp_tuning.spec import SELECTION_CRITERIA, extra_trials

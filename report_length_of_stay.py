@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Report length-of-stay prediction results in JMIR table format.
+"""Report length-of-stay prediction results as a formatted table.
 
 Reads the per-fold prediction CSVs written by
 ``dump_finetuned_predictions.py``, computes the regression metrics,
@@ -18,7 +18,7 @@ Usage:
 
 import sys
 
-from jmir_reporting.cli import MetricSpec, build_parser, run
+from reporting.cli import MetricSpec, build_parser, run
 
 TASK = 'length_of_stay'
 
