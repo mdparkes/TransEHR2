@@ -77,12 +77,13 @@ GRID:
     values: [0.0002, 0.0006, 0.00006]
     select_on: pretrain
 
-  # Half-lives in epochs, converted from the factors this grid used to carry so that the
-  # schedules are unchanged: 0.90, 0.80 and 0.50 applied every fifty epochs are half-lives of
-  # 329, 155 and 50. Held against a run whose best epoch lands between 50 and 110, only the
-  # last of the three halves the rate inside the run at all.
+  # Half-lives in epochs, geometrically spaced so that all three are equally distinguishable:
+  # 160 is about the longest schedule that still anneals inside the epoch budget, 20 is
+  # aggressive, and 57 is their geometric midpoint. Against a run whose best epoch lands
+  # between 50 and 110, the rate remaining at epoch 100 is 0.65, 0.32 and 0.03 respectively.
+  # A middle value nearer 120 would leave 0.56 there, close enough to 160 to waste the cell.
   PRETRAIN_LR_HALF_LIFE:
-    values: [329, 155, 50]
+    values: [160, 60, 20]
     select_on: pretrain
 
   CMPNT_MASK_RATIO:

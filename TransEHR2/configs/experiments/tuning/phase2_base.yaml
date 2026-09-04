@@ -89,7 +89,7 @@ MODEL_DIR: "/uhome/pr3/projects/p60290_2/TransEHR2/models"
 # particularly for the decay, which is the hyperparameter most sensitive to run length.
 PRETRAIN_TOTAL_EPOCH: 200
 
-FINETUNE_LEARNING_RATE: 0.0002
+FINETUNE_LEARNING_RATE: 0.00005
 FINETUNE_TOTAL_EPOCH: 500
 FINETUNE_LR_HALF_LIFE: 132
 
@@ -125,7 +125,7 @@ THP_PRED_LOSS_TYPE_WT: 1.0
 
 # --- Tuned: the first value of each grid, i.e. the centre of the sweep ---------------------
 PRETRAIN_LEARNING_RATE: 0.0002
-PRETRAIN_LR_HALF_LIFE: 329
+PRETRAIN_LR_HALF_LIFE: 160
 CMPNT_MASK_RATIO: 0.25
 RECORD_MASK_RATIO: 0.15
 # 0.01 is Zuo et al.'s time_loss/100, replacing the eyeballed 1e-6 that was submitted. Every
