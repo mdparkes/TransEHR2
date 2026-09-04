@@ -93,6 +93,12 @@ FINETUNE_LEARNING_RATE: 0.00005
 FINETUNE_TOTAL_EPOCH: 500
 FINETUNE_LR_HALF_LIFE: 132
 
+# RNG seeds, set immediately before each stage builds its model. Held fixed across a grid so
+# that trials differ only by hyperparameter; varied across repeats of one configuration
+# so that the repeats measure run-to-run spread.
+PRETRAIN_SEED: 0
+FINETUNE_SEED: 0
+
 # Tasks whose binary cross entropy weights the positive term by the ratio of negatives to
 # positives, measured over the training split, so that the two classes contribute equally.
 # Deaths are roughly one episode in ten, and an unweighted loss over that split rewards

@@ -57,7 +57,7 @@ import yaml
 _PROCESS_START = time.perf_counter()
 
 from accelerate import Accelerator
-from accelerate.utils import DistributedType
+from accelerate.utils import DistributedType, set_seed
 from torch.utils.tensorboard import SummaryWriter
 from typing import Any, Dict, List, Optional, Union
 
@@ -84,6 +84,8 @@ RECORDED_HYPERPARAMETERS = (
     'POSITION_ENCODING',
     'PRETRAIN_LEARNING_RATE',
     'PRETRAIN_LR_HALF_LIFE',
+    'PRETRAIN_SEED',
+    'FINETUNE_SEED',
     'FINETUNE_ENCODER_INIT',
     'FINETUNE_FREEZE_ENCODER',
     'CMPNT_MASK_RATIO',
@@ -511,6 +513,13 @@ def main():
     FINETUNE_LEARNING_RATE = experiment_config.get('FINETUNE_LEARNING_RATE', 2e-4)
     FINETUNE_TOTAL_EPOCH = experiment_config.get('FINETUNE_TOTAL_EPOCH', 500)
     FINETUNE_LR_HALF_LIFE = experiment_config.get('FINETUNE_LR_HALF_LIFE', None)
+    # Seeds are set per stage rather than once per run, so that a finetune is determined by
+    # its own seed and the encoder it starts from, whether or not pretraining ran in the
+    # same process. Holding one seed across a grid leaves the trials differing only by
+    # hyperparameter; varying it across repeats of a fixed configuration is what measures
+    # run-to-run spread. None leaves the RNG untouched.
+    PRETRAIN_SEED = experiment_config.get('PRETRAIN_SEED', None)
+    FINETUNE_SEED = experiment_config.get('FINETUNE_SEED', None)
     FINETUNE_ENCODER_INIT = experiment_config.get('FINETUNE_ENCODER_INIT', 'pretrained')
     FINETUNE_FREEZE_ENCODER = experiment_config.get('FINETUNE_FREEZE_ENCODER', False)
     if FINETUNE_ENCODER_INIT not in ('pretrained', 'random'):
@@ -674,6 +683,10 @@ def main():
         pretrain_evaluation_fp = f'{model_save_dir}/evaluation/evaluation_pretrained.yaml'
 
         # ---------------------------------------------------------------- pretraining
+
+        if PRETRAIN_SEED is not None:
+            set_seed(PRETRAIN_SEED)
+            print(f"Pretraining seed: {PRETRAIN_SEED}")
 
         electra = ELECTRA(
             generator=MaskedTokenGenerator(
@@ -856,6 +869,9 @@ def main():
                 )
 
             if not skip_finetuning:
+                if FINETUNE_SEED is not None:
+                    set_seed(FINETUNE_SEED)
+                    print(f"Finetuning seed: {FINETUNE_SEED}")
                 downstream_predictor = build_predictor()
 
                 if FINETUNE_ENCODER_INIT == 'random':
