@@ -1400,6 +1400,13 @@ def pretrain_model(
     # Report peak GPU VRAM usage
     print_peak_memory(accelerator)
 
+    # The epoch the returned weights came from, counted the way the progress tables count:
+    # one-based. Zero means no epoch ever improved on the initial value. Carried in the scores
+    # so it reaches the evaluation YAML, where it says whether a run converged or merely
+    # stopped, without having to be reconstructed from the log.
+    best_epoch_val_losses['Best_Epoch'] = best_epoch + 1
+    best_epoch_train_losses['Best_Epoch'] = best_epoch + 1
+
     return best_epoch_train_losses, best_epoch_val_losses
 
 
@@ -1709,6 +1716,13 @@ def finetune_model(
     # Report peak GPU VRAM usage
     print_peak_memory(accelerator)
     
+    # The epoch the returned weights came from, counted the way the progress tables count:
+    # one-based. Zero means no epoch ever improved on the initial value. Carried in the scores
+    # so it reaches the evaluation YAML, where it says whether a run converged or merely
+    # stopped, without having to be reconstructed from the log.
+    best_epoch_val_scores['Best_Epoch'] = best_epoch + 1
+    best_epoch_train_scores['Best_Epoch'] = best_epoch + 1
+
     return best_epoch_train_scores, best_epoch_val_scores
 
 
@@ -2027,5 +2041,12 @@ def pretrain_with_hyperparameter(
 
     # Report peak GPU VRAM usage
     print_peak_memory(accelerator)
+
+    # The epoch the returned weights came from, counted the way the progress tables count:
+    # one-based. Zero means no epoch ever improved on the initial value. Carried in the scores
+    # so it reaches the evaluation YAML, where it says whether a run converged or merely
+    # stopped, without having to be reconstructed from the log.
+    best_epoch_val_losses['Best_Epoch'] = best_epoch + 1
+    best_epoch_train_losses['Best_Epoch'] = best_epoch + 1
 
     return best_epoch_train_losses, best_epoch_val_losses
