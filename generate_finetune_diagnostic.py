@@ -73,6 +73,23 @@ CONTROLS = {
 ENCODER_FILES = ('pretrained.pt', 'value_encoder.pt', 'event_encoder.pt')
 
 
+def parse_values(text, cast):
+    """Parse a comma-separated grid argument.
+
+    Args:
+        text: The argument, e.g. "5e-5,2.2e-5,1e-5". "flat" and "none" mean no decay.
+        cast: Callable applied to each non-flat entry.
+
+    Returns:
+        list: The parsed values, in the order given. The first is the default.
+    """
+    values = []
+    for piece in text.split(','):
+        piece = piece.strip()
+        values.append(None if piece.lower() in ('flat', 'none') else cast(piece))
+    return values
+
+
 def token(value):
     """Filename-safe token for a hyperparameter value."""
     if value is None:
@@ -80,22 +97,43 @@ def token(value):
     return f'{value:g}'.replace('.', 'p').replace('-', 'm').replace('+', '')
 
 
-def cells(prefix):
-    """The grid and the controls, as (name, overrides) pairs."""
-    for rate in FINETUNE_LEARNING_RATES:
-        for half_life in FINETUNE_HALF_LIVES:
+def cells(prefix, rates, half_lives, controls=True):
+    """The grid, and the controls if they are wanted, as (name, overrides) pairs.
+
+    Args:
+        prefix: Name prefix for every cell.
+        rates: Finetuning learning rates.
+        half_lives: Finetuning decay half-lives; None holds the rate constant.
+        controls: Whether to emit the random-encoder and frozen-encoder cells.
+
+    Yields:
+        Tuples of (experiment name, config overrides).
+    """
+    for rate in rates:
+        for half_life in half_lives:
             yield (f'{prefix}_lr{token(rate)}_hl{token(half_life)}',
                    {'FINETUNE_LEARNING_RATE': rate, 'FINETUNE_LR_HALF_LIFE': half_life})
+    if not controls:
+        return
     for name, overrides in CONTROLS.items():
         yield f'{prefix}_{name}', dict(CONTROL_REFERENCE, **overrides)
 
 
-def write_config(base, name, overrides, variant_overrides, output_dir, header):
-    """Write one experiment config, and return its path."""
+def write_config(base, name, overrides, upstream, output_dir, header):
+    """Write one experiment config, and return its path.
+
+    Args:
+        base: The config every cell inherits.
+        name: EXPERIMENT_NAME for this cell.
+        overrides: The cell's own settings.
+        upstream: Pretraining and record-scope settings to force. Empty when the base config
+            is authoritative, which is the case when an existing encoder is being reused.
+        output_dir: Where to write.
+        header: Provenance comment for the top of the file.
+    """
     config = dict(base)
     config['EXPERIMENT_NAME'] = name
-    config.update(PRETRAIN_OVERRIDES)
-    config.update(variant_overrides)
+    config.update(upstream)
     config.update(overrides)
     path = os.path.join(output_dir, f'{name}.yaml')
     with open(path, 'w') as f_out:
@@ -107,56 +145,93 @@ def write_config(base, name, overrides, variant_overrides, output_dir, header):
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--variant', default='history', choices=sorted(VARIANTS),
-                        help='Record scope the whole diagnostic runs under')
+    parser.add_argument('--variant', default=None, choices=sorted(VARIANTS),
+                        help='Record scope to force on every cell, and pretrain an encoder '
+                             'for. Mutually exclusive with --encoder.')
+    parser.add_argument('--encoder', default=None,
+                        help='EXPERIMENT_NAME of an existing pretrain whose weights every '
+                             'cell links. No pretrain config is written and the base config '
+                             'is taken as authoritative, so nothing upstream is overridden.')
+    parser.add_argument('--prefix', default=None,
+                        help='Name prefix for the cells. Defaults to the variant\'s prefix, '
+                             'or to the base config filename when --encoder is given.')
     parser.add_argument('--base', default=BASE_CONFIG, help='Config the cells inherit from')
+    parser.add_argument('--rates', default='0.0002,0.00005,0.00001',
+                        help='Finetuning learning rates, comma separated. First is default.')
+    parser.add_argument('--half_lives', default='flat,120,160',
+                        help='Finetuning decay half-lives in epochs, comma separated. '
+                             '"flat" holds the rate constant.')
+    parser.add_argument('--no_controls', action='store_true',
+                        help='Omit the random-encoder and frozen-encoder cells')
     parser.add_argument('--output_dir', default=OUTPUT_DIR, help='Where to write the configs')
-    parser.add_argument('--fold', default='fold0', help='Fold the diagnostic runs on')
+    parser.add_argument('--fold', default='fold0', help='Fold the cells run on')
     args = parser.parse_args()
 
-    variant = VARIANTS[args.variant]
-    prefix = variant['prefix']
-    pretrain_name = f'{prefix}_pretrain'
+    if args.encoder and args.variant:
+        parser.error('--encoder reuses a pretrain whose record scope is already fixed, so '
+                     '--variant would silently disagree with it. Pass one or the other.')
+
+    rates = parse_values(args.rates, float)
+    half_lives = parse_values(args.half_lives, float)
+
+    if args.encoder:
+        upstream = {}
+        prefix = args.prefix or os.path.splitext(os.path.basename(args.base))[0]
+        encoder_name = args.encoder
+    else:
+        variant = VARIANTS[args.variant or 'history']
+        upstream = dict(PRETRAIN_OVERRIDES, **variant['overrides'])
+        prefix = args.prefix or variant['prefix']
+        encoder_name = f'{prefix}_pretrain'
 
     with open(args.base) as f_in:
         base = yaml.safe_load(f_in)
     base.pop('HYPERPARAMETERS_TO_TUNE', None)
     os.makedirs(args.output_dir, exist_ok=True)
 
-    header = (f'# Generated by generate_finetune_diagnostic.py --variant {args.variant}\n'
-              f'# from {args.base}. Do not edit by hand -- regenerate instead.\n\n')
+    header = (f'# Generated by generate_finetune_diagnostic.py from {args.base}\n'
+              f'# Do not edit by hand -- regenerate instead.\n\n')
 
-    pretrain_path = write_config(base, pretrain_name, {}, variant['overrides'],
-                                 args.output_dir, header)
-    cell_paths = [(name, write_config(base, name, overrides, variant['overrides'],
-                                      args.output_dir, header))
-                  for name, overrides in cells(prefix)]
+    pretrain_path = None
+    if not args.encoder:
+        pretrain_path = write_config(base, encoder_name, {}, upstream, args.output_dir, header)
+    cell_paths = [(name, write_config(base, name, overrides, upstream, args.output_dir, header))
+                  for name, overrides in cells(prefix, rates, half_lives,
+                                               controls=not args.no_controls)]
 
     model_dir = base['MODEL_DIR']
-    print(f'Variant:      {args.variant}  '
-          f'(USE_HISTORICAL_RECORDS={variant["overrides"]["USE_HISTORICAL_RECORDS"]})')
-    print(f'Encoder:      {pretrain_name}')
+    print(f'Base config:  {args.base}')
+    print(f'Encoder:      {encoder_name}'
+          f'{"  (existing, linked)" if args.encoder else "  (pretrained by step 1)"}')
     print(f'Cells:        {len(cell_paths)}  '
-          f'({len(FINETUNE_LEARNING_RATES)} rates x {len(FINETUNE_HALF_LIVES)} half-lives '
-          f'+ {len(CONTROLS)} controls)\n')
+          f'({len(rates)} rates x {len(half_lives)} half-lives'
+          f'{"" if args.no_controls else f" + {len(CONTROLS)} controls"})\n')
     for name, path in cell_paths:
-        print(f'  {name:<40} {path}')
+        print(f'  {name:<44} {path}')
 
     # slurm_run_experiment.sh indexes FOLDS by the array id and defaults to the five
     # manuscript folds, so a single-fold run has to name the fold and take one array task.
     launch = f'FOLDS="{args.fold}" sbatch --array=0-0 SLURM/slurm_run_experiment.sh'
-    print('\n1. Pretrain once:')
-    print(f'   TASKS=none {launch} {pretrain_path}')
-    print('\n2. Link that encoder into every cell, so each one skips pretraining and they all')
-    print('   finetune from identical weights:')
-    print(f'   src="{model_dir}/{pretrain_name}/{args.fold}/pretrained"')
-    print(f'   for cell in {" ".join(name for name, _ in cell_paths)}; do')
+    step = 1
+    if pretrain_path is not None:
+        print(f'\n{step}. Pretrain once:')
+        print(f'   TASKS=none {launch} {pretrain_path}')
+        step += 1
+    print(f'\n{step}. Link that encoder into every cell, so each one skips pretraining and')
+    print('   they all finetune from identical weights:')
+    print(f'   src="{model_dir}/{encoder_name}/{args.fold}/pretrained"')
+    print(f'   for cfg in {args.output_dir}/{prefix}_*.yaml; do')
+    print('     cell=$(basename "$cfg" .yaml)')
+    # The glob also matches the encoder's own config, and linking its weights over themselves
+    # would replace the files with symlinks to themselves.
+    print(f'     [ "$cell" = "{encoder_name}" ] && continue')
     print(f'     dst="{model_dir}/$cell/{args.fold}/pretrained"; mkdir -p "$dst"')
     print(f'     for f in {" ".join(ENCODER_FILES)}; do ln -sf "$src/$f" "$dst/$f"; done')
     print('   done')
-    print('\n3. Finetune every cell:')
-    print(f'   for cfg in {args.output_dir}/{prefix}_lr*.yaml '
-          f'{args.output_dir}/{prefix}_ctl_*.yaml; do')
+    step += 1
+    print(f'\n{step}. Finetune every cell:')
+    print(f'   for cfg in {args.output_dir}/{prefix}_lr*.yaml'
+          f'{"" if args.no_controls else f" {args.output_dir}/{prefix}_ctl_*.yaml"}; do')
     print(f'     TASKS=mortality {launch} "$cfg"')
     print('   done')
 

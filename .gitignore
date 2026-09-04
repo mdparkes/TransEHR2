@@ -144,3 +144,6 @@ TransEHR2/configs/experiments/ftdiag/
 
 # Generated Phase 2a trial configs
 TransEHR2/configs/experiments/tuning/phase2a/
+
+# Generated Phase 2b finetuning grid configs
+TransEHR2/configs/experiments/tuning/phase2b/
