@@ -103,8 +103,11 @@ def main():
     for name, path in cell_paths:
         print(f'  {name:<34} {path}')
 
+    # slurm_run_experiment.sh indexes FOLDS by the array id and defaults to the five
+    # manuscript folds, so a single-fold run has to name the fold and take one array task.
+    launch = f'FOLDS="{args.fold}" sbatch --array=0-0 SLURM/slurm_run_experiment.sh'
     print('\n1. Pretrain once:')
-    print(f'   TASKS=none sbatch SLURM/slurm_run_experiment.sh {pretrain_path}')
+    print(f'   TASKS=none {launch} {pretrain_path}')
     print('\n2. Link that encoder into every cell, so each one skips pretraining and they all')
     print('   finetune from identical weights:')
     print(f'   src="{model_dir}/{PRETRAIN_NAME}/{args.fold}/pretrained"')
@@ -113,8 +116,9 @@ def main():
     print(f'     for f in {" ".join(ENCODER_FILES)}; do ln -sf "$src/$f" "$dst/$f"; done')
     print('   done')
     print('\n3. Finetune every cell:')
-    for _, path in cell_paths:
-        print(f'   TASKS=mortality sbatch SLURM/slurm_run_experiment.sh {path}')
+    print(f'   for cfg in {args.output_dir}/ftdiag_lr*.yaml; do')
+    print(f'     TASKS=mortality {launch} "$cfg"')
+    print('   done')
 
 
 if __name__ == '__main__':
