@@ -138,3 +138,6 @@ report_historic_diagnosis_audit.py
 *.pth
 *.ckpt
 tests/__pycache__/
+
+# Generated finetuning diagnostic configs
+TransEHR2/configs/experiments/ftdiag/
