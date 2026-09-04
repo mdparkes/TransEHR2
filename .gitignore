@@ -150,3 +150,6 @@ TransEHR2/configs/experiments/tuning/phase2b/
 
 # Generated head-to-head repeat configs
 TransEHR2/configs/experiments/tuning/phase2h/
+
+# Generated Phase 2c trial configs
+TransEHR2/configs/experiments/tuning/phase2c/
