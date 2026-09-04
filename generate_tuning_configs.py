@@ -81,6 +81,10 @@ def main(argv=None):
             changed = ', '.join(f'{k} = {v!r}' for k, v in sorted(
                 spec_extras.get(trial['name'], {}).items()))
             described = f'ablation: {changed}'
+        elif trial.get('cell'):
+            # A factorial cell is not one hyperparameter at one value, so it is described by
+            # its whole assignment.
+            described = ', '.join(f'{k} = {v!r}' for k, v in trial['cell'].items())
         else:
             described = f"{trial['hyperparameter']} = {trial['value']!r}"
         stages = 'pretrain + finetune' if trial['needs_finetune'] else 'pretrain'
@@ -99,14 +103,20 @@ def main(argv=None):
         print("\nTo run the sweep, in order:")
         print(f"  sbatch --array=0-{len(trials) - 1} "
               f"SLURM/slurm_tune_pretrain.sh {manifest_path}")
-        print(f"  sbatch --array=0-{n_finetune - 1} "
-              f"SLURM/slurm_tune_finetune.sh {manifest_path}")
+        if n_finetune:
+            print(f"  sbatch --array=0-{n_finetune - 1} "
+                  f"SLURM/slurm_tune_finetune.sh {manifest_path}")
         print(f"  sbatch SLURM/slurm_report_tuning.sh {manifest_path}")
         print()
-        print("The finetune array depends on the pretrain array: every finetune loads the "
-              "encoder weights its own pretrain wrote. Chain them with")
-        print(f"  --dependency=afterok:<pretrain job id>")
-        print("or wait for the pretrain array to drain before submitting the second.")
+        if n_finetune:
+            print("The finetune array depends on the pretrain array: every finetune loads the "
+                  "encoder weights its own pretrain wrote. Chain them with")
+            print(f"  --dependency=afterok:<pretrain job id>")
+            print("or wait for the pretrain array to drain before submitting the second.")
+        else:
+            # An empty array would be sbatch --array=0--1, which is not a range.
+            print("No trial in this sweep is finetuned, so there is no finetune array. Every "
+                  "hyperparameter here is ranked on the pretraining loss.")
 
     return 0
 

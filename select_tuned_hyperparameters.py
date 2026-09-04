@@ -99,6 +99,14 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     manifest = load_manifest(args.manifest)
+    if manifest.get('design') == 'factorial':
+        # A factorial's winner is a cell that was actually run, so there is nothing to
+        # assemble from coordinate winners and the per-hyperparameter ranking this script
+        # performs would discard the interaction the design exists to measure.
+        print(f"ERROR: {args.manifest} is a factorial sweep. Selection over a cross product "
+              f"ranks whole cells, not coordinates.\n"
+              f"       Use select_tuned_cell.py instead.", file=sys.stderr)
+        return 1
     arm, comparison = choose_arm(manifest, args.arm)
 
     print(f"Sweep:    {manifest['spec_name']}")

@@ -29,7 +29,7 @@ import os
 import sys
 
 from hp_tuning.reporting import format_grid_value, format_metric, write_tables
-from hp_tuning.results import compare_arms, progress, rank_hyperparameter
+from hp_tuning.results import compare_arms, progress, rank_cells, rank_hyperparameter
 from hp_tuning.spec import load_manifest
 
 
@@ -56,6 +56,37 @@ def print_progress(manifest):
     return complete
 
 
+def print_cell_ranking(ranking):
+    """Print one arm's cells, best first, for a factorial sweep.
+
+    Coordinates are shown in full because a cell is not identified by any one of them: every
+    value appears in several cells, and it is the combination that was measured.
+
+    Args:
+        ranking: A ranking dict as returned by :func:`hp_tuning.results.rank_cells`.
+    """
+    direction = 'lowest' if ranking['direction'] == 'min' else 'highest'
+    print(f"\n  Factorial cells, selected on {ranking['criterion']}: "
+          f"{direction} {ranking['metric']}")
+    usable = [r for r in ranking['results'] if r.is_usable]
+    pending = [r for r in ranking['results'] if not r.is_usable]
+    ordered = sorted(usable, key=lambda r: r.value, reverse=ranking['direction'] == 'max')
+    for result in ordered + pending:
+        marker = '  <-- selected' if (
+            ranking['best'] is not None and result is ranking['best']
+        ) else ''
+        shown = format_metric(result.value) if result.is_usable else f'[{result.status}]'
+        coordinates = '  '.join(
+            f'{name}={format_grid_value(value)}' for name, value in result.grid_value.items()
+        )
+        print(f"      {coordinates:<60} {shown:>12}{marker}")
+        if not result.is_usable:
+            print(f"        {result.detail}")
+    if not ranking['complete']:
+        print("      NOTE incomplete: the selection above is the best of the cells that")
+        print("           finished, which is a weaker claim than the best of the grid.")
+
+
 def print_rankings(manifest):
     """Print the ranking of every hyperparameter on every arm.
 
@@ -66,6 +97,10 @@ def print_rankings(manifest):
         print("=" * 70)
         print(f"Arm: {arm}")
         print("=" * 70)
+        if manifest.get('design') == 'factorial':
+            print_cell_ranking(rank_cells(manifest, arm))
+            print()
+            continue
         for hyperparameter in manifest['grid']:
             ranking = rank_hyperparameter(manifest, arm, hyperparameter)
             direction = 'lowest' if ranking['direction'] == 'min' else 'highest'

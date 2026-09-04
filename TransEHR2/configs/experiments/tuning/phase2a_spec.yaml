@@ -1,0 +1,62 @@
+# Phase 2a: the pretraining learning rate and its schedule, crossed, on both encoding arms.
+#
+# Expand with:
+#     python generate_tuning_configs.py TransEHR2/configs/experiments/tuning/phase2a_spec.yaml
+#
+# The design is factorial rather than additive because these two do not act independently: a
+# high rate held flat is a different proposition from the same rate annealed, and the best
+# pair is not necessarily the pair of individual bests. An additive sweep would measure each
+# against the other's default and then assemble a combination it never ran. Three values each
+# on two arms is 18 pretrains, against 10 for the additive version -- eight runs to keep the
+# interaction in the answer.
+#
+# No finetuning in this phase. Both hyperparameters leave the pretraining objective intact,
+# so the pretraining loss ranks them and one criterion covers the whole grid, which is what a
+# factorial requires.
+
+SPEC_NAME: phase2a
+DESIGN: factorial
+
+BASE_CONFIG: phase2_base.yaml
+DATASET_CONFIG: ../../datasets/mimic4.yaml
+OUTPUT_DIR: phase2a
+MANIFEST: phase2a_manifest.yaml
+
+# fold0 is held out of the manuscript results precisely so that tuning can use it without
+# contaminating them.
+FOLD: fold0
+
+# Both arms are carried forward. Each one's winning cell becomes the encoder its own
+# finetuning grid is measured on, so neither encoding is judged under settings tuned for the
+# other.
+ARMS:
+  additive:
+    POSITION_ENCODING: 'additive'
+  rope:
+    POSITION_ENCODING: 'rope'
+
+# Short tokens used in trial names, which become directory names under models/, log/ and
+# checkpoints/. A factorial name carries both coordinates, so these keep it readable.
+ALIASES:
+  PRETRAIN_LEARNING_RATE: lr
+  PRETRAIN_LR_HALF_LIFE: hl
+
+# The first value of each entry is the default, and the all-defaults cell is flagged as the
+# centre so the arms have a defined pair of runs to be compared at.
+GRID:
+
+  # Half-decade steps spanning a decade. 0.002 is absent: held for a full run it diverged in
+  # half the trials that carried it, and a centre has to be stable for the arms to be
+  # comparable at it. 0.0006 has since pretrained to a usable encoder under a 40-epoch
+  # half-life, so the top of this range is measured rather than assumed.
+  PRETRAIN_LEARNING_RATE:
+    values: [0.0002, 0.0006, 0.00006]
+    select_on: pretrain
+
+  # Half-lives in epochs, geometrically spaced so all three are equally distinguishable. The
+  # scheduler steps every epoch, so lr(e) = lr0 * 0.5 ** (e / H) is the schedule in full.
+  # Against a run whose best epoch lands between 50 and 110, the rate remaining at epoch 100
+  # is 0.65, 0.32 and 0.03 respectively.
+  PRETRAIN_LR_HALF_LIFE:
+    values: [160, 60, 20]
+    select_on: pretrain

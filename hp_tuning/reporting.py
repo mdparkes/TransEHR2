@@ -315,6 +315,15 @@ def build_all_tables(manifest: Dict[str, Any], first_number: int = 1) -> List[Ta
     Returns:
         The tables, in the order they should appear.
     """
+    if manifest.get('design') == 'factorial':
+        # The tables are one block per hyperparameter, which a cross product has no rows for:
+        # each value appears in several cells and none of them is that value's result. A
+        # factorial phase is read from report_tuning_results.py and select_tuned_cell.py.
+        raise NotImplementedError(
+            f"{manifest['spec_name']} is a factorial sweep, which has no per-hyperparameter "
+            f"table to build. Report it with report_tuning_results.py."
+        )
+
     tables = []
     number = first_number
     for arm in manifest['arms']:

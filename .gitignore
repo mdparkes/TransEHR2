@@ -141,3 +141,6 @@ tests/__pycache__/
 
 # Generated finetuning diagnostic configs
 TransEHR2/configs/experiments/ftdiag/
+
+# Generated Phase 2a trial configs
+TransEHR2/configs/experiments/tuning/phase2a/
