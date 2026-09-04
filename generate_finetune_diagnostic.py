@@ -37,10 +37,22 @@ PRETRAIN_OVERRIDES = {
     'PRETRAIN_LR_HALF_LIFE': 40,
 }
 
-# `instay` drops prior admissions. Nothing else differs, so the two variants are comparable.
+# `instay` drops prior admissions, which also moves the value stream's largest gap. The frozen
+# ladder is spaced log-uniformly in period between P_MIN and P_MAX, with P_MAX ~ 63 * gap_max
+# from the informative-band criterion 0.1 <= gap/lambda <= pi. With history the value stream
+# spans 1 - 127,829 h, so P_MAX is 8.05e6; without it the span is the event stream's 1 - 48 h
+# and P_MAX is 63 * 48 = 3024. Left at 8.05e6 for an in-stay run, half the ladder would sit at
+# periods longer than any gap that occurs, phase-static and contributing a constant. P_MIN is
+# 2 * gap_min and does not move: both variants have a smallest gap of one hour.
 VARIANTS = {
-    'history': {'prefix': 'ftdiag', 'overrides': {'USE_HISTORICAL_RECORDS': True}},
-    'instay': {'prefix': 'ftdiag_instay', 'overrides': {'USE_HISTORICAL_RECORDS': False}},
+    'history': {
+        'prefix': 'ftdiag',
+        'overrides': {'USE_HISTORICAL_RECORDS': True, 'VALUE_LADDER_P_MAX': 8.05e6},
+    },
+    'instay': {
+        'prefix': 'ftdiag_instay',
+        'overrides': {'USE_HISTORICAL_RECORDS': False, 'VALUE_LADDER_P_MAX': 3024.0},
+    },
 }
 
 FINETUNE_LEARNING_RATES = [0.0002, 0.00005, 0.00001]
