@@ -62,7 +62,7 @@ PREDICTOR_AGGREGATION_METHOD: "mean"
 MODEL_DIR: "/uhome/pr3/projects/p60290_2/TransEHR2/models"
 
 PRETRAIN_LEARNING_RATE: 0.002
-PRETRAIN_LEARNING_RATE_DECAY: 0.9
+PRETRAIN_LR_HALF_LIFE: 329
 PRETRAIN_TOTAL_EPOCH: 1000
 
 DISC_LOSS_WEIGHT: 1.0
@@ -78,7 +78,7 @@ CMPNT_MASK_RATIO: 0.25
 
 FINETUNE_LEARNING_RATE: 0.0002
 FINETUNE_TOTAL_EPOCH: 500
-FINETUNE_LEARNING_RATE_DECAY: 0.9
+FINETUNE_LR_HALF_LIFE: 132
 
 # Tasks whose binary cross entropy weights the positive term by the ratio of negatives to
 # positives over the training split, so that the two classes contribute equally. Applies to

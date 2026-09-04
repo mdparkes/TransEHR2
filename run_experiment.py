@@ -83,7 +83,7 @@ ALL_TASKS = ('mortality', 'length_of_stay', 'phenotype')
 RECORDED_HYPERPARAMETERS = (
     'POSITION_ENCODING',
     'PRETRAIN_LEARNING_RATE',
-    'PRETRAIN_LEARNING_RATE_DECAY',
+    'PRETRAIN_LR_HALF_LIFE',
     'CMPNT_MASK_RATIO',
     'RECORD_MASK_RATIO',
     'THP_PRED_LOSS_TIME_WT',
@@ -495,7 +495,7 @@ def main():
     PREDICTOR_AGGREGATION_METHOD = experiment_config['PREDICTOR_AGGREGATION_METHOD']
     MODEL_DIR = experiment_config['MODEL_DIR']
     PRETRAIN_LEARNING_RATE = experiment_config.get('PRETRAIN_LEARNING_RATE', 2e-3)
-    PRETRAIN_LEARNING_RATE_DECAY = experiment_config.get('PRETRAIN_LEARNING_RATE_DECAY', 0.9)
+    PRETRAIN_LR_HALF_LIFE = experiment_config.get('PRETRAIN_LR_HALF_LIFE', None)
     PRETRAIN_TOTAL_EPOCH = experiment_config.get('PRETRAIN_TOTAL_EPOCH', 1000)
     DISC_LOSS_WEIGHT = experiment_config.get('DISC_LOSS_WEIGHT', 1.0)
     THP_LOSS_NLL_WEIGHT = experiment_config.get('THP_LOSS_NLL_WEIGHT', 1e-2)
@@ -508,7 +508,7 @@ def main():
     CMPNT_MASK_RATIO = experiment_config.get('CMPNT_MASK_RATIO', 0.25)
     FINETUNE_LEARNING_RATE = experiment_config.get('FINETUNE_LEARNING_RATE', 2e-4)
     FINETUNE_TOTAL_EPOCH = experiment_config.get('FINETUNE_TOTAL_EPOCH', 500)
-    FINETUNE_LEARNING_RATE_DECAY = experiment_config.get('FINETUNE_LEARNING_RATE_DECAY', 0.9)
+    FINETUNE_LR_HALF_LIFE = experiment_config.get('FINETUNE_LR_HALF_LIFE', None)
     # Tasks whose loss weights the positive term by the inverse prevalence of the positive
     # class. Single-label only by default: under a multi-label task the same weighting
     # ranks rare labels above common ones, which is a modelling stance, not a correction.
@@ -528,6 +528,20 @@ def main():
             f"{args.experiment_config} carries HYPERPARAMETERS_TO_TUNE, so it is a tuning "
             f"grid rather than a single configuration. Expand it into one config per trial "
             f"with generate_tuning_configs.py and run those."
+        )
+
+    # The decay factor used to be applied on a fixed multi-epoch cadence, so its value only
+    # meant something alongside that cadence. The schedule is now given as a half-life in
+    # epochs and stepped every epoch. Carrying the old key forward would silently apply a
+    # factor meant for one cadence at another, so refuse it rather than reinterpret it.
+    stale_decay = [key for key in ('PRETRAIN_LEARNING_RATE_DECAY', 'FINETUNE_LEARNING_RATE_DECAY')
+                   if key in experiment_config]
+    if stale_decay:
+        raise ValueError(
+            f"{args.experiment_config} carries {', '.join(stale_decay)}, which no longer has "
+            f"an effect. The learning rate schedule is set by PRETRAIN_LR_HALF_LIFE and "
+            f"FINETUNE_LR_HALF_LIFE, in epochs, applied as lr(e) = lr0 * 0.5 ** (e / H). A "
+            f"factor g formerly applied every I epochs is a half-life of I * ln(0.5) / ln(g)."
         )
 
     fold_name_list = resolve_folds(DATA_DIR, args.folds)
@@ -734,7 +748,7 @@ def main():
                     loaders=dataloader_list,
                     writer=writer,
                     learning_rate=PRETRAIN_LEARNING_RATE,
-                    learning_rate_decay=PRETRAIN_LEARNING_RATE_DECAY,
+                    lr_half_life=PRETRAIN_LR_HALF_LIFE,
                     total_epoch=PRETRAIN_TOTAL_EPOCH,
                     disc_loss_weight=DISC_LOSS_WEIGHT,
                     thp_loss_nll_weight=THP_LOSS_NLL_WEIGHT,
@@ -862,7 +876,7 @@ def main():
                         task=task,
                         writer=writer,
                         learning_rate=FINETUNE_LEARNING_RATE,
-                        learning_rate_decay=FINETUNE_LEARNING_RATE_DECAY,
+                        lr_half_life=FINETUNE_LR_HALF_LIFE,
                         total_epoch=FINETUNE_TOTAL_EPOCH,
                         checkpoint_dir=checkpoint_dir,
                         accelerator=accelerator,

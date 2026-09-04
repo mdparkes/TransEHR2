@@ -91,7 +91,7 @@ PRETRAIN_TOTAL_EPOCH: 200
 
 FINETUNE_LEARNING_RATE: 0.0002
 FINETUNE_TOTAL_EPOCH: 500
-FINETUNE_LEARNING_RATE_DECAY: 0.9
+FINETUNE_LR_HALF_LIFE: 132
 
 # Tasks whose binary cross entropy weights the positive term by the ratio of negatives to
 # positives, measured over the training split, so that the two classes contribute equally.
@@ -125,7 +125,7 @@ THP_PRED_LOSS_TYPE_WT: 1.0
 
 # --- Tuned: the first value of each grid, i.e. the centre of the sweep ---------------------
 PRETRAIN_LEARNING_RATE: 0.0002
-PRETRAIN_LEARNING_RATE_DECAY: 0.90
+PRETRAIN_LR_HALF_LIFE: 329
 CMPNT_MASK_RATIO: 0.25
 RECORD_MASK_RATIO: 0.15
 # 0.01 is Zuo et al.'s time_loss/100, replacing the eyeballed 1e-6 that was submitted. Every

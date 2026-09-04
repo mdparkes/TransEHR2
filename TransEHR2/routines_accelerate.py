@@ -34,6 +34,56 @@ MetadataDict: TypeAlias = Dict[str, Any]
 
 # Steps required before the running median is a usable reference for spike detection.
 SPIKE_MIN_STEPS = 10
+
+# Relative improvement threshold for early stopping, matching ReduceLROnPlateau's default.
+# Without one, "no improvement" means an exactly equal or worse loss, so movement in the fifth
+# decimal place holds a run open and the epoch of the best model becomes a function of numeric
+# noise rather than of convergence.
+IMPROVEMENT_THRESHOLD = 1e-4
+
+
+def resolve_decay_factor(lr_half_life: Optional[float]) -> float:
+    """Per-epoch multiplicative decay factor for a half-life given in epochs.
+
+    The scheduler steps once per epoch, so the factor and the schedule are the same statement:
+    lr(e) = lr0 * 0.5 ** (e / H). Expressing it as a half-life keeps the number in epochs,
+    which is the unit that can be held against how long a run actually lasts; a bare
+    multiplicative factor only means something once the step cadence is also known.
+
+    Args:
+        lr_half_life: Epochs over which the learning rate halves. None or non-positive
+            leaves the rate constant.
+
+    Returns:
+        float: The gamma to pass to ExponentialLR.
+    """
+    if lr_half_life is None or lr_half_life <= 0:
+        return 1.0
+    return 0.5 ** (1.0 / lr_half_life)
+
+
+def is_improvement(current: float, best: float, threshold: float = IMPROVEMENT_THRESHOLD) -> bool:
+    """Whether a validation loss improves on the incumbent by more than a relative threshold.
+
+    Scaled by the magnitude of the incumbent so the test means the same thing for losses of
+    any size. The scaling uses the absolute value rather than the plain ``best * (1 -
+    threshold)`` form, which inverts for a negative loss and would accept a worse value.
+
+    Args:
+        current: The current epoch's validation loss.
+        best: The best validation loss so far, or infinity before any epoch has run.
+        threshold: Minimum relative improvement required.
+
+    Returns:
+        bool: True if current improves on best by more than the threshold.
+    """
+    if not np.isfinite(current):
+        return False
+    if not np.isfinite(best):
+        return True
+    return current < best - abs(best) * threshold
+
+
 StateDict: TypeAlias = OrderedDict[str, Tensor]
 
 
@@ -997,7 +1047,7 @@ def pretrain_model(
     loaders: Tuple[torch.utils.data.DataLoader],
     writer: torch.utils.tensorboard.SummaryWriter,
     learning_rate: float,
-    learning_rate_decay: float = 0.5,
+    lr_half_life: Optional[float] = None,
     total_epoch: int = 100,
     disc_loss_weight: float = 0.5,
     thp_loss_nll_weight: float = 1e-3,
@@ -1026,7 +1076,8 @@ def pretrain_model(
         loaders: Tuple of (train, val) or (train, val, test) DataLoaders
         writer: TensorBoard writer for logging (only used on main process)
         learning_rate: Learning rate for optimizer
-        learning_rate_decay: Exponential decay factor every 50 epochs
+        lr_half_life: Epochs over which the learning rate halves. The scheduler steps every
+            epoch, so this is the schedule in full. None leaves the rate constant.
         total_epoch: Number of training epochs
         disc_loss_weight: Weight for discriminator loss
         thp_loss_nll_weight: Weight for THP NLL loss
@@ -1081,7 +1132,8 @@ def pretrain_model(
 
     # Initialize optimizer and scheduler
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=learning_rate_decay)
+    gamma = resolve_decay_factor(lr_half_life)
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=gamma)
 
     # Initialize loss functions
     #
@@ -1238,7 +1290,7 @@ def pretrain_model(
 
         # Check for improvement
         curr_val_loss = curr_epoch_val_losses['Optimization_Loss']
-        improvement_made = curr_val_loss < best_epoch_val_loss
+        improvement_made = is_improvement(curr_val_loss, best_epoch_val_loss)
 
 
         # Update best losses and state dict if improvement made
@@ -1297,8 +1349,7 @@ def pretrain_model(
             break
 
 
-        if (epoch + 1) % 50 == 0:
-            scheduler.step()
+        scheduler.step()
     
 
     if profiler.enabled:
@@ -1354,7 +1405,7 @@ def finetune_model(
     task: str,
     writer: torch.utils.tensorboard.SummaryWriter,
     learning_rate: float,
-    learning_rate_decay: float = 0.8,
+    lr_half_life: Optional[float] = None,
     total_epoch: int = 100,
     checkpoint_dir: str = None,
     resume_from_checkpoint: bool = True,
@@ -1372,7 +1423,8 @@ def finetune_model(
         task: One of 'mortality', 'length_of_stay', or 'phenotype'
         writer: TensorBoard writer (only used on main process)
         learning_rate: Learning rate for optimizer
-        learning_rate_decay: Learning rate decay factor every 20 epochs
+        lr_half_life: Epochs over which the learning rate halves. The scheduler steps every
+            epoch, so this is the schedule in full. None leaves the rate constant.
         total_epoch: Number of training epochs
         checkpoint_dir: Directory for saving checkpoints
         resume_from_checkpoint: Whether to resume from checkpoint
@@ -1430,7 +1482,8 @@ def finetune_model(
         pos_weight = pos_weight.to(accelerator.device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=learning_rate_decay)
+    gamma = resolve_decay_factor(lr_half_life)
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=gamma)
 
     if accelerator.is_main_process:
         param_shapes = get_param_shapes(model)
@@ -1588,7 +1641,7 @@ def finetune_model(
             current_epoch_val_metric = current_epoch_val_scores['Loss_Cross_Entropy']
         else:
             current_epoch_val_metric = current_epoch_val_scores['Loss_Mean_Squared_Error']
-        improvement_made = current_epoch_val_metric < best_epoch_val_metric
+        improvement_made = is_improvement(current_epoch_val_metric, best_epoch_val_metric)
 
         if improvement_made:
             best_epoch = epoch
@@ -1629,8 +1682,7 @@ def finetune_model(
             break
 
 
-        if (epoch + 1) % 20 == 0:
-            scheduler.step()
+        scheduler.step()
 
     # Save best model
     if accelerator.is_main_process:
@@ -1662,7 +1714,7 @@ def pretrain_with_hyperparameter(
     loaders: Tuple[torch.utils.data.DataLoader],
     writer: torch.utils.tensorboard.SummaryWriter,
     learning_rate: float,
-    learning_rate_decay: float = 0.5,
+    lr_half_life: Optional[float] = None,
     total_epoch: int = 100,
     disc_loss_weight: float = 0.5,
     thp_loss_nll_weight: float = 1e-3,
@@ -1690,7 +1742,8 @@ def pretrain_with_hyperparameter(
         loaders: Tuple of DataLoaders (train, test) or (train, val, test)
         writer: TensorBoard writer (only used on main process)
         learning_rate: Learning rate for optimizer
-        learning_rate_decay: Exponential decay factor every 50 epochs
+        lr_half_life: Epochs over which the learning rate halves. The scheduler steps every
+            epoch, so this is the schedule in full. None leaves the rate constant.
         total_epoch: Number of training epochs
         disc_loss_weight: Weight for discriminator loss
         thp_loss_nll_weight: Weight for THP NLL loss
@@ -1736,7 +1789,8 @@ def pretrain_with_hyperparameter(
 
     # Initialize optimizer and scheduler
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=learning_rate_decay)
+    gamma = resolve_decay_factor(lr_half_life)
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=gamma)
 
 
     # Initialize loss functions
@@ -1877,7 +1931,7 @@ def pretrain_with_hyperparameter(
 
         # Check for improvement
         curr_epoch_val_loss = curr_epoch_val_losses['Optimization_Loss']
-        improvement_made = curr_epoch_val_loss < best_epoch_val_loss
+        improvement_made = is_improvement(curr_epoch_val_loss, best_epoch_val_loss)
 
 
         # Update best losses if improvement made
@@ -1932,8 +1986,7 @@ def pretrain_with_hyperparameter(
                 print(f"\nNo improvement observed within {early_stopping_counter} epochs. Stopping early.\n")
             break
 
-        if (epoch + 1) % 50 == 0:
-            scheduler.step()
+        scheduler.step()
 
 
     # Save final best state and encoder weights to model directory

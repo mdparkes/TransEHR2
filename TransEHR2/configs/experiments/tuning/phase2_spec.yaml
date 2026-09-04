@@ -44,7 +44,7 @@ ARMS:
 # checkpoints/. Without these the names would carry the full hyperparameter key.
 ALIASES:
   PRETRAIN_LEARNING_RATE: lr
-  PRETRAIN_LEARNING_RATE_DECAY: decay
+  PRETRAIN_LR_HALF_LIFE: halflife
   CMPNT_MASK_RATIO: cmask
   RECORD_MASK_RATIO: rmask
   THP_PRED_LOSS_TIME_WT: timewt
@@ -77,8 +77,12 @@ GRID:
     values: [0.0002, 0.0006, 0.00006]
     select_on: pretrain
 
-  PRETRAIN_LEARNING_RATE_DECAY:
-    values: [0.90, 0.80, 0.50]
+  # Half-lives in epochs, converted from the factors this grid used to carry so that the
+  # schedules are unchanged: 0.90, 0.80 and 0.50 applied every fifty epochs are half-lives of
+  # 329, 155 and 50. Held against a run whose best epoch lands between 50 and 110, only the
+  # last of the three halves the rate inside the run at all.
+  PRETRAIN_LR_HALF_LIFE:
+    values: [329, 155, 50]
     select_on: pretrain
 
   CMPNT_MASK_RATIO:
