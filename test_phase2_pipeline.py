@@ -916,7 +916,7 @@ def report_timing(args, report, timings, base_config):
     print("  Both figures carry a 50% buffer and round up to the hour. The finetune number is")
     print("  an upper bound: finetuning drops the generator, discriminator and THP, so its")
     print("  epochs are cheaper than the pretrain epochs it is priced at here. Early stopping")
-    print("  fires after 30 epochs without improvement, so most trials finish well short of")
+    print("  fires after 40 epochs without improvement, so most trials finish well short of")
     print("  either ceiling.")
     report.note(f'Recommended --time: pretrain {pretrain_hours:02d}:00:00, '
                 f'finetune {finetune_hours:02d}:00:00.')

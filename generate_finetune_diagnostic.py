@@ -1,7 +1,7 @@
 """Expand a finetuning diagnostic: one pretrained encoder, a grid of finetuning schedules.
 
-Finetuning currently stops after thirty to forty epochs, which under a patience of thirty
-means the best model lands within the first ten. The grid separates the two candidate causes:
+Finetuning stopped after thirty to forty epochs, which under the patience of thirty in force
+at the time put the best model inside the first ten. The grid separates the two candidate causes:
 a learning rate high enough to overwrite the pretrained encoder before the head can use it,
 and the absence of any annealing. Every cell finetunes from the *same* encoder, so the
 comparison is between finetuning schedules and nothing else.

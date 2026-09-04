@@ -41,6 +41,11 @@ SPIKE_MIN_STEPS = 10
 # noise rather than of convergence.
 IMPROVEMENT_THRESHOLD = 1e-4
 
+# Epochs without improvement before a run is abandoned. Two half-lives of a schedule shorter
+# than this fit inside the window, so a plateau is met by a materially lower learning rate
+# before the run is given up on rather than after.
+EARLY_STOPPING_PATIENCE = 40
+
 
 def resolve_decay_factor(lr_half_life: Optional[float]) -> float:
     """Per-epoch multiplicative decay factor for a half-life given in epochs.
@@ -1343,7 +1348,7 @@ def pretrain_model(
         epoch_seconds.append(time.perf_counter() - epoch_start)
 
         # Early stopping check
-        if early_stopping_counter == 30:
+        if early_stopping_counter >= EARLY_STOPPING_PATIENCE:
             if accelerator.is_main_process:
                 print(f"\nNo improvement observed within {early_stopping_counter} epochs. Stopping early.\n")
             break
@@ -1676,7 +1681,7 @@ def finetune_model(
             )
 
         # Early stopping check
-        if early_stopping_counter == 30:
+        if early_stopping_counter >= EARLY_STOPPING_PATIENCE:
             if accelerator.is_main_process:
                 print(f"\nNo improvement observed within {early_stopping_counter} epochs. Stopping early.\n")
             break
@@ -1981,7 +1986,7 @@ def pretrain_with_hyperparameter(
                 print("\n" + performance_table + "\n")
 
         # Early stopping check
-        if early_stopping_counter == 30:
+        if early_stopping_counter >= EARLY_STOPPING_PATIENCE:
             if accelerator.is_main_process:
                 print(f"\nNo improvement observed within {early_stopping_counter} epochs. Stopping early.\n")
             break

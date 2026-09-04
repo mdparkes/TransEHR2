@@ -83,7 +83,7 @@ PREDICTOR_AGGREGATION_METHOD: "mean"
 
 MODEL_DIR: "/uhome/pr3/projects/p60290_2/TransEHR2/models"
 
-# Tuning budget. Early stopping fires after 30 epochs without improvement, so this is a
+# Tuning budget. Early stopping fires after 40 epochs without improvement, so this is a
 # ceiling rather than a target. The final runs get 1000; selecting under a shorter budget and
 # applying the result to a longer one is standard practice but is worth a line in the methods,
 # particularly for the decay, which is the hyperparameter most sensitive to run length.
