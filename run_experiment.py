@@ -84,6 +84,8 @@ RECORDED_HYPERPARAMETERS = (
     'POSITION_ENCODING',
     'PRETRAIN_LEARNING_RATE',
     'PRETRAIN_LR_HALF_LIFE',
+    'FINETUNE_ENCODER_INIT',
+    'FINETUNE_FREEZE_ENCODER',
     'CMPNT_MASK_RATIO',
     'RECORD_MASK_RATIO',
     'THP_PRED_LOSS_TIME_WT',
@@ -509,6 +511,13 @@ def main():
     FINETUNE_LEARNING_RATE = experiment_config.get('FINETUNE_LEARNING_RATE', 2e-4)
     FINETUNE_TOTAL_EPOCH = experiment_config.get('FINETUNE_TOTAL_EPOCH', 500)
     FINETUNE_LR_HALF_LIFE = experiment_config.get('FINETUNE_LR_HALF_LIFE', None)
+    FINETUNE_ENCODER_INIT = experiment_config.get('FINETUNE_ENCODER_INIT', 'pretrained')
+    FINETUNE_FREEZE_ENCODER = experiment_config.get('FINETUNE_FREEZE_ENCODER', False)
+    if FINETUNE_ENCODER_INIT not in ('pretrained', 'random'):
+        raise ValueError(
+            f"FINETUNE_ENCODER_INIT is {FINETUNE_ENCODER_INIT!r}; expected 'pretrained' "
+            f"or 'random'."
+        )
     # Tasks whose loss weights the positive term by the inverse prevalence of the positive
     # class. Single-label only by default: under a multi-label task the same weighting
     # ranks rare labels above common ones, which is a modelling stance, not a correction.
@@ -849,23 +858,44 @@ def main():
             if not skip_finetuning:
                 downstream_predictor = build_predictor()
 
-                value_encoder_path = os.path.join(model_save_dir, 'value_encoder.pt')
-                event_encoder_path = os.path.join(model_save_dir, 'event_encoder.pt')
-                if not (os.path.exists(value_encoder_path) and os.path.exists(event_encoder_path)):
-                    raise FileNotFoundError(
-                        f"Encoder weights not found in {model_save_dir}. Expected "
-                        f"value_encoder.pt and event_encoder.pt. Pretraining writes both when "
-                        f"it completes, so either it has not run for this configuration or it "
-                        f"did not finish."
+                if FINETUNE_ENCODER_INIT == 'random':
+                    # Control: the encoders keep the initialization build_predictor gave them,
+                    # so the run measures what the downstream head reaches on its own. Read
+                    # against an otherwise identical pretrained run, the gap is what
+                    # pretraining contributed.
+                    print("\nFINETUNE_ENCODER_INIT is 'random': pretrained weights not loaded\n")
+                else:
+                    value_encoder_path = os.path.join(model_save_dir, 'value_encoder.pt')
+                    event_encoder_path = os.path.join(model_save_dir, 'event_encoder.pt')
+                    if not (os.path.exists(value_encoder_path)
+                            and os.path.exists(event_encoder_path)):
+                        raise FileNotFoundError(
+                            f"Encoder weights not found in {model_save_dir}. Expected "
+                            f"value_encoder.pt and event_encoder.pt. Pretraining writes both "
+                            f"when it completes, so either it has not run for this "
+                            f"configuration or it did not finish."
+                        )
+                    print(f"\nLoading encoder weights from {model_save_dir}\n")
+                    downstream_predictor.val_encoder.load_state_dict(
+                        torch.load(value_encoder_path, map_location='cpu', weights_only=False)
                     )
-                print(f"\nLoading encoder weights from {model_save_dir}\n")
-                downstream_predictor.val_encoder.load_state_dict(
-                    torch.load(value_encoder_path, map_location='cpu', weights_only=False)
-                )
-                downstream_predictor.event_encoder.load_state_dict(
-                    torch.load(event_encoder_path, map_location='cpu', weights_only=False)
-                )
-                print("Successfully loaded encoder weights\n")
+                    downstream_predictor.event_encoder.load_state_dict(
+                        torch.load(event_encoder_path, map_location='cpu', weights_only=False)
+                    )
+                    print("Successfully loaded encoder weights\n")
+
+                if FINETUNE_FREEZE_ENCODER:
+                    # Control: only the head and the aggregation above it learn, so the run
+                    # measures the encoder as pretraining left it rather than as finetuning
+                    # would reshape it. Dropout inside the encoder stays active, as it does in
+                    # an unfrozen run.
+                    frozen = 0
+                    for encoder in (downstream_predictor.val_encoder,
+                                    downstream_predictor.event_encoder):
+                        for parameter in encoder.parameters():
+                            parameter.requires_grad_(False)
+                            frozen += parameter.numel()
+                    print(f"Encoders frozen: {frozen:,} parameters excluded from the update\n")
 
                 timer.start_phase('finetune', is_main_process=True)
                 try:

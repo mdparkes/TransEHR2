@@ -1,13 +1,20 @@
 """Expand a finetuning diagnostic: one pretrained encoder, a grid of finetuning schedules.
 
-Finetuning stopped after thirty to forty epochs, which under the patience of thirty in force
-at the time put the best model inside the first ten. The grid separates the two candidate causes:
-a learning rate high enough to overwrite the pretrained encoder before the head can use it,
-and the absence of any annealing. Every cell finetunes from the *same* encoder, so the
-comparison is between finetuning schedules and nothing else.
+The grid crosses finetuning learning rates with decay half-lives. Every cell finetunes from
+the same encoder, so the comparison is between finetuning settings and nothing else. Two
+control cells sit alongside it at a fixed reference setting:
+
+    random  the encoders are not loaded, so the run measures what the head reaches without
+            anything pretraining produced. Read against the matching grid cell, the gap is
+            pretraining's contribution.
+    frozen  the encoders are loaded but excluded from the update, so the run measures the
+            encoder as pretraining left it rather than as finetuning reshapes it.
+
+Two variants are available. `history` includes prior admissions; `instay` restricts the record
+to the current stay, which is the setting Xu et al. published on.
 
 Expand with:
-    python generate_finetune_diagnostic.py
+    python generate_finetune_diagnostic.py --variant instay
 
 Then pretrain once, link the encoder into each cell, and finetune. The script prints the
 commands.
@@ -20,24 +27,35 @@ import yaml
 
 BASE_CONFIG = 'TransEHR2/configs/experiments/tuning/phase2_base.yaml'
 OUTPUT_DIR = 'TransEHR2/configs/experiments/ftdiag'
-PRETRAIN_NAME = 'ftdiag_pretrain'
 
-# The encoder every cell shares. Additive rather than RoPE because the failure showed up in
-# both arms, so the cheaper one is enough to diagnose it, and a half-life of 40 against a
-# pretraining run that peaks between epoch 50 and 110 anneals well inside the run.
+# The encoder every cell shares. Additive rather than RoPE because the failure appeared in
+# both arms, so the cheaper one is enough, and a half-life of 40 anneals well inside a
+# pretraining run whose best epoch lands between 50 and 110.
 PRETRAIN_OVERRIDES = {
     'POSITION_ENCODING': 'additive',
     'PRETRAIN_LEARNING_RATE': 0.0006,
     'PRETRAIN_LR_HALF_LIFE': 40,
 }
 
-# 0.0002 is what finetuning runs today and is the value under suspicion. The other two step
-# down toward the range used for finetuning a pretrained transformer.
+# `instay` drops prior admissions. Nothing else differs, so the two variants are comparable.
+VARIANTS = {
+    'history': {'prefix': 'ftdiag', 'overrides': {'USE_HISTORICAL_RECORDS': True}},
+    'instay': {'prefix': 'ftdiag_instay', 'overrides': {'USE_HISTORICAL_RECORDS': False}},
+}
+
 FINETUNE_LEARNING_RATES = [0.0002, 0.00005, 0.00001]
 
-# None is the control: it holds the rate constant, so a difference between it and the other
-# two is attributable to annealing rather than to the rate itself.
-FINETUNE_HALF_LIVES = [None, 60, 20]
+# None holds the rate constant, so a difference between it and the others is attributable to
+# annealing rather than to the rate.
+FINETUNE_HALF_LIVES = [None, 120, 160]
+
+# The setting the controls run at, which must also be a cell of the grid so the three are read
+# against each other at one rate and one schedule.
+CONTROL_REFERENCE = {'FINETUNE_LEARNING_RATE': 0.00005, 'FINETUNE_LR_HALF_LIFE': None}
+CONTROLS = {
+    'ctl_random': {'FINETUNE_ENCODER_INIT': 'random'},
+    'ctl_frozen': {'FINETUNE_FREEZE_ENCODER': True},
+}
 
 # Weights written by pretraining that a finetune reads back.
 ENCODER_FILES = ('pretrained.pt', 'value_encoder.pt', 'event_encoder.pt')
@@ -47,23 +65,25 @@ def token(value):
     """Filename-safe token for a hyperparameter value."""
     if value is None:
         return 'flat'
-    text = f'{value:g}'
-    return text.replace('.', 'p').replace('-', 'm').replace('+', '')
+    return f'{value:g}'.replace('.', 'p').replace('-', 'm').replace('+', '')
 
 
-def cells():
-    """The grid, as (name, overrides) pairs."""
+def cells(prefix):
+    """The grid and the controls, as (name, overrides) pairs."""
     for rate in FINETUNE_LEARNING_RATES:
         for half_life in FINETUNE_HALF_LIVES:
-            name = f'ftdiag_lr{token(rate)}_hl{token(half_life)}'
-            yield name, {'FINETUNE_LEARNING_RATE': rate, 'FINETUNE_LR_HALF_LIFE': half_life}
+            yield (f'{prefix}_lr{token(rate)}_hl{token(half_life)}',
+                   {'FINETUNE_LEARNING_RATE': rate, 'FINETUNE_LR_HALF_LIFE': half_life})
+    for name, overrides in CONTROLS.items():
+        yield f'{prefix}_{name}', dict(CONTROL_REFERENCE, **overrides)
 
 
-def write_config(base, name, overrides, output_dir, header):
+def write_config(base, name, overrides, variant_overrides, output_dir, header):
     """Write one experiment config, and return its path."""
     config = dict(base)
     config['EXPERIMENT_NAME'] = name
     config.update(PRETRAIN_OVERRIDES)
+    config.update(variant_overrides)
     config.update(overrides)
     path = os.path.join(output_dir, f'{name}.yaml')
     with open(path, 'w') as f_out:
@@ -75,33 +95,40 @@ def write_config(base, name, overrides, output_dir, header):
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--variant', default='history', choices=sorted(VARIANTS),
+                        help='Record scope the whole diagnostic runs under')
     parser.add_argument('--base', default=BASE_CONFIG, help='Config the cells inherit from')
     parser.add_argument('--output_dir', default=OUTPUT_DIR, help='Where to write the configs')
     parser.add_argument('--fold', default='fold0', help='Fold the diagnostic runs on')
     args = parser.parse_args()
+
+    variant = VARIANTS[args.variant]
+    prefix = variant['prefix']
+    pretrain_name = f'{prefix}_pretrain'
 
     with open(args.base) as f_in:
         base = yaml.safe_load(f_in)
     base.pop('HYPERPARAMETERS_TO_TUNE', None)
     os.makedirs(args.output_dir, exist_ok=True)
 
-    header = (f'# Generated by generate_finetune_diagnostic.py from {args.base}\n'
-              f'# Do not edit by hand -- regenerate instead.\n\n')
+    header = (f'# Generated by generate_finetune_diagnostic.py --variant {args.variant}\n'
+              f'# from {args.base}. Do not edit by hand -- regenerate instead.\n\n')
 
-    pretrain_path = write_config(base, PRETRAIN_NAME, {}, args.output_dir, header)
-    cell_paths = [(name, write_config(base, name, overrides, args.output_dir, header))
-                  for name, overrides in cells()]
+    pretrain_path = write_config(base, pretrain_name, {}, variant['overrides'],
+                                 args.output_dir, header)
+    cell_paths = [(name, write_config(base, name, overrides, variant['overrides'],
+                                      args.output_dir, header))
+                  for name, overrides in cells(prefix)]
 
     model_dir = base['MODEL_DIR']
-    print(f'Base config:  {args.base}')
-    print(f'Encoder:      {PRETRAIN_NAME}  '
-          f'({PRETRAIN_OVERRIDES["POSITION_ENCODING"]}, '
-          f'lr {PRETRAIN_OVERRIDES["PRETRAIN_LEARNING_RATE"]}, '
-          f'half-life {PRETRAIN_OVERRIDES["PRETRAIN_LR_HALF_LIFE"]})')
+    print(f'Variant:      {args.variant}  '
+          f'(USE_HISTORICAL_RECORDS={variant["overrides"]["USE_HISTORICAL_RECORDS"]})')
+    print(f'Encoder:      {pretrain_name}')
     print(f'Cells:        {len(cell_paths)}  '
-          f'({len(FINETUNE_LEARNING_RATES)} rates x {len(FINETUNE_HALF_LIVES)} half-lives)\n')
+          f'({len(FINETUNE_LEARNING_RATES)} rates x {len(FINETUNE_HALF_LIVES)} half-lives '
+          f'+ {len(CONTROLS)} controls)\n')
     for name, path in cell_paths:
-        print(f'  {name:<34} {path}')
+        print(f'  {name:<40} {path}')
 
     # slurm_run_experiment.sh indexes FOLDS by the array id and defaults to the five
     # manuscript folds, so a single-fold run has to name the fold and take one array task.
@@ -110,13 +137,14 @@ def main():
     print(f'   TASKS=none {launch} {pretrain_path}')
     print('\n2. Link that encoder into every cell, so each one skips pretraining and they all')
     print('   finetune from identical weights:')
-    print(f'   src="{model_dir}/{PRETRAIN_NAME}/{args.fold}/pretrained"')
+    print(f'   src="{model_dir}/{pretrain_name}/{args.fold}/pretrained"')
     print(f'   for cell in {" ".join(name for name, _ in cell_paths)}; do')
     print(f'     dst="{model_dir}/$cell/{args.fold}/pretrained"; mkdir -p "$dst"')
     print(f'     for f in {" ".join(ENCODER_FILES)}; do ln -sf "$src/$f" "$dst/$f"; done')
     print('   done')
     print('\n3. Finetune every cell:')
-    print(f'   for cfg in {args.output_dir}/ftdiag_lr*.yaml; do')
+    print(f'   for cfg in {args.output_dir}/{prefix}_lr*.yaml '
+          f'{args.output_dir}/{prefix}_ctl_*.yaml; do')
     print(f'     TASKS=mortality {launch} "$cfg"')
     print('   done')
 
