@@ -26,9 +26,18 @@ import sys
 import yaml
 from scipy import stats
 
+from hp_tuning.reporting import print_table
+
 DEFAULT_BASE_CONFIG = 'TransEHR2/configs/experiments/tuning/phase2_base.yaml'
 DEFAULT_METRICS = 'val:Best_Epoch,val:AUPRC,val:AUROC,test:AUPRC,test:AUROC,test:F1_Score'
-BLOCKS = {'train': 'train_scores', 'val': 'validation_scores', 'test': 'test_scores'}
+# A finetuned task writes *_scores; pretraining writes *_losses. One prefix reads either, so
+# a metric spec does not have to know which stage produced the file.
+BLOCKS = {
+    'train': ('train_scores', 'train_losses'),
+    'val': ('validation_scores', 'val_losses'),
+    'test': ('test_scores',),
+}
+PRETRAIN_METRICS = 'val:Best_Epoch,val:Optimization_Loss,val:Generator_Loss,val:THP_NLL_Loss'
 SEED_PATTERN = re.compile(r'^(?P<group>.+)_seed(?P<seed>\d+)$')
 
 
@@ -91,10 +100,11 @@ def metric_value(data, spec):
         The value, or None if the block or the metric is absent.
     """
     block_name, _, metric = spec.partition(':')
-    block = data.get(BLOCKS.get(block_name, block_name))
-    if not isinstance(block, dict):
-        return None
-    return block.get(metric)
+    for candidate in BLOCKS.get(block_name, (block_name,)):
+        block = data.get(candidate)
+        if isinstance(block, dict) and metric in block:
+            return block[metric]
+    return None
 
 
 def varying_hyperparameters(runs):
@@ -133,22 +143,6 @@ def render(value):
     if abs(value) < 1e-3 or abs(value) >= 1000:
         return f'{value:g}'
     return f'{value:.4f}'
-
-
-def print_table(rows, headers):
-    """Print rows as an aligned fixed-width table.
-
-    Args:
-        rows: Sequence of sequences of already-rendered cells.
-        headers: Column headers.
-    """
-    widths = [max(len(str(headers[i])), *(len(row[i]) for row in rows)) if rows
-              else len(str(headers[i])) for i in range(len(headers))]
-    line = '  '.join(str(h).ljust(w) for h, w in zip(headers, widths))
-    print(line)
-    print('  '.join('-' * w for w in widths))
-    for row in rows:
-        print('  '.join(cell.ljust(w) for cell, w in zip(row, widths)))
 
 
 def paired_report(runs, spec):
@@ -233,8 +227,10 @@ def main(argv=None):
     parser.add_argument('--fold', default='fold0', help='Fold to read')
     parser.add_argument('--task', default='mortality',
                         help="Task to read, or 'pretrain' for the pretraining evaluation")
-    parser.add_argument('--metrics', default=DEFAULT_METRICS,
-                        help='Comma-separated block:metric specs')
+    parser.add_argument('--metrics', default=None,
+                        help='Comma-separated block:metric specs. Defaults to the task\'s '
+                             'ranking metrics, or to the pretraining losses under '
+                             "--task pretrain.")
     parser.add_argument('--sort', default=None,
                         help='Metric spec to sort by, best first')
     parser.add_argument('--paired', action='store_true',
@@ -271,7 +267,8 @@ def main(argv=None):
         print("Nothing to tabulate. The matched experiments have not written results yet.")
         return 1
 
-    metrics = [spec.strip() for spec in args.metrics.split(',') if spec.strip()]
+    chosen = args.metrics or (PRETRAIN_METRICS if args.task == 'pretrain' else DEFAULT_METRICS)
+    metrics = [spec.strip() for spec in chosen.split(',') if spec.strip()]
     hyperparameters = varying_hyperparameters(runs)
 
     # A shared prefix says the same thing on every row, so it moves into the header.
@@ -281,8 +278,13 @@ def main(argv=None):
         print(f"Names are shown without their common prefix {prefix!r}\n")
 
     if args.sort:
-        runs.sort(key=lambda pair: (metric_value(pair[1], args.sort) is None,
-                                    -(metric_value(pair[1], args.sort) or 0)))
+        # A loss is better when small and a score when large, so the direction follows the
+        # metric name rather than being another thing to remember.
+        descending = 'loss' not in args.sort.lower()
+        runs.sort(key=lambda pair: (
+            metric_value(pair[1], args.sort) is None,
+            -(metric_value(pair[1], args.sort) or 0) if descending
+            else (metric_value(pair[1], args.sort) or 0)))
 
     headers = (['experiment'] + [key.replace('FINETUNE_', 'FT_').replace('PRETRAIN_', 'PT_')
                                  for key in hyperparameters] + metrics)

@@ -28,7 +28,7 @@ import argparse
 import os
 import sys
 
-from hp_tuning.reporting import format_grid_value, format_metric, write_tables
+from hp_tuning.reporting import format_grid_value, format_metric, print_table, write_tables
 from hp_tuning.results import compare_arms, progress, rank_cells, rank_hyperparameter
 from hp_tuning.spec import load_manifest
 
@@ -101,28 +101,32 @@ def print_rankings(manifest):
             print_cell_ranking(rank_cells(manifest, arm))
             print()
             continue
+        rows, notes = [], []
         for hyperparameter in manifest['grid']:
             ranking = rank_hyperparameter(manifest, arm, hyperparameter)
             direction = 'lowest' if ranking['direction'] == 'min' else 'highest'
-            print(f"\n  {hyperparameter}")
-            print(f"    selected on {ranking['criterion']}: {direction} "
-                  f"{ranking['metric']}")
-            for result in ranking['results']:
-                marker = '  <-- selected' if (
-                    ranking['best'] is not None and result is ranking['best']
-                ) else ''
-                if result.is_usable:
-                    shown = format_metric(result.value)
-                else:
-                    shown = f'[{result.status}]'
-                print(f"      {format_grid_value(result.grid_value):>10}  "
-                      f"{shown:>12}{marker}")
+            for index, result in enumerate(ranking['results']):
+                selected = ranking['best'] is not None and result is ranking['best']
+                shown = format_metric(result.value) if result.is_usable \
+                    else f'[{result.status}]'
+                rows.append([
+                    hyperparameter if index == 0 else '',
+                    format_grid_value(result.grid_value),
+                    shown,
+                    '<-- selected' if selected else '',
+                    f"{ranking['criterion']}, {direction} {ranking['metric']}"
+                    if index == 0 else '',
+                ])
                 if not result.is_usable:
-                    print(f"                    {result.detail}")
+                    notes.append(f"  {hyperparameter}="
+                                 f"{format_grid_value(result.grid_value)}: {result.detail}")
             if not ranking['complete']:
-                print("      NOTE incomplete: the selection above is the best of the trials "
-                      "that finished,")
-                print("           which is a weaker claim than the best of the grid.")
+                notes.append(f"  {hyperparameter}: incomplete, so the selection is the best "
+                             f"of the trials that finished")
+        print()
+        print_table(rows, ['hyperparameter', 'value', 'metric', '', 'ranked on'], indent='  ')
+        for note in notes:
+            print(note)
         print()
 
     if len(manifest['arms']) > 1:
