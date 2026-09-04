@@ -147,3 +147,6 @@ TransEHR2/configs/experiments/tuning/phase2a/
 
 # Generated Phase 2b finetuning grid configs
 TransEHR2/configs/experiments/tuning/phase2b/
+
+# Generated head-to-head repeat configs
+TransEHR2/configs/experiments/tuning/phase2h/

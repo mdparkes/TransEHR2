@@ -97,6 +97,29 @@ def token(value):
     return f'{value:g}'.replace('.', 'p').replace('-', 'm').replace('+', '')
 
 
+def seed_cells(prefix, rate, half_life, seeds):
+    """One cell per seed at a single finetuning configuration.
+
+    A repeat measures run-to-run spread at a settled configuration, which is what a grid with
+    one seed cannot do. Giving both arms the same seeds pairs the repeats, so the comparison
+    between them is within-seed and the seed variance drops out of it.
+
+    Args:
+        prefix: Name prefix for every cell.
+        rate: The finetuning learning rate every repeat uses.
+        half_life: The finetuning decay half-life every repeat uses.
+        seeds: The seeds, one repeat each.
+
+    Yields:
+        Tuples of (experiment name, config overrides).
+    """
+    for seed in seeds:
+        yield (f'{prefix}_seed{seed}',
+               {'FINETUNE_LEARNING_RATE': rate,
+                'FINETUNE_LR_HALF_LIFE': half_life,
+                'FINETUNE_SEED': seed})
+
+
 def cells(prefix, rates, half_lives, controls=True):
     """The grid, and the controls if they are wanted, as (name, overrides) pairs.
 
@@ -163,6 +186,11 @@ def main():
                              '"flat" holds the rate constant.')
     parser.add_argument('--no_controls', action='store_true',
                         help='Omit the random-encoder and frozen-encoder cells')
+    parser.add_argument('--seeds', default=None,
+                        help='Comma-separated seeds. Replaces the grid with one repeat per '
+                             'seed at a single configuration, so --rates and --half_lives '
+                             'must each name one value. Give both arms the same seeds to '
+                             'pair the repeats.')
     parser.add_argument('--output_dir', default=OUTPUT_DIR, help='Where to write the configs')
     parser.add_argument('--fold', default='fold0', help='Fold the cells run on')
     args = parser.parse_args()
@@ -173,6 +201,10 @@ def main():
 
     rates = parse_values(args.rates, float)
     half_lives = parse_values(args.half_lives, float)
+    seeds = parse_values(args.seeds, int) if args.seeds else None
+    if seeds is not None and (len(rates) != 1 or len(half_lives) != 1):
+        parser.error('--seeds repeats one configuration, so --rates and --half_lives must '
+                     'each name a single value.')
 
     if args.encoder:
         upstream = {}
@@ -195,17 +227,24 @@ def main():
     pretrain_path = None
     if not args.encoder:
         pretrain_path = write_config(base, encoder_name, {}, upstream, args.output_dir, header)
+    if seeds is not None:
+        plan = seed_cells(prefix, rates[0], half_lives[0], seeds)
+    else:
+        plan = cells(prefix, rates, half_lives, controls=not args.no_controls)
     cell_paths = [(name, write_config(base, name, overrides, upstream, args.output_dir, header))
-                  for name, overrides in cells(prefix, rates, half_lives,
-                                               controls=not args.no_controls)]
+                  for name, overrides in plan]
 
     model_dir = base['MODEL_DIR']
     print(f'Base config:  {args.base}')
     print(f'Encoder:      {encoder_name}'
           f'{"  (existing, linked)" if args.encoder else "  (pretrained by step 1)"}')
-    print(f'Cells:        {len(cell_paths)}  '
-          f'({len(rates)} rates x {len(half_lives)} half-lives'
-          f'{"" if args.no_controls else f" + {len(CONTROLS)} controls"})\n')
+    if seeds is not None:
+        print(f'Cells:        {len(cell_paths)}  (one repeat per seed at lr {rates[0]:g}, '
+              f'half-life {half_lives[0]})\n')
+    else:
+        print(f'Cells:        {len(cell_paths)}  '
+              f'({len(rates)} rates x {len(half_lives)} half-lives'
+              f'{"" if args.no_controls else f" + {len(CONTROLS)} controls"})\n')
     for name, path in cell_paths:
         print(f'  {name:<44} {path}')
 
@@ -230,8 +269,11 @@ def main():
     print('   done')
     step += 1
     print(f'\n{step}. Finetune every cell:')
-    print(f'   for cfg in {args.output_dir}/{prefix}_lr*.yaml'
-          f'{"" if args.no_controls else f" {args.output_dir}/{prefix}_ctl_*.yaml"}; do')
+    if seeds is not None:
+        print(f'   for cfg in {args.output_dir}/{prefix}_seed*.yaml; do')
+    else:
+        print(f'   for cfg in {args.output_dir}/{prefix}_lr*.yaml'
+              f'{"" if args.no_controls else f" {args.output_dir}/{prefix}_ctl_*.yaml"}; do')
     print(f'     TASKS=mortality {launch} "$cfg"')
     print('   done')
 
