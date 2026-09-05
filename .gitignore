@@ -146,4 +146,10 @@ TransEHR2/configs/experiments/tuning/phase2b/
 TransEHR2/configs/experiments/tuning/phase2c_additive/
 TransEHR2/configs/experiments/tuning/phase2c_rope/
 TransEHR2/configs/experiments/tuning/phase2d/
+
+# Experiment configs. Untracked so the repository never holds two configurations that claim
+# to describe the same experiment: the ones the revision runs are assembled from what the
+# tuning phases select, and a stale committed copy beside them would be indistinguishable.
+# Kept on disk, so anything already pointing at one still works.
+TransEHR2/configs/experiments/experiment*.yaml
 TransEHR2/configs/experiments/tuning/phase2h/

@@ -112,7 +112,7 @@ python embed_text.py --data-dir ${DATA_DIR}
 **3. Train and evaluate.**
 
 ```shell
-python run_experiment.py TransEHR2/configs/datasets/mimic4.yaml TransEHR2/configs/experiments/experiment1_baseline.yaml
+python run_experiment.py TransEHR2/configs/datasets/mimic4.yaml TransEHR2/configs/experiments/<experiment>.yaml
 ```
 
 `--folds` restricts the run to particular folds and `--tasks` to particular tasks, which is how the work is spread across jobs. `fold0` is reserved for hyperparameter tuning and is excluded from reported results.
@@ -152,7 +152,7 @@ A sweep is described by a spec under `TransEHR2/configs/experiments/tuning/`. Th
 
 ```shell
 # Expand the spec into one config per trial, plus a manifest
-python generate_tuning_configs.py TransEHR2/configs/experiments/tuning/phase2_spec.yaml
+python generate_tuning_configs.py TransEHR2/configs/experiments/tuning/<spec>.yaml
 
 # Run trial $SLURM_ARRAY_TASK_ID; prints the config path for run_experiment.py
 python tuning_trial.py ${MANIFEST} ${SLURM_ARRAY_TASK_ID}
