@@ -1,0 +1,79 @@
+# Base config for the Phase 3 pre-admission history sweep.
+#
+# The encoding arm and the five tuned hyperparameters are the ones Phase 2 settled. The additive
+# arm won the paired head-to-head against rope on fold0 mortality AUPRC; its coordinate winners
+# and the numbers behind them are recorded in phase2c_additive_selection.yaml, and the schedules
+# come from the phase2a factorial cell in phase2a_additive_cell.yaml. Every value below therefore
+# has a decision record beside it in this directory.
+#
+# This is the same configuration as phase2d_additive_base.yaml. The two must not drift: any
+# re-derivation of a Phase 2 winner has to land in both.
+#
+# HISTORY_LEN_STEPS is null -- use the full extracted history -- and every trial in the sweep
+# overrides it. The 500 arm is the extraction capacity, so it reproduces this default.
+
+BATCH_SIZE: 200
+DISCRIMINATOR_DIM_FEEDFORWARD: 256
+DISCRIMINATOR_ENCODER_ACTIVATION: gelu
+DISCRIMINATOR_ENCODER_DIM_FEEDFORWARD: 256
+DISCRIMINATOR_ENCODER_DROPOUT: 0.1
+DISCRIMINATOR_ENCODER_D_MODEL: 256
+DISCRIMINATOR_ENCODER_NORM: LayerNorm
+DISCRIMINATOR_ENCODER_NORM_FIRST: true
+DISCRIMINATOR_ENCODER_N_ENCODER_BLOCKS: 1
+DISCRIMINATOR_ENCODER_N_HEADS: 2
+DISC_LOSS_WEIGHT: 1.0
+EPISODE_LEN_STEPS: null
+EVENT_LADDER_P_MAX: 3000.0
+EVENT_LADDER_P_MIN: 2.0
+FINETUNE_LEARNING_RATE: 1.0e-05
+FINETUNE_LR_HALF_LIFE: 160
+FINETUNE_POS_WEIGHT_TASKS:
+- mortality
+FINETUNE_TOTAL_EPOCH: 500
+GENERATOR_DIM_FEEDFORWARD: 256
+GENERATOR_D_MODEL: 256
+GENERATOR_ENCODER_ACTIVATION: gelu
+GENERATOR_ENCODER_DIM_FEEDFORWARD: 256
+GENERATOR_ENCODER_DROPOUT: 0.1
+GENERATOR_ENCODER_D_MODEL: 256
+GENERATOR_ENCODER_NORM: LayerNorm
+GENERATOR_ENCODER_NORM_FIRST: true
+GENERATOR_ENCODER_N_ENCODER_BLOCKS: 1
+GENERATOR_ENCODER_N_HEADS: 2
+HISTORY_LEN_STEPS: null
+MODEL_DIR: /uhome/pr3/projects/p60290_2/TransEHR2/models
+OBS_UNOBS_SAMPLE_RATIO: 10.0
+POSITION_ENCODING: additive
+PREDICTOR_AGGREGATION_METHOD: mean
+PREDICT_INDICATORS: false
+PRETRAIN_LEARNING_RATE: 0.0006
+PRETRAIN_LR_HALF_LIFE: 160
+PRETRAIN_TOTAL_EPOCH: 200
+THP_ENCODER_DROPOUT: 0.1
+THP_ENCODER_D_INNER: 256
+THP_ENCODER_D_K: 128
+THP_ENCODER_D_MODEL: 256
+THP_ENCODER_D_V: 64
+THP_ENCODER_NORM_FIRST: true
+THP_ENCODER_N_HEADS: 2
+THP_ENCODER_N_LAYERS: 1
+THP_LOSS_MC_SAMPLES: 100
+THP_LOSS_NLL_WEIGHT: 0.01
+THP_PRED_LOSS_TYPE_WT: 1.0
+USE_HISTORICAL_RECORDS: true
+USE_TEXT: true
+USE_THP_PRED_LOSS: true
+VALUE_LADDER_P_MAX: 8050000.0
+VALUE_LADDER_P_MIN: 2.0
+CMPNT_MASK_RATIO: 0.25
+RECORD_MASK_RATIO: 0.25
+THP_PRED_LOSS_TIME_WT: 0.01
+
+# Both stages are seeded, and every arm inherits the same pair, so the arms differ in the crop
+# window and nothing else. Weight initialisation, masking draws and batch order are held fixed
+# across the sweep; the seeds are not resampled here, so an arm's margin carries no error bar.
+PRETRAIN_SEED: 0
+FINETUNE_SEED: 0
+
+EXPERIMENT_NAME: phase3_base
