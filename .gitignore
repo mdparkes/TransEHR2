@@ -152,4 +152,9 @@ TransEHR2/configs/experiments/tuning/phase2d/
 # tuning phases select, and a stale committed copy beside them would be indistinguishable.
 # Kept on disk, so anything already pointing at one still works.
 TransEHR2/configs/experiments/experiment*.yaml
+
+# The grid the pre-phase tuner read. Superseded by the phase specs under tuning/, and only the
+# unsupported accelerate tuner still reads it. tune_sequence_lengths.yaml stays tracked: the
+# sequence length sweep has not run yet.
+TransEHR2/configs/experiments/tune_hyperparameters.yaml
 TransEHR2/configs/experiments/tuning/phase2h/
