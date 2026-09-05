@@ -1,0 +1,63 @@
+spec_name: phase2c_additive
+manifest: /projects/p60290_2/TransEHR2/TransEHR2/configs/experiments/tuning/phase2c_additive_manifest.yaml
+fold: fold0
+arm: tuned
+arm_chosen_by: command line
+selected:
+  CMPNT_MASK_RATIO:
+    value: 0.25
+    criterion: mortality
+    metric: AUPRC
+    direction: max
+    metric_value: 0.5997120174533633
+    trial: phase2c_additive_tuned_centre
+    grid:
+    - 0.25
+    - 0.5
+    - 0.75
+    complete: true
+    measured:
+      '0.25': 0.5997120174533633
+      '0.5': 0.5941395627785094
+      '0.75': 0.59375813349441
+  RECORD_MASK_RATIO:
+    value: 0.25
+    criterion: mortality
+    metric: AUPRC
+    direction: max
+    metric_value: 0.6060876966510192
+    trial: phase2c_additive_tuned_rmask_0p25
+    grid:
+    - 0.15
+    - 0.25
+    - 0.35
+    complete: true
+    measured:
+      '0.15': 0.5997120174533633
+      '0.25': 0.6060876966510192
+      '0.35': 0.5941634828965936
+  THP_PRED_LOSS_TIME_WT:
+    value: 0.01
+    criterion: mortality
+    metric: AUPRC
+    direction: max
+    metric_value: 0.5997120174533633
+    trial: phase2c_additive_tuned_centre
+    grid:
+    - 0.01
+    - 0.001
+    - 0.0001
+    complete: true
+    measured:
+      '0.01': 0.5997120174533633
+      '0.001': 0.5878313414007746
+      '0.0001': 0.5918563444596785
+caveats:
+- 'Additive sweep: each hyperparameter was tuned against the others at their defaults,
+  so this combination of winners was never run as a configuration. Phase 4 validates
+  it on the manuscript folds.'
+- Hyperparameters were selected under the tuning epoch budget and are applied to much
+  longer final runs. Learning rate decay is the one most sensitive to that gap and
+  the one most worth a line in the methods section.
+- Selected on fold0 alone, which is the fold held out of the manuscript results for
+  exactly this purpose.
