@@ -47,6 +47,24 @@ STATUS_TEXT = {
 }
 
 
+def print_table(rows: List[List[str]], headers: List[str], indent: str = '') -> None:
+    """Print already-rendered rows as an aligned fixed-width table.
+
+    Args:
+        rows: One list of cells per row. Cells are rendered before they get here.
+        headers: Column headers.
+        indent: Prefix for every line.
+    """
+    widths = [
+        max([len(str(headers[i]))] + [len(row[i]) for row in rows])
+        for i in range(len(headers))
+    ]
+    print(indent + '  '.join(str(h).ljust(w) for h, w in zip(headers, widths)))
+    print(indent + '  '.join('-' * w for w in widths))
+    for row in rows:
+        print(indent + '  '.join(cell.ljust(w) for cell, w in zip(row, widths)))
+
+
 def format_metric(value: Optional[float]) -> str:
     """Render a metric for a table cell.
 
@@ -315,6 +333,15 @@ def build_all_tables(manifest: Dict[str, Any], first_number: int = 1) -> List[Ta
     Returns:
         The tables, in the order they should appear.
     """
+    if manifest.get('design') == 'factorial':
+        # The tables are one block per hyperparameter, which a cross product has no rows for:
+        # each value appears in several cells and none of them is that value's result. A
+        # factorial phase is read from report_tuning_results.py and select_tuned_cell.py.
+        raise NotImplementedError(
+            f"{manifest['spec_name']} is a factorial sweep, which has no per-hyperparameter "
+            f"table to build. Report it with report_tuning_results.py."
+        )
+
     tables = []
     number = first_number
     for arm in manifest['arms']:

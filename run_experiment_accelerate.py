@@ -211,7 +211,7 @@ if __name__ == "__main__":
     PREDICTOR_AGGREGATION_METHOD = experiment_config['PREDICTOR_AGGREGATION_METHOD']
     MODEL_DIR = experiment_config['MODEL_DIR']
     PRETRAIN_LEARNING_RATE = experiment_config.get('PRETRAIN_LEARNING_RATE', 2e-3)
-    PRETRAIN_LEARNING_RATE_DECAY = experiment_config.get('PRETRAIN_LEARNING_RATE_DECAY', 0.9)
+    PRETRAIN_LR_HALF_LIFE = experiment_config.get('PRETRAIN_LR_HALF_LIFE', None)
     PRETRAIN_TOTAL_EPOCH = experiment_config.get('PRETRAIN_TOTAL_EPOCH', 1000)
     DISC_LOSS_WEIGHT = experiment_config.get('DISC_LOSS_WEIGHT', 1.0)
     THP_LOSS_NLL_WEIGHT = experiment_config.get('THP_LOSS_NLL_WEIGHT', 1e-2)
@@ -224,7 +224,7 @@ if __name__ == "__main__":
     CMPNT_MASK_RATIO = experiment_config.get('CMPNT_MASK_RATIO', 0.25)
     FINETUNE_LEARNING_RATE = experiment_config.get('FINETUNE_LEARNING_RATE', 2e-4)
     FINETUNE_TOTAL_EPOCH = experiment_config.get('FINETUNE_TOTAL_EPOCH', 500)
-    FINETUNE_LEARNING_RATE_DECAY = experiment_config.get('FINETUNE_LEARNING_RATE_DECAY', 0.9)
+    FINETUNE_LR_HALF_LIFE = experiment_config.get('FINETUNE_LR_HALF_LIFE', None)
     # Tasks whose loss weights the positive term by the inverse prevalence of the positive
     # class. Single-label only by default: under a multi-label task the same weighting
     # ranks rare labels above common ones, which is a modelling stance, not a correction.
@@ -468,7 +468,7 @@ if __name__ == "__main__":
                     loaders=dataloader_list,  # Training set dataloader
                     writer=writer,
                     learning_rate=PRETRAIN_LEARNING_RATE,
-                    learning_rate_decay=PRETRAIN_LEARNING_RATE_DECAY,
+                    lr_half_life=PRETRAIN_LR_HALF_LIFE,
                     total_epoch=PRETRAIN_TOTAL_EPOCH,
                     disc_loss_weight=DISC_LOSS_WEIGHT,
                     thp_loss_nll_weight=THP_LOSS_NLL_WEIGHT,
@@ -668,7 +668,7 @@ if __name__ == "__main__":
                         task=task,
                         writer=writer,
                         learning_rate=FINETUNE_LEARNING_RATE,
-                        learning_rate_decay=FINETUNE_LEARNING_RATE_DECAY,
+                        lr_half_life=FINETUNE_LR_HALF_LIFE,
                         total_epoch=FINETUNE_TOTAL_EPOCH,
                         checkpoint_dir=checkpoint_dir,
                         accelerator=accelerator,

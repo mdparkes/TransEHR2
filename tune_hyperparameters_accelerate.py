@@ -255,7 +255,7 @@ if __name__ == "__main__":
     PREDICTOR_AGGREGATION_METHOD = experiment_config['PREDICTOR_AGGREGATION_METHOD']
     MODEL_DIR = experiment_config['MODEL_DIR']
     PRETRAIN_LEARNING_RATE = experiment_config.get('PRETRAIN_LEARNING_RATE', 2e-3)
-    PRETRAIN_LEARNING_RATE_DECAY = experiment_config.get('PRETRAIN_LEARNING_RATE_DECAY', 0.5)
+    PRETRAIN_LR_HALF_LIFE = experiment_config.get('PRETRAIN_LR_HALF_LIFE', None)
     PRETRAIN_TOTAL_EPOCH = experiment_config.get('PRETRAIN_TOTAL_EPOCH', 2000)
     DISC_LOSS_WEIGHT = experiment_config['DISC_LOSS_WEIGHT']
     THP_LOSS_NLL_WEIGHT = experiment_config.get('THP_LOSS_NLL_WEIGHT', 1e-3)
@@ -268,7 +268,7 @@ if __name__ == "__main__":
     CMPNT_MASK_RATIO = experiment_config.get('CMPNT_MASK_RATIO', 0.5)
     FINETUNE_LEARNING_RATE = experiment_config.get('FINETUNE_LEARNING_RATE', 2e-4)
     FINETUNE_TOTAL_EPOCH = experiment_config.get('FINETUNE_TOTAL_EPOCH', 500)
-    FINETUNE_LEARNING_RATE_DECAY = experiment_config.get('FINETUNE_LEARNING_RATE_DECAY', 0.8)
+    FINETUNE_LR_HALF_LIFE = experiment_config.get('FINETUNE_LR_HALF_LIFE', None)
     USE_HISTORICAL_RECORDS = experiment_config.get('USE_HISTORICAL_RECORDS', True)
 
     # Runtime sequence-length caps. Unlike every other hyperparameter here these change the
@@ -559,7 +559,7 @@ if __name__ == "__main__":
                         loaders=[train_loader, test_loader],
                         writer=writer,
                         learning_rate=PRETRAIN_LEARNING_RATE,
-                        learning_rate_decay=PRETRAIN_LEARNING_RATE_DECAY,
+                        lr_half_life=PRETRAIN_LR_HALF_LIFE,
                         total_epoch=PRETRAIN_TOTAL_EPOCH,
                         disc_loss_weight=DISC_LOSS_WEIGHT,
                         thp_loss_nll_weight=THP_LOSS_NLL_WEIGHT,

@@ -252,6 +252,62 @@ def rank_hyperparameter(
     }
 
 
+def rank_cells(
+    manifest: Dict[str, Any],
+    arm: str,
+    criterion: Optional[str] = None
+) -> Dict[str, Any]:
+    """Rank whole grid cells on one arm, for a factorial sweep.
+
+    Ranking coordinates instead would discard the interaction the design exists to measure.
+
+    Args:
+        manifest: A loaded manifest, from a sweep whose design is ``factorial``.
+        arm: The encoding arm.
+        criterion: Which criterion to rank on. Defaults to the one the grid shares, which a
+            factorial spec is validated to have.
+
+    Returns:
+        A dict with:
+            ``criterion``, ``metric``, ``direction``: how the ranking was done.
+            ``results``: one :class:`TrialResult` per cell, in manifest order, each with
+                ``grid_value`` set to that cell's assignment.
+            ``best``: the winning cell's result, or None if no cell produced a usable metric.
+            ``complete``: whether every cell produced a usable metric.
+
+    Raises:
+        ValueError: If the manifest is not a factorial sweep.
+    """
+    if manifest.get('design') != 'factorial':
+        raise ValueError(
+            f"rank_cells is for a factorial sweep; {manifest['spec_name']} is "
+            f"{manifest.get('design', 'additive')!r}. Use rank_hyperparameter instead."
+        )
+    if criterion is None:
+        criterion = next(iter(manifest['grid'].values()))['select_on']
+    spec = SELECTION_CRITERIA[criterion]
+
+    results = []
+    for trial in manifest['trials']:
+        if trial['arm'] != arm or trial.get('is_extra') or not trial.get('cell'):
+            continue
+        result = read_result(manifest, trial, criterion)
+        result.grid_value = trial['cell']
+        results.append(result)
+
+    usable = [r for r in results if r.is_usable]
+    chooser = min if spec['direction'] == 'min' else max
+    return {
+        'arm': arm,
+        'criterion': criterion,
+        'metric': spec['metric'],
+        'direction': spec['direction'],
+        'results': results,
+        'best': chooser(usable, key=lambda r: r.value) if usable else None,
+        'complete': bool(results) and len(usable) == len(results),
+    }
+
+
 def rank_all(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Rank every hyperparameter on every arm.
 

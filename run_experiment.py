@@ -57,7 +57,7 @@ import yaml
 _PROCESS_START = time.perf_counter()
 
 from accelerate import Accelerator
-from accelerate.utils import DistributedType
+from accelerate.utils import DistributedType, set_seed
 from torch.utils.tensorboard import SummaryWriter
 from typing import Any, Dict, List, Optional, Union
 
@@ -83,7 +83,11 @@ ALL_TASKS = ('mortality', 'length_of_stay', 'phenotype')
 RECORDED_HYPERPARAMETERS = (
     'POSITION_ENCODING',
     'PRETRAIN_LEARNING_RATE',
-    'PRETRAIN_LEARNING_RATE_DECAY',
+    'PRETRAIN_LR_HALF_LIFE',
+    'PRETRAIN_SEED',
+    'FINETUNE_SEED',
+    'FINETUNE_ENCODER_INIT',
+    'FINETUNE_FREEZE_ENCODER',
     'CMPNT_MASK_RATIO',
     'RECORD_MASK_RATIO',
     'THP_PRED_LOSS_TIME_WT',
@@ -495,7 +499,7 @@ def main():
     PREDICTOR_AGGREGATION_METHOD = experiment_config['PREDICTOR_AGGREGATION_METHOD']
     MODEL_DIR = experiment_config['MODEL_DIR']
     PRETRAIN_LEARNING_RATE = experiment_config.get('PRETRAIN_LEARNING_RATE', 2e-3)
-    PRETRAIN_LEARNING_RATE_DECAY = experiment_config.get('PRETRAIN_LEARNING_RATE_DECAY', 0.9)
+    PRETRAIN_LR_HALF_LIFE = experiment_config.get('PRETRAIN_LR_HALF_LIFE', None)
     PRETRAIN_TOTAL_EPOCH = experiment_config.get('PRETRAIN_TOTAL_EPOCH', 1000)
     DISC_LOSS_WEIGHT = experiment_config.get('DISC_LOSS_WEIGHT', 1.0)
     THP_LOSS_NLL_WEIGHT = experiment_config.get('THP_LOSS_NLL_WEIGHT', 1e-2)
@@ -508,7 +512,18 @@ def main():
     CMPNT_MASK_RATIO = experiment_config.get('CMPNT_MASK_RATIO', 0.25)
     FINETUNE_LEARNING_RATE = experiment_config.get('FINETUNE_LEARNING_RATE', 2e-4)
     FINETUNE_TOTAL_EPOCH = experiment_config.get('FINETUNE_TOTAL_EPOCH', 500)
-    FINETUNE_LEARNING_RATE_DECAY = experiment_config.get('FINETUNE_LEARNING_RATE_DECAY', 0.9)
+    FINETUNE_LR_HALF_LIFE = experiment_config.get('FINETUNE_LR_HALF_LIFE', None)
+    # Set per stage, so a finetune is determined by its own seed and the encoder it starts
+    # from whether or not pretraining ran in the same process. None leaves the RNG untouched.
+    PRETRAIN_SEED = experiment_config.get('PRETRAIN_SEED', None)
+    FINETUNE_SEED = experiment_config.get('FINETUNE_SEED', None)
+    FINETUNE_ENCODER_INIT = experiment_config.get('FINETUNE_ENCODER_INIT', 'pretrained')
+    FINETUNE_FREEZE_ENCODER = experiment_config.get('FINETUNE_FREEZE_ENCODER', False)
+    if FINETUNE_ENCODER_INIT not in ('pretrained', 'random'):
+        raise ValueError(
+            f"FINETUNE_ENCODER_INIT is {FINETUNE_ENCODER_INIT!r}; expected 'pretrained' "
+            f"or 'random'."
+        )
     # Tasks whose loss weights the positive term by the inverse prevalence of the positive
     # class. Single-label only by default: under a multi-label task the same weighting
     # ranks rare labels above common ones, which is a modelling stance, not a correction.
@@ -528,6 +543,19 @@ def main():
             f"{args.experiment_config} carries HYPERPARAMETERS_TO_TUNE, so it is a tuning "
             f"grid rather than a single configuration. Expand it into one config per trial "
             f"with generate_tuning_configs.py and run those."
+        )
+
+    # The decay factor was applied on a fixed multi-epoch cadence, so the same value means a
+    # different schedule now that the scheduler steps every epoch. Refuse it rather than
+    # silently reinterpret it.
+    stale_decay = [key for key in ('PRETRAIN_LEARNING_RATE_DECAY', 'FINETUNE_LEARNING_RATE_DECAY')
+                   if key in experiment_config]
+    if stale_decay:
+        raise ValueError(
+            f"{args.experiment_config} carries {', '.join(stale_decay)}, which no longer has "
+            f"an effect. The learning rate schedule is set by PRETRAIN_LR_HALF_LIFE and "
+            f"FINETUNE_LR_HALF_LIFE, in epochs, applied as lr(e) = lr0 * 0.5 ** (e / H). A "
+            f"factor g formerly applied every I epochs is a half-life of I * ln(0.5) / ln(g)."
         )
 
     fold_name_list = resolve_folds(DATA_DIR, args.folds)
@@ -652,6 +680,10 @@ def main():
 
         # ---------------------------------------------------------------- pretraining
 
+        if PRETRAIN_SEED is not None:
+            set_seed(PRETRAIN_SEED)
+            print(f"Pretraining seed: {PRETRAIN_SEED}")
+
         electra = ELECTRA(
             generator=MaskedTokenGenerator(
                 encoder=build_value_encoder(
@@ -734,7 +766,7 @@ def main():
                     loaders=dataloader_list,
                     writer=writer,
                     learning_rate=PRETRAIN_LEARNING_RATE,
-                    learning_rate_decay=PRETRAIN_LEARNING_RATE_DECAY,
+                    lr_half_life=PRETRAIN_LR_HALF_LIFE,
                     total_epoch=PRETRAIN_TOTAL_EPOCH,
                     disc_loss_weight=DISC_LOSS_WEIGHT,
                     thp_loss_nll_weight=THP_LOSS_NLL_WEIGHT,
@@ -833,25 +865,46 @@ def main():
                 )
 
             if not skip_finetuning:
+                if FINETUNE_SEED is not None:
+                    set_seed(FINETUNE_SEED)
+                    print(f"Finetuning seed: {FINETUNE_SEED}")
                 downstream_predictor = build_predictor()
 
-                value_encoder_path = os.path.join(model_save_dir, 'value_encoder.pt')
-                event_encoder_path = os.path.join(model_save_dir, 'event_encoder.pt')
-                if not (os.path.exists(value_encoder_path) and os.path.exists(event_encoder_path)):
-                    raise FileNotFoundError(
-                        f"Encoder weights not found in {model_save_dir}. Expected "
-                        f"value_encoder.pt and event_encoder.pt. Pretraining writes both when "
-                        f"it completes, so either it has not run for this configuration or it "
-                        f"did not finish."
+                if FINETUNE_ENCODER_INIT == 'random':
+                    # Control: the encoders keep their fresh initialization. Against an
+                    # otherwise identical pretrained run, the gap is pretraining's
+                    # contribution.
+                    print("\nFINETUNE_ENCODER_INIT is 'random': pretrained weights not loaded\n")
+                else:
+                    value_encoder_path = os.path.join(model_save_dir, 'value_encoder.pt')
+                    event_encoder_path = os.path.join(model_save_dir, 'event_encoder.pt')
+                    if not (os.path.exists(value_encoder_path)
+                            and os.path.exists(event_encoder_path)):
+                        raise FileNotFoundError(
+                            f"Encoder weights not found in {model_save_dir}. Expected "
+                            f"value_encoder.pt and event_encoder.pt. Pretraining writes both "
+                            f"when it completes, so either it has not run for this "
+                            f"configuration or it did not finish."
+                        )
+                    print(f"\nLoading encoder weights from {model_save_dir}\n")
+                    downstream_predictor.val_encoder.load_state_dict(
+                        torch.load(value_encoder_path, map_location='cpu', weights_only=False)
                     )
-                print(f"\nLoading encoder weights from {model_save_dir}\n")
-                downstream_predictor.val_encoder.load_state_dict(
-                    torch.load(value_encoder_path, map_location='cpu', weights_only=False)
-                )
-                downstream_predictor.event_encoder.load_state_dict(
-                    torch.load(event_encoder_path, map_location='cpu', weights_only=False)
-                )
-                print("Successfully loaded encoder weights\n")
+                    downstream_predictor.event_encoder.load_state_dict(
+                        torch.load(event_encoder_path, map_location='cpu', weights_only=False)
+                    )
+                    print("Successfully loaded encoder weights\n")
+
+                if FINETUNE_FREEZE_ENCODER:
+                    # Control: only the head learns, so the run measures the encoder as
+                    # pretraining left it. Encoder dropout stays active, as when unfrozen.
+                    frozen = 0
+                    for encoder in (downstream_predictor.val_encoder,
+                                    downstream_predictor.event_encoder):
+                        for parameter in encoder.parameters():
+                            parameter.requires_grad_(False)
+                            frozen += parameter.numel()
+                    print(f"Encoders frozen: {frozen:,} parameters excluded from the update\n")
 
                 timer.start_phase('finetune', is_main_process=True)
                 try:
@@ -862,7 +915,7 @@ def main():
                         task=task,
                         writer=writer,
                         learning_rate=FINETUNE_LEARNING_RATE,
-                        learning_rate_decay=FINETUNE_LEARNING_RATE_DECAY,
+                        lr_half_life=FINETUNE_LR_HALF_LIFE,
                         total_epoch=FINETUNE_TOTAL_EPOCH,
                         checkpoint_dir=checkpoint_dir,
                         accelerator=accelerator,

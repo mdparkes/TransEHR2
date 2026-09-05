@@ -17,6 +17,7 @@ list, and ``report_tuning_results.py`` and ``select_tuned_hyperparameters.py`` r
 back through it.
 """
 
+import itertools
 import os
 import textwrap
 
@@ -32,6 +33,14 @@ from typing import Any, Dict, List, Optional
 # needed. The masking ratios and the time weight *rescale* the objective -- a model masked at
 # 0.75 is not solving the same problem as one masked at 0.25 -- so their pretraining losses are
 # not comparable to each other and selection has to move downstream to a task metric.
+# How a grid becomes trials.
+#   'additive'  -- one shared centre plus one trial per non-default value, each hyperparameter
+#                  ranked on its own coordinate.
+#   'factorial' -- every combination, ranked as whole cells. Use it where the hyperparameters
+#                  interact, so the best combination is not the combination of individual
+#                  bests.
+DESIGNS = ('additive', 'factorial')
+
 SELECTION_CRITERIA = {
     'pretrain': {
         'task': 'pretrain',
@@ -105,6 +114,12 @@ def load_spec(spec_path: str) -> Dict[str, Any]:
     if not spec['GRID']:
         raise ValueError(f"{spec_path} defines no grid")
 
+    spec['DESIGN'] = spec.get('DESIGN', 'additive')
+    if spec['DESIGN'] not in DESIGNS:
+        raise ValueError(
+            f"{spec_path} sets DESIGN to {spec['DESIGN']!r}; expected one of {list(DESIGNS)}"
+        )
+
     for hp_name, entry in spec['GRID'].items():
         if 'values' not in entry or not entry['values']:
             raise ValueError(f"{spec_path}: grid entry {hp_name!r} has no values")
@@ -120,6 +135,15 @@ def load_spec(spec_path: str) -> Dict[str, Any]:
                 f"{spec_path}: grid entry {hp_name!r} repeats a value: {values}. The first "
                 f"entry is the default and is run once as the shared centre, so a repeat "
                 f"would silently collapse two trials into one."
+            )
+
+    if spec['DESIGN'] == 'factorial':
+        criteria = sorted({entry['select_on'] for entry in spec['GRID'].values()})
+        if len(criteria) > 1:
+            raise ValueError(
+                f"{spec_path} is factorial but its grid selects on {criteria}. A factorial is "
+                f"ranked as whole cells against one criterion, so every hyperparameter in it "
+                f"has to share one. Split the grid into one sweep per criterion."
             )
 
     # Extra trials are one-off ablations that hang off the sweep rather than sitting in the
@@ -181,6 +205,104 @@ def load_spec(spec_path: str) -> Dict[str, Any]:
     return spec
 
 
+def _extra_trials(
+    spec: Dict[str, Any],
+    arm_name: str,
+    arm_overrides: Dict[str, Any],
+    defaults: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    """One-off ablations hanging off one arm of a sweep.
+
+    Args:
+        spec: A spec as returned by :func:`load_spec`.
+        arm_name: The arm these belong to.
+        arm_overrides: The config keys that define that arm.
+        defaults: The default value of every grid hyperparameter.
+
+    Returns:
+        Trial dicts, in spec order.
+    """
+    trials = []
+    for extra in spec.get('EXTRA_TRIALS') or []:
+        if extra['arm'] != arm_name:
+            continue
+        criterion = SELECTION_CRITERIA[extra['select_on']]
+        # Built from the DEFAULTS, not from any grid cell, so the only thing separating it
+        # from the arm's centre is its own overrides. That is what makes the head-to-head
+        # against the centre a one-variable comparison.
+        overrides = dict(arm_overrides, **defaults)
+        overrides.update(extra['overrides'])
+        trials.append({
+            'name': f"{spec['SPEC_NAME']}_{arm_name}_{extra['name']}",
+            'arm': arm_name,
+            'is_centre': False,
+            'hyperparameter': None,
+            'value': None,
+            'overrides': overrides,
+            'cell': None,
+            # Empty on purpose: `covers` is how the ranking stage finds the trial for a
+            # grid cell, so an empty list keeps an ablation out of every ranking and out
+            # of selection. An extra trial is reported, never selected on.
+            'covers': [],
+            'needs_finetune': criterion['needs_finetune'],
+            'is_extra': True,
+            'select_on': extra['select_on'],
+            'description': extra.get('description', ''),
+        })
+    return trials
+
+
+def _factorial_cells(
+    spec: Dict[str, Any],
+    arm_name: str,
+    arm_overrides: Dict[str, Any],
+    defaults: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    """Every combination of every grid value, for one arm.
+
+    ``covers`` is empty because each value appears in several cells, so a per-value lookup
+    would be ambiguous; ``cell`` carries the full assignment instead, and that is what the
+    ranking stage reads. The all-defaults cell is still the centre, so the arm comparison has
+    a defined pair to sit on.
+
+    Args:
+        spec: A spec as returned by :func:`load_spec`.
+        arm_name: The arm these belong to.
+        arm_overrides: The config keys that define that arm.
+        defaults: The default value of every grid hyperparameter.
+
+    Returns:
+        Trial dicts, one per cell, in grid order with the first value of each varying slowest.
+    """
+    grid = spec['GRID']
+    aliases = spec.get('ALIASES', {})
+    hp_names = list(grid.keys())
+    needs_finetune = SELECTION_CRITERIA[grid[hp_names[0]]['select_on']]['needs_finetune']
+
+    trials = []
+    for combination in itertools.product(*(grid[name]['values'] for name in hp_names)):
+        cell = dict(zip(hp_names, combination))
+        token = '_'.join(
+            f"{aliases.get(name, name.lower())}_{slugify_value(cell[name])}"
+            for name in hp_names
+        )
+        trials.append({
+            'name': f"{spec['SPEC_NAME']}_{arm_name}_{token}",
+            'arm': arm_name,
+            'is_centre': all(cell[name] == defaults[name] for name in hp_names),
+            'hyperparameter': None,
+            'value': None,
+            'overrides': dict(arm_overrides, **cell),
+            'cell': cell,
+            'covers': [],
+            'needs_finetune': needs_finetune,
+            'is_extra': False,
+            'select_on': grid[hp_names[0]]['select_on'],
+            'description': '',
+        })
+    return trials
+
+
 def expand_trials(spec: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Turn a spec into the list of trials the sweep consists of.
 
@@ -205,6 +327,11 @@ def expand_trials(spec: Dict[str, Any]) -> List[Dict[str, Any]]:
     for arm_name in spec['ARMS']:
         arm_overrides = spec['ARMS'][arm_name] or {}
 
+        if spec.get('DESIGN', 'additive') == 'factorial':
+            trials.extend(_factorial_cells(spec, arm_name, arm_overrides, defaults))
+            trials.extend(_extra_trials(spec, arm_name, arm_overrides, defaults))
+            continue
+
         centre_name = f"{spec['SPEC_NAME']}_{arm_name}_centre"
         trials.append({
             'name': centre_name,
@@ -213,6 +340,7 @@ def expand_trials(spec: Dict[str, Any]) -> List[Dict[str, Any]]:
             'hyperparameter': None,
             'value': None,
             'overrides': dict(arm_overrides, **defaults),
+            'cell': None,
             # The centre is the default trial for every hyperparameter at once.
             'covers': [{'hyperparameter': name, 'value': defaults[name]} for name in hp_names],
             'is_extra': False,
@@ -237,36 +365,13 @@ def expand_trials(spec: Dict[str, Any]) -> List[Dict[str, Any]]:
                     'hyperparameter': hp_name,
                     'value': value,
                     'overrides': overrides,
+                    'cell': None,
                     'covers': [{'hyperparameter': hp_name, 'value': value}],
             'is_extra': False,
                     'needs_finetune': criterion['needs_finetune'],
                 })
 
-        for extra in spec.get('EXTRA_TRIALS') or []:
-            if extra['arm'] != arm_name:
-                continue
-            criterion = SELECTION_CRITERIA[extra['select_on']]
-            # Built from the DEFAULTS, not from any grid cell, so the only thing separating it
-            # from the arm's centre is its own overrides. That is what makes the head-to-head
-            # against the centre a one-variable comparison.
-            overrides = dict(arm_overrides, **defaults)
-            overrides.update(extra['overrides'])
-            trials.append({
-                'name': f"{spec['SPEC_NAME']}_{arm_name}_{extra['name']}",
-                'arm': arm_name,
-                'is_centre': False,
-                'hyperparameter': None,
-                'value': None,
-                'overrides': overrides,
-                # Empty on purpose: `covers` is how the ranking stage finds the trial for a
-                # grid cell, so an empty list keeps an ablation out of every ranking and out
-                # of selection. An extra trial is reported, never selected on.
-                'covers': [],
-                'needs_finetune': criterion['needs_finetune'],
-                'is_extra': True,
-                'select_on': extra['select_on'],
-                'description': extra.get('description', ''),
-            })
+        trials.extend(_extra_trials(spec, arm_name, arm_overrides, defaults))
 
     names = [trial['name'] for trial in trials]
     if len(set(names)) != len(names):
@@ -347,9 +452,9 @@ def write_trial_configs(
 
         if trial.get('is_extra', False):
             rationale = (
-                f"# This is an ablation, not a grid cell. It sits at the centre in every\n"
-                f"# respect but the setting above, so it is read head-to-head against the\n"
-                f"# centre, and it takes no part in selecting any hyperparameter's value.\n"
+                "# This is an ablation, not a grid cell. It sits at the centre in every\n"
+                "# respect but the setting above, so it is read head-to-head against the\n"
+                "# centre, and it takes no part in selecting any hyperparameter's value.\n"
             )
             if trial.get('description'):
                 wrapped = '\n'.join(
@@ -359,8 +464,8 @@ def write_trial_configs(
                 rationale += f'#\n{wrapped}\n'
         else:
             rationale = (
-                f"# Every other tuned hyperparameter sits at its default, which is what makes\n"
-                f"# this an additive sweep: each value is measured against one shared point.\n"
+                "# Every other tuned hyperparameter sits at its default, which is what makes\n"
+                "# this an additive sweep: each value is measured against one shared point.\n"
             )
 
         header = (
@@ -400,6 +505,7 @@ def write_manifest(spec: Dict[str, Any], trials: List[Dict[str, Any]]) -> str:
         'model_dir': spec['MODEL_DIR'],
         'fold': spec['FOLD'],
         'arms': list(spec['ARMS'].keys()),
+        'design': spec.get('DESIGN', 'additive'),
         'grid': {
             name: {
                 'values': entry['values'],
@@ -417,6 +523,7 @@ def write_manifest(spec: Dict[str, Any], trials: List[Dict[str, Any]]) -> str:
                 'is_centre': trial['is_centre'],
                 'hyperparameter': trial['hyperparameter'],
                 'value': trial['value'],
+                'cell': trial.get('cell'),
                 'covers': trial['covers'],
                 'needs_finetune': trial['needs_finetune'],
                 'is_extra': trial.get('is_extra', False),

@@ -595,9 +595,12 @@ def test_the_shipped_tuning_config_parses_to_numbers():
 
     import yaml
 
+    # phase2_base.yaml, because that is where the bounds are authored: every sweep in the
+    # tuning phases inherits them from it, and it is tracked, where the configs generated
+    # from it are not.
     path = (
         pathlib.Path(__file__).resolve().parent
-        / 'configs' / 'experiments' / 'tune_hyperparameters.yaml'
+        / 'configs' / 'experiments' / 'tuning' / 'phase2_base.yaml'
     )
     config = yaml.safe_load(path.read_text())
 

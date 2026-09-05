@@ -83,15 +83,21 @@ PREDICTOR_AGGREGATION_METHOD: "mean"
 
 MODEL_DIR: "/uhome/pr3/projects/p60290_2/TransEHR2/models"
 
-# Tuning budget. Early stopping fires after 30 epochs without improvement, so this is a
+# Tuning budget. Early stopping fires after 40 epochs without improvement, so this is a
 # ceiling rather than a target. The final runs get 1000; selecting under a shorter budget and
 # applying the result to a longer one is standard practice but is worth a line in the methods,
 # particularly for the decay, which is the hyperparameter most sensitive to run length.
 PRETRAIN_TOTAL_EPOCH: 200
 
-FINETUNE_LEARNING_RATE: 0.0002
+FINETUNE_LEARNING_RATE: 0.00005
 FINETUNE_TOTAL_EPOCH: 500
-FINETUNE_LEARNING_RATE_DECAY: 0.9
+FINETUNE_LR_HALF_LIFE: 132
+
+# RNG seeds, set immediately before each stage builds its model. Held fixed across a grid so
+# that trials differ only by hyperparameter; varied across repeats of one configuration
+# so that the repeats measure run-to-run spread.
+PRETRAIN_SEED: 0
+FINETUNE_SEED: 0
 
 # Tasks whose binary cross entropy weights the positive term by the ratio of negatives to
 # positives, measured over the training split, so that the two classes contribute equally.
@@ -125,7 +131,7 @@ THP_PRED_LOSS_TYPE_WT: 1.0
 
 # --- Tuned: the first value of each grid, i.e. the centre of the sweep ---------------------
 PRETRAIN_LEARNING_RATE: 0.0002
-PRETRAIN_LEARNING_RATE_DECAY: 0.90
+PRETRAIN_LR_HALF_LIFE: 160
 CMPNT_MASK_RATIO: 0.25
 RECORD_MASK_RATIO: 0.15
 # 0.01 is Zuo et al.'s time_loss/100, replacing the eyeballed 1e-6 that was submitted. Every

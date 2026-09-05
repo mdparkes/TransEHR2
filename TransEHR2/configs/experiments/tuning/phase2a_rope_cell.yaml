@@ -1,0 +1,33 @@
+spec_name: phase2a
+manifest: /projects/p60290_2/TransEHR2/TransEHR2/configs/experiments/tuning/phase2a_manifest.yaml
+fold: fold0
+arm: rope
+design: factorial
+criterion: pretrain
+metric: Optimization_Loss
+direction: min
+selected:
+  cell:
+    PRETRAIN_LEARNING_RATE: 0.0006
+    PRETRAIN_LR_HALF_LIFE: 60
+  trial: phase2a_rope_lr_0p0006_hl_60
+  metric_value: 4.80419921875
+  complete: true
+measured:
+  PRETRAIN_LEARNING_RATE=0.0002  PRETRAIN_LR_HALF_LIFE=160: 4.881871223449707
+  PRETRAIN_LEARNING_RATE=0.0002  PRETRAIN_LR_HALF_LIFE=60: 4.921308994293213
+  PRETRAIN_LEARNING_RATE=0.0002  PRETRAIN_LR_HALF_LIFE=20: 5.0850725173950195
+  PRETRAIN_LEARNING_RATE=0.0006  PRETRAIN_LR_HALF_LIFE=160: 4.854453086853027
+  PRETRAIN_LEARNING_RATE=0.0006  PRETRAIN_LR_HALF_LIFE=60: 4.80419921875
+  PRETRAIN_LEARNING_RATE=0.0006  PRETRAIN_LR_HALF_LIFE=20: 4.907016277313232
+  PRETRAIN_LEARNING_RATE=6e-05  PRETRAIN_LR_HALF_LIFE=160: 5.026004791259766
+  PRETRAIN_LEARNING_RATE=6e-05  PRETRAIN_LR_HALF_LIFE=60: 5.116809844970703
+  PRETRAIN_LEARNING_RATE=6e-05  PRETRAIN_LR_HALF_LIFE=20: 5.309528350830078
+caveats:
+- 'Factorial sweep: the selected cell was run as a configuration, so no combination
+  of separately chosen winners is being assumed.'
+- Hyperparameters were selected under the tuning epoch budget and are applied to much
+  longer final runs. The learning rate half-life is the one most sensitive to that
+  gap and the one most worth a line in the methods section.
+- Selected on fold0 alone, which is the fold held out of the manuscript results for
+  exactly this purpose.
