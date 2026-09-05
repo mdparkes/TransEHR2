@@ -83,10 +83,24 @@ def test_generated_sweep_output_is_not_tracked(pattern):
     )
 
 
-def test_the_spec_names_its_paths_relatively():
+def tracked_specs():
+    """Every tracked tuning spec, by repo-relative path."""
+    listed = subprocess.run(
+        ['git', 'ls-files', 'TransEHR2/configs/experiments/tuning/*_spec.yaml'],
+        cwd=REPO_ROOT, capture_output=True, text=True, check=True
+    )
+    return [line for line in listed.stdout.split('\n') if line]
+
+
+@pytest.mark.parametrize('path', tracked_specs())
+def test_the_spec_names_its_paths_relatively(path):
     """The spec is the tracked half of the pair, so its paths have to travel."""
-    path = 'TransEHR2/configs/experiments/tuning/phase2_spec.yaml'
     with open(os.path.join(REPO_ROOT, path)) as f_in:
         spec = yaml.safe_load(f_in)
     for key in ('BASE_CONFIG', 'DATASET_CONFIG', 'OUTPUT_DIR', 'MANIFEST'):
         assert not os.path.isabs(spec[key]), f'{path}: {key} is absolute'
+
+
+def test_there_are_specs_to_check():
+    """Guard the parametrization: an empty list would make the test above vacuous."""
+    assert tracked_specs()

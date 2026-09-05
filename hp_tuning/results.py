@@ -259,9 +259,7 @@ def rank_cells(
 ) -> Dict[str, Any]:
     """Rank whole grid cells on one arm, for a factorial sweep.
 
-    A factorial exists because the hyperparameters interact, which is exactly the case in
-    which the best combination is not the combination of individual bests. Ranking whole cells
-    is what keeps that interaction in the answer; ranking coordinates would discard it.
+    Ranking coordinates instead would discard the interaction the design exists to measure.
 
     Args:
         manifest: A loaded manifest, from a sweep whose design is ``factorial``.

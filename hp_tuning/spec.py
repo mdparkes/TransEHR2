@@ -33,15 +33,12 @@ from typing import Any, Dict, List, Optional
 # needed. The masking ratios and the time weight *rescale* the objective -- a model masked at
 # 0.75 is not solving the same problem as one masked at 0.25 -- so their pretraining losses are
 # not comparable to each other and selection has to move downstream to a task metric.
-# How a grid is turned into trials.
-#   'additive'  -- each untested value paired against every other hyperparameter's default,
-#                  so the sweep is one shared centre plus one trial per non-default value.
-#                  Each hyperparameter is then ranked on its own coordinate.
-#   'factorial' -- every combination of every value. Ranking a single hyperparameter over a
-#                  cross product has no unambiguous meaning, because each of its values
-#                  appears in several cells, so selection ranks whole cells instead. Use it
-#                  where the hyperparameters interact and the best pair is not the pair of
-#                  individual bests.
+# How a grid becomes trials.
+#   'additive'  -- one shared centre plus one trial per non-default value, each hyperparameter
+#                  ranked on its own coordinate.
+#   'factorial' -- every combination, ranked as whole cells. Use it where the hyperparameters
+#                  interact, so the best combination is not the combination of individual
+#                  bests.
 DESIGNS = ('additive', 'factorial')
 
 SELECTION_CRITERIA = {
@@ -263,11 +260,10 @@ def _factorial_cells(
 ) -> List[Dict[str, Any]]:
     """Every combination of every grid value, for one arm.
 
-    A cell is not the trial for any single grid value: each value appears in as many cells as
-    the other hyperparameters have combinations, so a per-value lookup would be ambiguous.
-    ``covers`` is therefore empty and ``cell`` carries the full assignment, which is what the
-    ranking stage reads. The all-defaults cell is still flagged as the centre, so the arm
-    comparison keeps a defined pair of runs to sit on.
+    ``covers`` is empty because each value appears in several cells, so a per-value lookup
+    would be ambiguous; ``cell`` carries the full assignment instead, and that is what the
+    ranking stage reads. The all-defaults cell is still the centre, so the arm comparison has
+    a defined pair to sit on.
 
     Args:
         spec: A spec as returned by :func:`load_spec`.

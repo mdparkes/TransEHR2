@@ -35,25 +35,19 @@ MetadataDict: TypeAlias = Dict[str, Any]
 # Steps required before the running median is a usable reference for spike detection.
 SPIKE_MIN_STEPS = 10
 
-# Relative improvement threshold for early stopping, matching ReduceLROnPlateau's default.
-# Without one, "no improvement" means an exactly equal or worse loss, so movement in the fifth
-# decimal place holds a run open and the epoch of the best model becomes a function of numeric
-# noise rather than of convergence.
+# Relative improvement early stopping needs before it resets its counter. Without one, any
+# movement at all counts, so the best epoch tracks numeric noise rather than convergence.
 IMPROVEMENT_THRESHOLD = 1e-4
 
-# Epochs without improvement before a run is abandoned. Two half-lives of a schedule shorter
-# than this fit inside the window, so a plateau is met by a materially lower learning rate
-# before the run is given up on rather than after.
+# Epochs without improvement before a run is abandoned. Longer than two decay steps, so a
+# plateau meets a lower learning rate before the run is given up on.
 EARLY_STOPPING_PATIENCE = 40
 
 
 def resolve_decay_factor(lr_half_life: Optional[float]) -> float:
     """Per-epoch multiplicative decay factor for a half-life given in epochs.
 
-    The scheduler steps once per epoch, so the factor and the schedule are the same statement:
-    lr(e) = lr0 * 0.5 ** (e / H). Expressing it as a half-life keeps the number in epochs,
-    which is the unit that can be held against how long a run actually lasts; a bare
-    multiplicative factor only means something once the step cadence is also known.
+    The scheduler steps once per epoch, so lr(e) = lr0 * 0.5 ** (e / H).
 
     Args:
         lr_half_life: Epochs over which the learning rate halves. None or non-positive
@@ -70,9 +64,8 @@ def resolve_decay_factor(lr_half_life: Optional[float]) -> float:
 def is_improvement(current: float, best: float, threshold: float = IMPROVEMENT_THRESHOLD) -> bool:
     """Whether a validation loss improves on the incumbent by more than a relative threshold.
 
-    Scaled by the magnitude of the incumbent so the test means the same thing for losses of
-    any size. The scaling uses the absolute value rather than the plain ``best * (1 -
-    threshold)`` form, which inverts for a negative loss and would accept a worse value.
+    Scaled by ``abs(best)`` rather than the usual ``best * (1 - threshold)``, which inverts
+    below zero and would accept a worse value. The optimization loss can be negative.
 
     Args:
         current: The current epoch's validation loss.
@@ -1081,8 +1074,7 @@ def pretrain_model(
         loaders: Tuple of (train, val) or (train, val, test) DataLoaders
         writer: TensorBoard writer for logging (only used on main process)
         learning_rate: Learning rate for optimizer
-        lr_half_life: Epochs over which the learning rate halves. The scheduler steps every
-            epoch, so this is the schedule in full. None leaves the rate constant.
+        lr_half_life: Epochs over which the learning rate halves. None leaves it constant.
         total_epoch: Number of training epochs
         disc_loss_weight: Weight for discriminator loss
         thp_loss_nll_weight: Weight for THP NLL loss
@@ -1400,10 +1392,8 @@ def pretrain_model(
     # Report peak GPU VRAM usage
     print_peak_memory(accelerator)
 
-    # The epoch the returned weights came from, counted the way the progress tables count:
-    # one-based. Zero means no epoch ever improved on the initial value. Carried in the scores
-    # so it reaches the evaluation YAML, where it says whether a run converged or merely
-    # stopped, without having to be reconstructed from the log.
+    # One-based, matching the progress tables; zero means no epoch improved. Carried in the
+    # scores so it reaches the evaluation YAML.
     best_epoch_val_losses['Best_Epoch'] = best_epoch + 1
     best_epoch_train_losses['Best_Epoch'] = best_epoch + 1
 
@@ -1435,8 +1425,7 @@ def finetune_model(
         task: One of 'mortality', 'length_of_stay', or 'phenotype'
         writer: TensorBoard writer (only used on main process)
         learning_rate: Learning rate for optimizer
-        lr_half_life: Epochs over which the learning rate halves. The scheduler steps every
-            epoch, so this is the schedule in full. None leaves the rate constant.
+        lr_half_life: Epochs over which the learning rate halves. None leaves it constant.
         total_epoch: Number of training epochs
         checkpoint_dir: Directory for saving checkpoints
         resume_from_checkpoint: Whether to resume from checkpoint
@@ -1716,10 +1705,8 @@ def finetune_model(
     # Report peak GPU VRAM usage
     print_peak_memory(accelerator)
     
-    # The epoch the returned weights came from, counted the way the progress tables count:
-    # one-based. Zero means no epoch ever improved on the initial value. Carried in the scores
-    # so it reaches the evaluation YAML, where it says whether a run converged or merely
-    # stopped, without having to be reconstructed from the log.
+    # One-based, matching the progress tables; zero means no epoch improved. Carried in the
+    # scores so it reaches the evaluation YAML.
     best_epoch_val_scores['Best_Epoch'] = best_epoch + 1
     best_epoch_train_scores['Best_Epoch'] = best_epoch + 1
 
@@ -1761,8 +1748,7 @@ def pretrain_with_hyperparameter(
         loaders: Tuple of DataLoaders (train, test) or (train, val, test)
         writer: TensorBoard writer (only used on main process)
         learning_rate: Learning rate for optimizer
-        lr_half_life: Epochs over which the learning rate halves. The scheduler steps every
-            epoch, so this is the schedule in full. None leaves the rate constant.
+        lr_half_life: Epochs over which the learning rate halves. None leaves it constant.
         total_epoch: Number of training epochs
         disc_loss_weight: Weight for discriminator loss
         thp_loss_nll_weight: Weight for THP NLL loss
@@ -2042,10 +2028,8 @@ def pretrain_with_hyperparameter(
     # Report peak GPU VRAM usage
     print_peak_memory(accelerator)
 
-    # The epoch the returned weights came from, counted the way the progress tables count:
-    # one-based. Zero means no epoch ever improved on the initial value. Carried in the scores
-    # so it reaches the evaluation YAML, where it says whether a run converged or merely
-    # stopped, without having to be reconstructed from the log.
+    # One-based, matching the progress tables; zero means no epoch improved. Carried in the
+    # scores so it reaches the evaluation YAML.
     best_epoch_val_losses['Best_Epoch'] = best_epoch + 1
     best_epoch_train_losses['Best_Epoch'] = best_epoch + 1
 

@@ -9,10 +9,9 @@ itself.
     python report_experiment_results.py 'phase2h_*' --paired
     python report_experiment_results.py 'phase2b_additive_*' --csv wave_b_additive.csv
 
-``--paired`` is for repeats of two configurations under matched seeds: it pairs runs by the
-seed in their names, reports each pair's difference, and gives the mean difference with a
-confidence interval. Pairing within a seed removes the run-to-run variance the two groups
-share, which is the point of running matched seeds in the first place.
+``--paired`` pairs runs by the seed in their names and reports the mean difference between
+two groups with a confidence interval. Pairing removes the run-to-run variance the groups
+share.
 """
 
 import argparse

@@ -513,11 +513,8 @@ def main():
     FINETUNE_LEARNING_RATE = experiment_config.get('FINETUNE_LEARNING_RATE', 2e-4)
     FINETUNE_TOTAL_EPOCH = experiment_config.get('FINETUNE_TOTAL_EPOCH', 500)
     FINETUNE_LR_HALF_LIFE = experiment_config.get('FINETUNE_LR_HALF_LIFE', None)
-    # Seeds are set per stage rather than once per run, so that a finetune is determined by
-    # its own seed and the encoder it starts from, whether or not pretraining ran in the
-    # same process. Holding one seed across a grid leaves the trials differing only by
-    # hyperparameter; varying it across repeats of a fixed configuration is what measures
-    # run-to-run spread. None leaves the RNG untouched.
+    # Set per stage, so a finetune is determined by its own seed and the encoder it starts
+    # from whether or not pretraining ran in the same process. None leaves the RNG untouched.
     PRETRAIN_SEED = experiment_config.get('PRETRAIN_SEED', None)
     FINETUNE_SEED = experiment_config.get('FINETUNE_SEED', None)
     FINETUNE_ENCODER_INIT = experiment_config.get('FINETUNE_ENCODER_INIT', 'pretrained')
@@ -548,10 +545,9 @@ def main():
             f"with generate_tuning_configs.py and run those."
         )
 
-    # The decay factor used to be applied on a fixed multi-epoch cadence, so its value only
-    # meant something alongside that cadence. The schedule is now given as a half-life in
-    # epochs and stepped every epoch. Carrying the old key forward would silently apply a
-    # factor meant for one cadence at another, so refuse it rather than reinterpret it.
+    # The decay factor was applied on a fixed multi-epoch cadence, so the same value means a
+    # different schedule now that the scheduler steps every epoch. Refuse it rather than
+    # silently reinterpret it.
     stale_decay = [key for key in ('PRETRAIN_LEARNING_RATE_DECAY', 'FINETUNE_LEARNING_RATE_DECAY')
                    if key in experiment_config]
     if stale_decay:
@@ -875,10 +871,9 @@ def main():
                 downstream_predictor = build_predictor()
 
                 if FINETUNE_ENCODER_INIT == 'random':
-                    # Control: the encoders keep the initialization build_predictor gave them,
-                    # so the run measures what the downstream head reaches on its own. Read
-                    # against an otherwise identical pretrained run, the gap is what
-                    # pretraining contributed.
+                    # Control: the encoders keep their fresh initialization. Against an
+                    # otherwise identical pretrained run, the gap is pretraining's
+                    # contribution.
                     print("\nFINETUNE_ENCODER_INIT is 'random': pretrained weights not loaded\n")
                 else:
                     value_encoder_path = os.path.join(model_save_dir, 'value_encoder.pt')
@@ -901,10 +896,8 @@ def main():
                     print("Successfully loaded encoder weights\n")
 
                 if FINETUNE_FREEZE_ENCODER:
-                    # Control: only the head and the aggregation above it learn, so the run
-                    # measures the encoder as pretraining left it rather than as finetuning
-                    # would reshape it. Dropout inside the encoder stays active, as it does in
-                    # an unfrozen run.
+                    # Control: only the head learns, so the run measures the encoder as
+                    # pretraining left it. Encoder dropout stays active, as when unfrozen.
                     frozen = 0
                     for encoder in (downstream_predictor.val_encoder,
                                     downstream_predictor.event_encoder):

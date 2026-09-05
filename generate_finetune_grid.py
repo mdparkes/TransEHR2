@@ -1,30 +1,21 @@
-"""Expand a grid of finetuning configurations over one shared encoder.
+"""Expand a grid of finetuning configurations over one shared, already-pretrained encoder.
 
-Every cell finetunes from the same weights, so the only thing separating them is the
-finetuning settings. Three shapes, selected by argument:
+Every cell links the same weights, so the only thing separating them is the finetuning
+settings. Two shapes:
 
-    a grid          --rates and --half_lives, crossed. The default shape.
-    seed repeats    --seeds, one run per seed at a single configuration. Measures the
-                    run-to-run spread a single-seed grid cannot; give two groups the same
-                    seeds to pair them.
-    controls        the random-encoder and frozen-encoder cells, unless --no_controls.
-                    Read against the matching grid cell, the first gives what pretraining
-                    contributed and the second what finetuning the encoder contributed.
+    grid          --rates and --half_lives, crossed.
+    seed repeats  --seeds, one run per seed at a single configuration. Give two groups the
+                  same seeds and their comparison becomes within-seed.
 
-The encoder is either pretrained here or reused:
+Two control cells are added unless --no_controls: one finetunes from a fresh initialization
+instead of the linked weights, the other freezes the encoder. Read against the matching grid
+cell they separate what pretraining contributed from what finetuning the encoder contributed.
 
-    --encoder NAME  link an existing pretrain's weights. The base config is authoritative,
-                    so nothing upstream of finetuning is overridden. Use this downstream of
-                    a phase that already selected the pretraining settings.
-    --variant       pretrain one here, at the settings below, under a chosen record scope.
-                    Standalone use, where no upstream phase has run.
-
-    python generate_finetune_grid.py --variant instay
     python generate_finetune_grid.py --base <selected>.yaml --encoder <trial> \
-        --prefix phase2d_additive --rates 5e-5,2.2e-5,1e-5 --half_lives 160,60,20 \
-        --no_controls
+        --prefix phase2b_additive --output_dir <dir> \
+        --rates 5e-5,2.2e-5,1e-5 --half_lives 160,60,20 --no_controls
 
-The script prints the commands to pretrain, link and finetune.
+The script prints the commands to link and to submit.
 """
 
 import argparse
@@ -32,69 +23,30 @@ import os
 
 import yaml
 
-BASE_CONFIG = 'TransEHR2/configs/experiments/tuning/phase2_base.yaml'
-OUTPUT_DIR = 'TransEHR2/configs/experiments/ftdiag'
+# Weights pretraining writes that a finetune reads back.
+ENCODER_FILES = ('pretrained.pt', 'value_encoder.pt', 'event_encoder.pt')
 
-# The encoder every cell shares. Additive rather than RoPE because the failure appeared in
-# both arms, so the cheaper one is enough, and a half-life of 40 anneals well inside a
-# pretraining run whose best epoch lands between 50 and 110.
-PRETRAIN_OVERRIDES = {
-    'POSITION_ENCODING': 'additive',
-    'PRETRAIN_LEARNING_RATE': 0.0006,
-    'PRETRAIN_LR_HALF_LIFE': 40,
-}
-
-# `instay` drops prior admissions, which also moves the value stream's largest gap. The frozen
-# ladder is spaced log-uniformly in period between P_MIN and P_MAX, with P_MAX ~ 63 * gap_max
-# from the informative-band criterion 0.1 <= gap/lambda <= pi. With history the value stream
-# spans 1 - 127,829 h, so P_MAX is 8.05e6; without it the span is the event stream's 1 - 48 h
-# and P_MAX is 63 * 48 = 3024. Left at 8.05e6 for an in-stay run, half the ladder would sit at
-# periods longer than any gap that occurs, phase-static and contributing a constant. P_MIN is
-# 2 * gap_min and does not move: both variants have a smallest gap of one hour.
-VARIANTS = {
-    'history': {
-        'prefix': 'ftdiag',
-        'overrides': {'USE_HISTORICAL_RECORDS': True, 'VALUE_LADDER_P_MAX': 8.05e6},
-    },
-    'instay': {
-        'prefix': 'ftdiag_instay',
-        'overrides': {'USE_HISTORICAL_RECORDS': False, 'VALUE_LADDER_P_MAX': 3024.0},
-    },
-}
-
-FINETUNE_LEARNING_RATES = [0.0002, 0.00005, 0.00001]
-
-# None holds the rate constant, so a difference between it and the others is attributable to
-# annealing rather than to the rate.
-FINETUNE_HALF_LIVES = [None, 120, 160]
-
-# The setting the controls run at, which must also be a cell of the grid so the three are read
-# against each other at one rate and one schedule.
+# The controls run at one grid cell, so the three are read against each other at one rate and
+# one schedule.
 CONTROL_REFERENCE = {'FINETUNE_LEARNING_RATE': 0.00005, 'FINETUNE_LR_HALF_LIFE': None}
 CONTROLS = {
     'ctl_random': {'FINETUNE_ENCODER_INIT': 'random'},
     'ctl_frozen': {'FINETUNE_FREEZE_ENCODER': True},
 }
 
-# Weights written by pretraining that a finetune reads back.
-ENCODER_FILES = ('pretrained.pt', 'value_encoder.pt', 'event_encoder.pt')
-
 
 def parse_values(text, cast):
-    """Parse a comma-separated grid argument.
+    """Parse a comma-separated grid argument. 'flat' and 'none' mean no decay.
 
     Args:
-        text: The argument, e.g. "5e-5,2.2e-5,1e-5". "flat" and "none" mean no decay.
+        text: The argument, e.g. "5e-5,2.2e-5,1e-5".
         cast: Callable applied to each non-flat entry.
 
     Returns:
-        list: The parsed values, in the order given. The first is the default.
+        list: The parsed values. The first is the default.
     """
-    values = []
-    for piece in text.split(','):
-        piece = piece.strip()
-        values.append(None if piece.lower() in ('flat', 'none') else cast(piece))
-    return values
+    return [None if piece.strip().lower() in ('flat', 'none') else cast(piece.strip())
+            for piece in text.split(',')]
 
 
 def token(value):
@@ -104,18 +56,35 @@ def token(value):
     return f'{value:g}'.replace('.', 'p').replace('-', 'm').replace('+', '')
 
 
-def seed_cells(prefix, rate, half_life, seeds):
-    """One cell per seed at a single finetuning configuration.
+def grid_cells(prefix, rates, half_lives, controls):
+    """The rate-by-half-life grid, and the controls if wanted.
 
-    A repeat measures run-to-run spread at a settled configuration, which is what a grid with
-    one seed cannot do. Giving both arms the same seeds pairs the repeats, so the comparison
-    between them is within-seed and the seed variance drops out of it.
+    Args:
+        prefix: Name prefix for every cell.
+        rates: Finetuning learning rates.
+        half_lives: Decay half-lives in epochs; None holds the rate constant.
+        controls: Whether to emit the two control cells.
+
+    Yields:
+        Tuples of (experiment name, config overrides).
+    """
+    for rate in rates:
+        for half_life in half_lives:
+            yield (f'{prefix}_lr{token(rate)}_hl{token(half_life)}',
+                   {'FINETUNE_LEARNING_RATE': rate, 'FINETUNE_LR_HALF_LIFE': half_life})
+    if controls:
+        for name, overrides in CONTROLS.items():
+            yield f'{prefix}_{name}', dict(CONTROL_REFERENCE, **overrides)
+
+
+def seed_cells(prefix, rate, half_life, seeds):
+    """One cell per seed at a single configuration.
 
     Args:
         prefix: Name prefix for every cell.
         rate: The finetuning learning rate every repeat uses.
-        half_life: The finetuning decay half-life every repeat uses.
-        seeds: The seeds, one repeat each.
+        half_life: The decay half-life every repeat uses.
+        seeds: One repeat each.
 
     Yields:
         Tuples of (experiment name, config overrides).
@@ -127,43 +96,22 @@ def seed_cells(prefix, rate, half_life, seeds):
                 'FINETUNE_SEED': seed})
 
 
-def cells(prefix, rates, half_lives, controls=True):
-    """The grid, and the controls if they are wanted, as (name, overrides) pairs.
+def write_config(base, name, overrides, output_dir, header):
+    """Write one experiment config and return its path.
 
     Args:
-        prefix: Name prefix for every cell.
-        rates: Finetuning learning rates.
-        half_lives: Finetuning decay half-lives; None holds the rate constant.
-        controls: Whether to emit the random-encoder and frozen-encoder cells.
-
-    Yields:
-        Tuples of (experiment name, config overrides).
-    """
-    for rate in rates:
-        for half_life in half_lives:
-            yield (f'{prefix}_lr{token(rate)}_hl{token(half_life)}',
-                   {'FINETUNE_LEARNING_RATE': rate, 'FINETUNE_LR_HALF_LIFE': half_life})
-    if not controls:
-        return
-    for name, overrides in CONTROLS.items():
-        yield f'{prefix}_{name}', dict(CONTROL_REFERENCE, **overrides)
-
-
-def write_config(base, name, overrides, upstream, output_dir, header):
-    """Write one experiment config, and return its path.
-
-    Args:
-        base: The config every cell inherits.
+        base: The config every cell inherits, which is authoritative for everything
+            upstream of finetuning.
         name: EXPERIMENT_NAME for this cell.
         overrides: The cell's own settings.
-        upstream: Pretraining and record-scope settings to force. Empty when the base config
-            is authoritative, which is the case when an existing encoder is being reused.
         output_dir: Where to write.
         header: Provenance comment for the top of the file.
+
+    Returns:
+        str: The path written.
     """
     config = dict(base)
     config['EXPERIMENT_NAME'] = name
-    config.update(upstream)
     config.update(overrides)
     path = os.path.join(output_dir, f'{name}.yaml')
     with open(path, 'w') as f_out:
@@ -175,36 +123,25 @@ def write_config(base, name, overrides, upstream, output_dir, header):
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--variant', default=None, choices=sorted(VARIANTS),
-                        help='Record scope to force on every cell, and pretrain an encoder '
-                             'for. Mutually exclusive with --encoder.')
-    parser.add_argument('--encoder', default=None,
-                        help='EXPERIMENT_NAME of an existing pretrain whose weights every '
-                             'cell links. No pretrain config is written and the base config '
-                             'is taken as authoritative, so nothing upstream is overridden.')
-    parser.add_argument('--prefix', default=None,
-                        help='Name prefix for the cells. Defaults to the variant\'s prefix, '
-                             'or to the base config filename when --encoder is given.')
-    parser.add_argument('--base', default=BASE_CONFIG, help='Config the cells inherit from')
-    parser.add_argument('--rates', default='0.0002,0.00005,0.00001',
-                        help='Finetuning learning rates, comma separated. First is default.')
-    parser.add_argument('--half_lives', default='flat,120,160',
-                        help='Finetuning decay half-lives in epochs, comma separated. '
-                             '"flat" holds the rate constant.')
-    parser.add_argument('--no_controls', action='store_true',
-                        help='Omit the random-encoder and frozen-encoder cells')
+    parser.add_argument('--base', required=True,
+                        help='Config every cell inherits, from the phase that selected the '
+                             'pretraining settings')
+    parser.add_argument('--encoder', required=True,
+                        help='EXPERIMENT_NAME of the pretrain whose weights every cell links')
+    parser.add_argument('--prefix', required=True, help='Name prefix for the cells')
+    parser.add_argument('--output_dir', required=True, help='Where to write the configs')
+    parser.add_argument('--rates', default='0.00005,0.000022,0.00001',
+                        help='Finetuning learning rates, comma separated')
+    parser.add_argument('--half_lives', default='160,60,20',
+                        help="Decay half-lives in epochs, comma separated. 'flat' holds the "
+                             'rate constant.')
     parser.add_argument('--seeds', default=None,
                         help='Comma-separated seeds. Replaces the grid with one repeat per '
-                             'seed at a single configuration, so --rates and --half_lives '
-                             'must each name one value. Give both arms the same seeds to '
-                             'pair the repeats.')
-    parser.add_argument('--output_dir', default=OUTPUT_DIR, help='Where to write the configs')
+                             'seed, so --rates and --half_lives must each name one value.')
+    parser.add_argument('--no_controls', action='store_true',
+                        help='Omit the random-encoder and frozen-encoder cells')
     parser.add_argument('--fold', default='fold0', help='Fold the cells run on')
     args = parser.parse_args()
-
-    if args.encoder and args.variant:
-        parser.error('--encoder reuses a pretrain whose record scope is already fixed, so '
-                     '--variant would silently disagree with it. Pass one or the other.')
 
     rates = parse_values(args.rates, float)
     half_lives = parse_values(args.half_lives, float)
@@ -213,16 +150,6 @@ def main():
         parser.error('--seeds repeats one configuration, so --rates and --half_lives must '
                      'each name a single value.')
 
-    if args.encoder:
-        upstream = {}
-        prefix = args.prefix or os.path.splitext(os.path.basename(args.base))[0]
-        encoder_name = args.encoder
-    else:
-        variant = VARIANTS[args.variant or 'history']
-        upstream = dict(PRETRAIN_OVERRIDES, **variant['overrides'])
-        prefix = args.prefix or variant['prefix']
-        encoder_name = f'{prefix}_pretrain'
-
     with open(args.base) as f_in:
         base = yaml.safe_load(f_in)
     base.pop('HYPERPARAMETERS_TO_TUNE', None)
@@ -230,27 +157,20 @@ def main():
 
     header = (f'# Generated by generate_finetune_grid.py from {args.base}\n'
               f'# Do not edit by hand -- regenerate instead.\n\n')
-
-    pretrain_path = None
-    if not args.encoder:
-        pretrain_path = write_config(base, encoder_name, {}, upstream, args.output_dir, header)
-    if seeds is not None:
-        plan = seed_cells(prefix, rates[0], half_lives[0], seeds)
-    else:
-        plan = cells(prefix, rates, half_lives, controls=not args.no_controls)
-    cell_paths = [(name, write_config(base, name, overrides, upstream, args.output_dir, header))
+    plan = (seed_cells(args.prefix, rates[0], half_lives[0], seeds) if seeds is not None
+            else grid_cells(args.prefix, rates, half_lives, not args.no_controls))
+    cell_paths = [(name, write_config(base, name, overrides, args.output_dir, header))
                   for name, overrides in plan]
 
     model_dir = base['MODEL_DIR']
     print(f'Base config:  {args.base}')
-    print(f'Encoder:      {encoder_name}'
-          f'{"  (existing, linked)" if args.encoder else "  (pretrained by step 1)"}')
+    print(f'Encoder:      {args.encoder}')
     if seeds is not None:
-        print(f'Cells:        {len(cell_paths)}  (one repeat per seed at lr {rates[0]:g}, '
-              f'half-life {half_lives[0]})\n')
+        print(f'Cells:        {len(cell_paths)}  (one per seed at lr {rates[0]:g}, '
+              f'half-life {half_lives[0]:g})\n')
     else:
-        print(f'Cells:        {len(cell_paths)}  '
-              f'({len(rates)} rates x {len(half_lives)} half-lives'
+        print(f'Cells:        {len(cell_paths)}  ({len(rates)} rates x '
+              f'{len(half_lives)} half-lives'
               f'{"" if args.no_controls else f" + {len(CONTROLS)} controls"})\n')
     for name, path in cell_paths:
         print(f'  {name:<44} {path}')
@@ -258,29 +178,17 @@ def main():
     # slurm_run_experiment.sh indexes FOLDS by the array id and defaults to the five
     # manuscript folds, so a single-fold run has to name the fold and take one array task.
     launch = f'FOLDS="{args.fold}" sbatch --array=0-0 SLURM/slurm_run_experiment.sh'
-    step = 1
-    if pretrain_path is not None:
-        print(f'\n{step}. Pretrain once:')
-        print(f'   TASKS=none {launch} {pretrain_path}')
-        step += 1
-    print(f'\n{step}. Link that encoder into every cell, so each one skips pretraining and')
-    print('   they all finetune from identical weights:')
-    print(f'   src="{model_dir}/{encoder_name}/{args.fold}/pretrained"')
-    print(f'   for cfg in {args.output_dir}/{prefix}_*.yaml; do')
+    suffix = 'seed*' if seeds is not None else '*'
+    print('\n1. Link the encoder into every cell, so each skips pretraining and they all')
+    print('   finetune from identical weights:')
+    print(f'   src="{model_dir}/{args.encoder}/{args.fold}/pretrained"')
+    print(f'   for cfg in {args.output_dir}/{args.prefix}_{suffix}.yaml; do')
     print('     cell=$(basename "$cfg" .yaml)')
-    # The glob also matches the encoder's own config, and linking its weights over themselves
-    # would replace the files with symlinks to themselves.
-    print(f'     [ "$cell" = "{encoder_name}" ] && continue')
     print(f'     dst="{model_dir}/$cell/{args.fold}/pretrained"; mkdir -p "$dst"')
     print(f'     for f in {" ".join(ENCODER_FILES)}; do ln -sf "$src/$f" "$dst/$f"; done')
     print('   done')
-    step += 1
-    print(f'\n{step}. Finetune every cell:')
-    if seeds is not None:
-        print(f'   for cfg in {args.output_dir}/{prefix}_seed*.yaml; do')
-    else:
-        print(f'   for cfg in {args.output_dir}/{prefix}_lr*.yaml'
-              f'{"" if args.no_controls else f" {args.output_dir}/{prefix}_ctl_*.yaml"}; do')
+    print('\n2. Finetune every cell:')
+    print(f'   for cfg in {args.output_dir}/{args.prefix}_{suffix}.yaml; do')
     print(f'     TASKS=mortality {launch} "$cfg"')
     print('   done')
 

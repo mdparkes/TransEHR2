@@ -1,9 +1,8 @@
 """Select the winning cell of a factorial sweep and write it as an experiment config.
 
-A factorial is run where the hyperparameters interact, which is the case in which the best
-combination is not the combination of individual bests. Selection therefore ranks whole cells,
-and the winner is a configuration that was actually run rather than one assembled from
-coordinate winners -- so the config written here is the winning trial's own, renamed.
+Selection ranks whole cells, so the winner is a configuration that was actually run rather
+than one assembled from coordinate winners. The config written is the winning trial's own,
+renamed.
 
     python select_tuned_cell.py <manifest>                       # report every arm
     python select_tuned_cell.py <manifest> --arm rope --output <path>
@@ -24,9 +23,8 @@ from hp_tuning.spec import load_manifest
 CAVEATS = [
     'Factorial sweep: the selected cell was run as a configuration, so no combination of '
     'separately chosen winners is being assumed.',
-    'Hyperparameters were selected under the tuning epoch budget and are applied to much '
-    'longer final runs. The learning rate half-life is the one most sensitive to that gap '
-    'and the one most worth a line in the methods section.',
+    'Selected under the tuning epoch budget and applied to longer final runs. The learning '
+    'rate half-life is the setting most sensitive to that difference.',
 ]
 
 
