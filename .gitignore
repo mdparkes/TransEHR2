@@ -106,7 +106,6 @@ TransEHR2/configs/experiments/tuning/*_manifest.yaml
 analyze_timestep_counts.py
 analyze_dataload_times.py
 test_run_experiment_accelerate.py
-test_tunes_hyperparameters.py
 test_text_extraction.py
 test_data_integrity.py
 
@@ -146,4 +145,5 @@ TransEHR2/configs/experiments/tuning/phase2a/
 TransEHR2/configs/experiments/tuning/phase2b/
 TransEHR2/configs/experiments/tuning/phase2c_additive/
 TransEHR2/configs/experiments/tuning/phase2c_rope/
+TransEHR2/configs/experiments/tuning/phase2d/
 TransEHR2/configs/experiments/tuning/phase2h/
