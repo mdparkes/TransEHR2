@@ -1,11 +1,5 @@
-# Assembled by select_tuned_hyperparameters.py from /projects/p60290_2/TransEHR2/TransEHR2/configs/experiments/tuning/phase2c_rope_selection.yaml
-# Sweep phase2c_rope, arm tuned, selected on fold0.
-#
-# Each tuned value won its own coordinate against the others at their defaults.
-# This combination was not itself run during tuning; that is the known gap in an
-# additive sweep, and it is what the manuscript folds validate.
-
 BATCH_SIZE: 200
+CMPNT_MASK_RATIO: 0.25
 DISCRIMINATOR_DIM_FEEDFORWARD: 256
 DISCRIMINATOR_ENCODER_ACTIVATION: gelu
 DISCRIMINATOR_ENCODER_DIM_FEEDFORWARD: 256
@@ -19,6 +13,7 @@ DISC_LOSS_WEIGHT: 1.0
 EPISODE_LEN_STEPS: null
 EVENT_LADDER_P_MAX: 3000.0
 EVENT_LADDER_P_MIN: 2.0
+EXPERIMENT_NAME: phase2d_rope_base
 FINETUNE_LEARNING_RATE: 2.2e-05
 FINETUNE_LR_HALF_LIFE: 60
 FINETUNE_POS_WEIGHT_TASKS:
@@ -45,6 +40,7 @@ PRETRAIN_LEARNING_RATE: 0.0006
 PRETRAIN_LR_HALF_LIFE: 60
 PRETRAIN_SEED: 0
 PRETRAIN_TOTAL_EPOCH: 200
+RECORD_MASK_RATIO: 0.25
 THP_ENCODER_DROPOUT: 0.1
 THP_ENCODER_D_INNER: 256
 THP_ENCODER_D_K: 128
@@ -55,13 +51,10 @@ THP_ENCODER_N_HEADS: 2
 THP_ENCODER_N_LAYERS: 1
 THP_LOSS_MC_SAMPLES: 100
 THP_LOSS_NLL_WEIGHT: 0.01
+THP_PRED_LOSS_TIME_WT: 0.01
 THP_PRED_LOSS_TYPE_WT: 1.0
 USE_HISTORICAL_RECORDS: true
 USE_TEXT: true
 USE_THP_PRED_LOSS: true
 VALUE_LADDER_P_MAX: 8050000.0
 VALUE_LADDER_P_MIN: 2.0
-CMPNT_MASK_RATIO: 0.5
-RECORD_MASK_RATIO: 0.25
-THP_PRED_LOSS_TIME_WT: 0.0001
-EXPERIMENT_NAME: phase2d_rope_base
