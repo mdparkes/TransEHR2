@@ -1,46 +1,48 @@
-# Phase 2c: the masking ratios and the time weight, on the settled encoding and schedules.
+# Phase 2c (additive): the masking ratios and the time weight, on this arm's selected settings.
 #
 # THIS SPEC DEPENDS ON PHASES 2a AND 2b HAVING FINISHED. BASE_CONFIG below is not in the
-# repository: it is the encoding and the two schedules those phases selected, assembled into
-# one config. Phase 2a's selection already carries the pretraining side, so the finetuning
-# rate and half-life Phase 2b chose are added to it:
+# repository: it is Phase 2a's selected pretraining settings for this arm, with the finetuning
+# rate and half-life Phase 2b selected for it added on top.
 #
 #     python -c "import yaml; c = yaml.safe_load(open( \
 #         'TransEHR2/configs/experiments/tuning/phase2b_additive_base.yaml')); \
-#         c.update({'FINETUNE_LEARNING_RATE': 1.0e-5, 'FINETUNE_LR_HALF_LIFE': 160, \
-#                   'EXPERIMENT_NAME': 'phase2c_base'}); \
+#         c.update({'FINETUNE_LEARNING_RATE': 1.0e-5, \
+#                   'FINETUNE_LR_HALF_LIFE': 160, \
+#                   'EXPERIMENT_NAME': 'phase2c_additive_base'}); \
 #         yaml.safe_dump(c, open( \
-#         'TransEHR2/configs/experiments/tuning/phase2c_base.yaml', 'w'))"
+#         'TransEHR2/configs/experiments/tuning/phase2c_additive_base.yaml', 'w'))"
 #
 # Running the generator before that file exists fails with a message saying so, rather than
 # quietly sweeping these three against untuned settings.
 #
 # Expand with:
-#     python generate_tuning_configs.py TransEHR2/configs/experiments/tuning/phase2c_spec.yaml
+#     python generate_tuning_configs.py \
+#         TransEHR2/configs/experiments/tuning/phase2c_additive_spec.yaml
 #
-# The design is additive, not factorial. These three are plausibly interacting -- two of them
-# are masking ratios -- but a cross product is 27 cells against the additive 7, and at this
-# task's measured noise more cells buys no power and more selection bias: the maximum of 27
-# noisy draws is further above the truth than the maximum of 7. Where a difference is small
-# relative to run-to-run spread, replication of few configurations dominates enumeration of
-# many.
+# One arm per spec. The two encodings reached this phase carrying different learning rates and
+# different schedules on both sides, so they no longer share a configuration and a two-arm
+# sweep would report a head-to-head at a centre that is not common to them. They are swept
+# separately and compared afterwards.
+#
+# The design is additive rather than factorial. A cross product of the three is 27 cells
+# against 7, which at this task's measured run-to-run spread buys no power: the maximum of 27
+# noisy draws sits further above the truth than the maximum of 7.
 
-SPEC_NAME: phase2c
+SPEC_NAME: phase2c_additive
 
-BASE_CONFIG: phase2c_base.yaml
+BASE_CONFIG: phase2c_additive_base.yaml
 DATASET_CONFIG: ../../datasets/mimic4.yaml
-OUTPUT_DIR: phase2c
-MANIFEST: phase2c_manifest.yaml
+OUTPUT_DIR: phase2c_additive
+MANIFEST: phase2c_additive_manifest.yaml
 
 # fold0 is held out of the manuscript results precisely so that tuning can use it without
 # contaminating them.
 FOLD: fold0
 
-# One arm. The encoding comparison is finished: the two were not separated by the paired
-# head-to-head, so the additive encoding is carried forward as the submitted one.
+# One arm, so it carries no overrides of its own: the encoding, both learning rates and both
+# schedules all come from BASE_CONFIG, which is what the phases before this one selected.
 ARMS:
-  additive:
-    POSITION_ENCODING: 'additive'
+  tuned: {}
 
 # Short tokens used in trial names, which become directory names under models/, log/ and
 # checkpoints/.

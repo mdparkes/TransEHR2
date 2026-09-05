@@ -456,9 +456,9 @@ def write_trial_configs(
 
         if trial.get('is_extra', False):
             rationale = (
-                f"# This is an ablation, not a grid cell. It sits at the centre in every\n"
-                f"# respect but the setting above, so it is read head-to-head against the\n"
-                f"# centre, and it takes no part in selecting any hyperparameter's value.\n"
+                "# This is an ablation, not a grid cell. It sits at the centre in every\n"
+                "# respect but the setting above, so it is read head-to-head against the\n"
+                "# centre, and it takes no part in selecting any hyperparameter's value.\n"
             )
             if trial.get('description'):
                 wrapped = '\n'.join(
@@ -468,8 +468,8 @@ def write_trial_configs(
                 rationale += f'#\n{wrapped}\n'
         else:
             rationale = (
-                f"# Every other tuned hyperparameter sits at its default, which is what makes\n"
-                f"# this an additive sweep: each value is measured against one shared point.\n"
+                "# Every other tuned hyperparameter sits at its default, which is what makes\n"
+                "# this an additive sweep: each value is measured against one shared point.\n"
             )
 
         header = (

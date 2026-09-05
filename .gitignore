@@ -139,17 +139,11 @@ report_historic_diagnosis_audit.py
 *.ckpt
 tests/__pycache__/
 
-# Generated finetuning diagnostic configs
+# Generated trial configs. Every sweep and grid writes its own directory here, and the
+# manifest beside it; both are reproduced by re-running their generator.
 TransEHR2/configs/experiments/ftdiag/
-
-# Generated Phase 2a trial configs
 TransEHR2/configs/experiments/tuning/phase2a/
-
-# Generated Phase 2b finetuning grid configs
 TransEHR2/configs/experiments/tuning/phase2b/
-
-# Generated head-to-head repeat configs
+TransEHR2/configs/experiments/tuning/phase2c_additive/
+TransEHR2/configs/experiments/tuning/phase2c_rope/
 TransEHR2/configs/experiments/tuning/phase2h/
-
-# Generated Phase 2c trial configs
-TransEHR2/configs/experiments/tuning/phase2c/

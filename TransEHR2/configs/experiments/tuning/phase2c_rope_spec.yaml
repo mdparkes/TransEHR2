@@ -1,0 +1,76 @@
+# Phase 2c (rope): the masking ratios and the time weight, on this arm's selected settings.
+#
+# THIS SPEC DEPENDS ON PHASES 2a AND 2b HAVING FINISHED. BASE_CONFIG below is not in the
+# repository: it is Phase 2a's selected pretraining settings for this arm, with the finetuning
+# rate and half-life Phase 2b selected for it added on top.
+#
+#     python -c "import yaml; c = yaml.safe_load(open( \
+#         'TransEHR2/configs/experiments/tuning/phase2b_rope_base.yaml')); \
+#         c.update({'FINETUNE_LEARNING_RATE': 2.2e-5, \
+#                   'FINETUNE_LR_HALF_LIFE': 60, \
+#                   'EXPERIMENT_NAME': 'phase2c_rope_base'}); \
+#         yaml.safe_dump(c, open( \
+#         'TransEHR2/configs/experiments/tuning/phase2c_rope_base.yaml', 'w'))"
+#
+# Running the generator before that file exists fails with a message saying so, rather than
+# quietly sweeping these three against untuned settings.
+#
+# Expand with:
+#     python generate_tuning_configs.py \
+#         TransEHR2/configs/experiments/tuning/phase2c_rope_spec.yaml
+#
+# One arm per spec. The two encodings reached this phase carrying different learning rates and
+# different schedules on both sides, so they no longer share a configuration and a two-arm
+# sweep would report a head-to-head at a centre that is not common to them. They are swept
+# separately and compared afterwards.
+#
+# The design is additive rather than factorial. A cross product of the three is 27 cells
+# against 7, which at this task's measured run-to-run spread buys no power: the maximum of 27
+# noisy draws sits further above the truth than the maximum of 7.
+
+SPEC_NAME: phase2c_rope
+
+BASE_CONFIG: phase2c_rope_base.yaml
+DATASET_CONFIG: ../../datasets/mimic4.yaml
+OUTPUT_DIR: phase2c_rope
+MANIFEST: phase2c_rope_manifest.yaml
+
+# fold0 is held out of the manuscript results precisely so that tuning can use it without
+# contaminating them.
+FOLD: fold0
+
+# One arm, so it carries no overrides of its own: the encoding, both learning rates and both
+# schedules all come from BASE_CONFIG, which is what the phases before this one selected.
+ARMS:
+  tuned: {}
+
+# Short tokens used in trial names, which become directory names under models/, log/ and
+# checkpoints/.
+ALIASES:
+  CMPNT_MASK_RATIO: cmask
+  RECORD_MASK_RATIO: rmask
+  THP_PRED_LOSS_TIME_WT: timewt
+
+# All three rescale the pretraining objective, so their pretraining losses are not comparable
+# to one another -- a model masked at 0.75 is solving a harder problem than one masked at 0.25,
+# and "lowest loss wins" would pick the easiest task. They are selected on mortality validation
+# performance instead, which is why every trial here is finetuned as well as pretrained.
+GRID:
+
+  CMPNT_MASK_RATIO:
+    values: [0.25, 0.5, 0.75]
+    select_on: mortality
+
+  # Xu et al.'s 0.15 was inherited and has never been tuned, and it has the widest reach of the
+  # masking hyperparameters: feature_sample_rate goes to the event-stream masker as well as the
+  # value-stream one, where CMPNT_MASK_RATIO only bites on text.
+  RECORD_MASK_RATIO:
+    values: [0.15, 0.25, 0.35]
+    select_on: mortality
+
+  # With MSE targets at O(1), weight 0.01 puts the time term an order of magnitude below the
+  # type loss and 0.0001 switches it off in all but name. If the sweep comes back flat, the
+  # informative direction is UP toward parity (0.1, 1.0), not further down.
+  THP_PRED_LOSS_TIME_WT:
+    values: [0.01, 0.001, 0.0001]
+    select_on: mortality

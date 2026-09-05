@@ -111,7 +111,7 @@ def main(argv=None):
         if n_finetune:
             print("The finetune array depends on the pretrain array: every finetune loads the "
                   "encoder weights its own pretrain wrote. Chain them with")
-            print(f"  --dependency=afterok:<pretrain job id>")
+            print("  --dependency=afterok:<pretrain job id>")
             print("or wait for the pretrain array to drain before submitting the second.")
         else:
             # An empty array would be sbatch --array=0--1, which is not a range.

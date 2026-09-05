@@ -82,7 +82,10 @@ TransEHR2/
 ├── generate_tuning_configs.py     Expand a tuning spec into one config per trial
 ├── tuning_trial.py                Look one trial up in a manifest, for job arrays
 ├── report_tuning_results.py       Rank a sweep's trials
-├── select_tuned_hyperparameters.py  Assemble the winning config
+├── select_tuned_hyperparameters.py  Assemble the winning config (additive sweep)
+├── select_tuned_cell.py           Write the winning cell's config (factorial sweep)
+├── generate_finetune_grid.py      Finetuning grid or seed repeats over one shared encoder
+├── report_experiment_results.py   Tabulate finished runs by name pattern
 ├── dump_finetuned_predictions.py  Per-fold prediction CSVs
 ├── report_mortality.py            Result tables
 ├── report_length_of_stay.py
