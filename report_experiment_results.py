@@ -232,6 +232,10 @@ def main(argv=None):
                              "--task pretrain.")
     parser.add_argument('--sort', default=None,
                         help='Metric spec to sort by, best first')
+    parser.add_argument('--show', default=None,
+                        help='Comma-separated hyperparameters to column even when every run '
+                             'agrees on them. Hyperparameters that differ are always shown; '
+                             'this is for confirming that the ones meant to be constant are.')
     parser.add_argument('--paired', action='store_true',
                         help='Pair runs by the seed in their names and compare two groups')
     parser.add_argument('--paired_metric', default='val:AUPRC',
@@ -269,6 +273,9 @@ def main(argv=None):
     chosen = args.metrics or (PRETRAIN_METRICS if args.task == 'pretrain' else DEFAULT_METRICS)
     metrics = [spec.strip() for spec in chosen.split(',') if spec.strip()]
     hyperparameters = varying_hyperparameters(runs)
+    for key in (spec.strip() for spec in (args.show or '').split(',') if spec.strip()):
+        if key not in hyperparameters:
+            hyperparameters.append(key)
 
     # A shared prefix says the same thing on every row, so it moves into the header.
     prefix = os.path.commonprefix([name for name, _ in runs])

@@ -27,14 +27,19 @@ ABSOLUTE_PATH = re.compile(r'(?<![\w.])/(?:[\w.-]+/)+[\w.-]+')
 ALLOWED_KEYS = {'MODEL_DIR', 'DATA_DIR', 'VARIABLE_PROPERTIES_PATH'}
 
 
+# A decision record names the manifest and the trials it read, on the machine that ran them.
+# That is what it is for, so it is not held to the portability rule the configs are.
+RECORD_SUFFIXES = ('_cell.yaml', '_selection.yaml')
+
+
 def tracked_configs():
-    """Every tracked YAML under TransEHR2/configs/."""
+    """Every tracked YAML under TransEHR2/configs/ that is a config rather than a record."""
     listed = subprocess.run(
         ['git', 'ls-files', 'TransEHR2/configs/*.yaml',
          'TransEHR2/configs/**/*.yaml'],
         cwd=REPO_ROOT, capture_output=True, text=True, check=True
     ).stdout.split()
-    return sorted(set(listed))
+    return sorted({path for path in listed if not path.endswith(RECORD_SUFFIXES)})
 
 
 def absolute_values(node, path=''):
