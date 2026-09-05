@@ -1316,7 +1316,7 @@ def pretrain_model(
                 best_epoch=best_epoch,
                 best_epoch_train_losses=best_epoch_train_losses,
                 best_epoch_val_losses=best_epoch_val_losses,
-                early_stopping_counter=0,
+                early_stopping_counter=early_stopping_counter,
                 best_state_dict=best_state_dict,
                 best_state_path=best_state_path,
                 timer=timer
