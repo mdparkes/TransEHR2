@@ -87,3 +87,30 @@ def test_an_all_padding_batch_keeps_a_column():
     masks = np.zeros((3, 16), dtype=np.int64)
     batches = list(length_sorted_batches(tokens, masks, np.arange(3), 3))
     assert batches[0][1].shape[1] == 1
+
+
+def test_episode_ids_are_found_beside_the_partition(tmp_path):
+    """extract_mimic writes them at {fold}/{partition}_ids.pkl, not inside the partition.
+
+    Looking only inside the partition returned None for every partition, so the cache key fell
+    back to the partition path -- unique by construction -- and no text was ever reused across
+    folds. The job did six times the embedding work with nothing in its output to say so.
+    """
+    import pickle
+    from embed_text import load_episode_ids
+
+    fold = tmp_path / 'fold1'
+    (fold / 'train').mkdir(parents=True)
+    ids = [1001, 1002, 1003]
+    with open(fold / 'train_ids.pkl', 'wb') as handle:
+        pickle.dump(ids, handle)
+
+    assert load_episode_ids(str(fold / 'train')) == ids
+
+
+def test_missing_episode_ids_are_reported_as_absent(tmp_path):
+    from embed_text import load_episode_ids
+
+    fold = tmp_path / 'fold2'
+    (fold / 'test').mkdir(parents=True)
+    assert load_episode_ids(str(fold / 'test')) is None

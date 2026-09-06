@@ -115,24 +115,35 @@ def load_partition_text(
 
 
 def load_episode_ids(part_dir: str) -> Optional[List]:
-    """Load episode IDs from a partition directory.
+    """Load the patient-episode ids for a partition, in extracted-array row order.
 
-    Tries common naming conventions: train_ids.pkl, val_ids.pkl,
-    test_ids.pkl.  Returns None if no ID file is found.
+    `extract_mimic` writes the ids beside the partition directory rather than inside it --
+    `{fold}/{partition}_ids.pkl` against `{fold}/{partition}/` -- so that is where this looks
+    first. The partition directory is still checked, for datasets written before that layout.
+
+    These ids are what makes deduplication possible: the folds re-partition one set of
+    patients, so an episode recurs in every fold and its text needs embedding once. Without
+    them the cache key falls back to the partition path and nothing can ever hit.
+
+    Returns:
+        The ids, or None if no file was found.
     """
     split = os.path.basename(part_dir)
-    ids_path = os.path.join(part_dir, f'{split}_ids.pkl')
-    if os.path.exists(ids_path):
-        with open(ids_path, 'rb') as f:
-            return pickle.load(f)
-    for fname in os.listdir(part_dir):
+    candidates = [
+        os.path.join(os.path.dirname(part_dir), f'{split}_ids.pkl'),
+        os.path.join(part_dir, f'{split}_ids.pkl'),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            with open(path, 'rb') as f:
+                return pickle.load(f)
+    for fname in sorted(os.listdir(part_dir)):
         if fname.endswith('_ids.pkl'):
             with open(os.path.join(part_dir, fname), 'rb') as f:
                 return pickle.load(f)
     return None
 
 
-@torch.no_grad()
 def length_sorted_batches(token_array, mask_array, flat_indices, batch_size):
     """Yield batches ordered by real sequence length, with the padding tail trimmed.
 
@@ -170,6 +181,7 @@ def length_sorted_batches(token_array, mask_array, flat_indices, batch_size):
         yield flat_indices[start:end], token_array[start:end, :keep], masks[:, :keep]
 
 
+@torch.no_grad()
 def embed_batch(
     llm: GradientTraceableLLM,
     token_ids_batch: np.ndarray,
@@ -224,6 +236,18 @@ def process_partition(
     metadata, offsets, values, masks, timesteps, n_text_feats = \
         load_partition_text(part_dir)
     episode_ids = load_episode_ids(part_dir)
+    if episode_ids is None:
+        # Without ids the cache key falls back to the partition path, which is unique, so every
+        # text is re-embedded in every fold. That is six times the work and it is invisible in
+        # the output, so say so rather than quietly running long.
+        print(f"  WARNING: no episode ids beside {part_dir}. Deduplication across folds is "
+              f"off, so this partition re-embeds text other folds already did.")
+    elif len(episode_ids) != offsets[0].shape[0] - 1:
+        raise ValueError(
+            f'{part_dir}: {offsets[0].shape[0] - 1} episodes in the arrays but '
+            f'{len(episode_ids)} ids beside them. Caching on mismatched ids would attach one '
+            f"episode's embeddings to another."
+        )
     # CSR format: n+1 offsets for n episodes
     n_episodes = offsets[0].shape[0] - 1
 
