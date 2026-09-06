@@ -87,9 +87,7 @@ TransEHR2/
 ├── generate_finetune_grid.py      Finetuning grid or seed repeats over one shared encoder
 ├── report_experiment_results.py   Tabulate finished runs by name pattern
 ├── dump_finetuned_predictions.py  Per-fold prediction CSVs
-├── report_mortality.py            Result tables
-├── report_length_of_stay.py
-├── report_phenotype.py
+├── report_results_tables.py       Result tables, one document per cohort
 └── experiment_descriptions.md     What each experiment number means
 ```
 
@@ -200,30 +198,27 @@ By default the `test` split supplies the reported numbers, and the `val` split i
 
 Experiment numbers are given in the order their columns should appear, left to right, and one is nominated as the control that every other column is tested against. Numbers are resolved by globbing `experiment{N}_*` under `--model-dir`, so `--experiments 3` finds `experiment3_nohistory`. See `experiment_descriptions.md` for what each number is.
 
-Omit `--output` and nothing is written, which is the way to check a table on screen first:
+`report_results_tables.py` declares the cohorts, their column order, and the control each is tested against, and writes one document per cohort with a numbered table per task:
 
 ```shell
-python report_mortality.py --experiments 3 1 2 --control 3
+python report_results_tables.py
 ```
 
-`--append` adds to an existing document instead of replacing it, so several tables can go into one file:
+A task whose predictions have not been dumped is named and skipped rather than aborting the tables that are ready. Restrict the run with `--tasks` and `--cohorts`, and check a single table on screen by naming one of each.
+
+Any other set of experiments can be reported by giving them explicitly, in the order their columns should appear:
 
 ```shell
-OUT=tables/results.docx
-rm -f $OUT
-python report_mortality.py      --experiments 3 1 2 --control 3 --table-number 1 --output $OUT --append
-python report_length_of_stay.py --experiments 3 1 2 --control 3 --table-number 2 --output $OUT --append
-python report_phenotype.py      --experiments 3 1 2 --control 3 --table-number 3 --output $OUT --append
+python report_results_tables.py --experiments 3 1 2 --control 3 --tasks mortality
 ```
 
-Delete the output file first, or `--append` will add to the tables already there.
-
-The Word table carries P values only. `--stats-csv` writes every per-fold value, mean difference, *t* statistic, degrees of freedom, and both unadjusted and adjusted P value:
+Options the script does not define are passed through to the per-task reporter, so the threshold, metric, fold and formatting flags below all still apply:
 
 ```shell
-python report_mortality.py --experiments 3 1 2 --control 3 \
-    --stats-csv stats/table1_mortality.csv --quiet
+python report_results_tables.py --tasks mortality --threshold 0.5
 ```
+
+The Word tables carry P values only. A stats CSV is written beside each one with every per-fold value, mean difference, *t* statistic, degrees of freedom, and both unadjusted and adjusted P value.
 
 ### Statistical comparisons
 
@@ -273,14 +268,14 @@ Common to all three scripts:
 | `--stats-csv PATH` | none | Per-fold values and test statistics |
 | `--quiet` | off | Suppress the statistical detail block |
 
-Classification tasks only (`report_mortality.py`, `report_phenotype.py`):
+Classification tasks only (`--tasks mortality`, `--tasks phenotype`):
 
 | Option | Default | Purpose |
 |---|---|---|
 | `--threshold {prevalence,FLOAT}` | `prevalence` | How probabilities become class labels |
 | `--calibration-split SPLIT` | `val` | Split the threshold is calibrated on |
 
-`report_phenotype.py` only:
+`--tasks phenotype` only:
 
 | Option | Default | Purpose |
 |---|---|---|
