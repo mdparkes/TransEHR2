@@ -19,6 +19,7 @@ from typing import Dict, Iterator, List, Optional, Tuple, Union
 from TransEHR2.constants import HF_API_TOKEN, LLM_NAME, MAX_TOKEN_LENGTH, TOKENIZER_PAD_TOKEN
 from TransEHR2.data.custom_types import EpisodeData, MixedTensorDataset, TensorDimensions
 from TransEHR2.data.datareaders import MIMICDataReader
+from TransEHR2.data.cohorts import cohort_indices
 from TransEHR2.data.datasets import MixedDataset
 
 
@@ -1464,7 +1465,8 @@ def load_dataset(
     base_path: str,
     history_len_steps: Optional[int] = None,
     episode_len_steps: Optional[int] = None,
-    extracted_history_len_steps: Optional[int] = None
+    extracted_history_len_steps: Optional[int] = None,
+    cohort: Optional[str] = None
 ) -> MixedDataset:
     """
     Load tensorized dataset with memory-mapped arrays.
@@ -1479,6 +1481,10 @@ def load_dataset(
         extracted_history_len_steps: Size of the history region in the extracted arrays. Only
             needed for datasets written before the layout was recorded in metadata.pkl; when
             metadata carries the value, this argument is ignored.
+        cohort: Restrict the dataset to the episodes a named cohort keeps; see
+            `TransEHR2.data.cohorts`. None (default) keeps every episode. Membership is
+            computed on the full extracted history, so it does not move with
+            `history_len_steps`.
 
     Raises:
         ValueError: If a crop is requested but the extracted history/episode split is unknown,
@@ -1533,6 +1539,15 @@ def load_dataset(
                     np.load(embed_path, mmap_mode='r')
                 )
 
+    episode_indices = cohort_indices(
+        {
+            'val_masks': load_mmap('val_masks'),
+            'val_text_indicators': load_mmap('val_text_indicators'),
+            'max_history_len_steps': max_history_len_steps,
+        },
+        cohort,
+    )
+
     return MixedDataset(
         val_numeric_indicators=load_mmap('val_numeric_indicators'),
         val_numeric_values=[load_mmap(f'val_numeric_values_{i}') for i in range(n_num)],
@@ -1563,6 +1578,7 @@ def load_dataset(
         max_history_len_steps=max_history_len_steps,
         history_len_steps=history_len_steps,
         episode_len_steps=episode_len_steps,
+        episode_indices=episode_indices,
     )
 
 
@@ -2125,7 +2141,8 @@ def prepare_dataloaders(
     use_historical_records: bool = True,
     history_len_steps: Optional[int] = None,
     episode_len_steps: Optional[int] = None,
-    extracted_history_len_steps: Optional[int] = None
+    extracted_history_len_steps: Optional[int] = None,
+    cohort: Optional[str] = None
 ) -> List[DataLoader]:
     """Prepare training, (validation), and test DataLoaders for MixedDataset.
 
@@ -2234,7 +2251,11 @@ def prepare_dataloaders(
             history_len_steps=history_len_steps,
             episode_len_steps=episode_len_steps,
             extracted_history_len_steps=extracted_history_len_steps,
+            cohort=cohort,
         )
+        if cohort is not None:
+            print(f'  {partition}: cohort {cohort!r} keeps {len(dataset)} of '
+                  f'{dataset.n_extracted_episodes} episodes')
         
         # Determine sampler and shuffle behavior
         sampler = None
