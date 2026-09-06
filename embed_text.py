@@ -133,6 +133,43 @@ def load_episode_ids(part_dir: str) -> Optional[List]:
 
 
 @torch.no_grad()
+def length_sorted_batches(token_array, mask_array, flat_indices, batch_size):
+    """Yield batches ordered by real sequence length, with the padding tail trimmed.
+
+    Sequences are stored padded to MAX_TOKEN_LENGTH. A batch drawn in storage order almost
+    always contains one long note, so trimming alone would save nothing; sorting by real length
+    first makes each batch nearly uniform, and the trim then costs each batch its own longest
+    sequence rather than the global maximum. Attention is quadratic in that length.
+
+    Padding is on the right -- `LLMTextProcessor` refuses a tokenizer that pads left, because
+    CLS pooling reads position 0 -- so dropping the tail beyond a batch's longest real sequence
+    removes only padding, and the embeddings are unchanged.
+
+    Args:
+        token_array: (n, token_len) token ids.
+        mask_array: (n, token_len) attention masks, nonzero on real tokens.
+        flat_indices: (n,) destination index of each row in the partition's embedding array.
+        batch_size: Rows per batch.
+
+    Yields:
+        (indices, tokens, masks) per batch, where `indices` says where each row's embedding
+        belongs. Rows are permuted, so the caller must scatter by `indices` rather than assume
+        input order.
+    """
+    lengths = np.asarray(mask_array).sum(axis=1)
+    order = np.argsort(lengths, kind='stable')
+    token_array = np.asarray(token_array)[order]
+    mask_array = np.asarray(mask_array)[order]
+    flat_indices = np.asarray(flat_indices)[order]
+
+    for start in range(0, len(flat_indices), batch_size):
+        end = min(start + batch_size, len(flat_indices))
+        masks = mask_array[start:end]
+        # At least one column, so an all-empty batch still has a shape the model accepts.
+        keep = max(int(masks.sum(axis=1).max()), 1)
+        yield flat_indices[start:end], token_array[start:end, :keep], masks[:, :keep]
+
+
 def embed_batch(
     llm: GradientTraceableLLM,
     token_ids_batch: np.ndarray,
@@ -247,21 +284,13 @@ def process_partition(
             token_array = np.stack(need_embed_tokens, axis=0)
             mask_array = np.stack(need_embed_masks, axis=0)
 
-            for batch_start in range(
-                0, len(need_embed_indices), batch_size
+            for batch_indices, batch_tokens, batch_masks in length_sorted_batches(
+                token_array, mask_array, need_embed_indices, batch_size
             ):
-                batch_end = min(
-                    batch_start + batch_size,
-                    len(need_embed_indices)
-                )
-                batch_tokens = token_array[batch_start:batch_end]
-                batch_masks = mask_array[batch_start:batch_end]
                 batch_embeds = embed_batch(
                     llm, batch_tokens, batch_masks, device
                 )
-                for i, flat_idx in enumerate(
-                    need_embed_indices[batch_start:batch_end]
-                ):
+                for i, flat_idx in enumerate(batch_indices):
                     all_embeddings[flat_idx] = batch_embeds[i]
 
             new_embeddings_count += len(need_embed_indices)
