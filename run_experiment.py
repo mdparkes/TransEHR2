@@ -875,7 +875,12 @@ def main():
             if skip_finetuning:
                 print(f"\nFinetuned {task} model found, skipping finetuning.\n")
 
-            checkpoint_dir = f'./checkpoints/{EXPERIMENT_NAME}/{fold_name}/finetuned'
+            # Per task, like the log directory beside it. One directory shared by every task
+            # is resumed from by whichever task runs next: a requeue during phenotyping would
+            # load mortality's model and optimizer state into the phenotyping stage. It also
+            # forecloses running the tasks as separate concurrent jobs, which is how a fold
+            # fans out across GPUs.
+            checkpoint_dir = f'./checkpoints/{EXPERIMENT_NAME}/{fold_name}/finetuned_{task}'
             log_dir = f'./log/{EXPERIMENT_NAME}/{fold_name}/finetuned_{task}'
             os.makedirs(log_dir, exist_ok=True)
             writer = SummaryWriter(log_dir)
