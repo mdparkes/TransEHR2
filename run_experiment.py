@@ -646,17 +646,34 @@ def main():
 
     if USE_TEXT:
         n_val_feats = len(VALUED_FEATS) + len(TEXT_FEATS)
-        # text_embed_dim is a property of the extraction, so read it from the fold actually
+        # text_embed_dim is a property of the extraction, so read it from the folds actually
         # being run rather than from whichever fold happens to sort first.
-        meta_path = os.path.join(DATA_DIR, fold_name_list[0], 'train', 'metadata.pkl')
-        with open(meta_path, 'rb') as f:
-            _meta = pickle.load(f)
-        text_embed_dim = _meta['text_embed_dim']
-        if text_embed_dim == 0:
+        #
+        # Every partition is checked, not just the first fold's train split. `load_dataset`
+        # falls back to text_embed_dim 0 when a partition has no embedding files, and the model
+        # is built from whichever partition was read here: an unembedded test split then reaches
+        # the value encoder's input projection 2048 columns short, after the run has already
+        # paid for pretraining and finetuning.
+        widths = {}
+        for fold_name in fold_name_list:
+            for partition in ('train', 'val', 'test'):
+                meta_path = os.path.join(DATA_DIR, fold_name, partition, 'metadata.pkl')
+                if not os.path.exists(meta_path):
+                    continue
+                with open(meta_path, 'rb') as f:
+                    widths[f'{fold_name}/{partition}'] = pickle.load(f).get('text_embed_dim', 0)
+        missing = sorted(name for name, width in widths.items() if not width)
+        if missing:
             raise RuntimeError(
-                "text_embed_dim is 0 in dataset metadata. "
-                "Run embed_text.py to pre-compute text embeddings before training."
+                f"USE_TEXT is set, but these partitions carry no text embeddings: "
+                f"{', '.join(missing)}. Run embed_text.py over them before training."
             )
+        if len(set(widths.values())) > 1:
+            raise RuntimeError(
+                f"partitions disagree on the text embedding width: {widths}. They must come "
+                f"from one embedding model, or the encoder is built for the wrong one."
+            )
+        text_embed_dim = next(iter(widths.values()))
         tot_val_feat_dim += len(TEXT_FEATS) * text_embed_dim
         print(f"Text embedding dimension: {text_embed_dim}\n")
     else:
