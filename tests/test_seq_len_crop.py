@@ -340,7 +340,7 @@ def test_lengthening_is_rejected():
 
 
 def test_collate_masks_post_crop_history_region():
-    """`use_historical_records=False` must mask the cropped history region, not the stored one."""
+    """Dropping history must clear the cropped history region, not the stored one."""
     ds = MixedDataset(
         **_build_arrays(EPISODE_SPECS, H_BIG, E_BIG),
         history_len_steps=H_SMALL,
@@ -348,11 +348,12 @@ def test_collate_masks_post_crop_history_region():
     )
     batch = [ds[i] for i in range(len(EPISODE_SPECS))]
     masked = collate_tensorized(
-        batch, use_historical_records=False, history_len_steps=ds.history_len_steps
+        batch, use_historical_nontext_records=False, use_historical_text_records=False,
+        history_len_steps=ds.history_len_steps
     )
     unmasked = collate_tensorized(
         [ds[i] for i in range(len(EPISODE_SPECS))],
-        use_historical_records=True, history_len_steps=ds.history_len_steps
+        history_len_steps=ds.history_len_steps
     )
 
     masked_tensors = _timestep_tensors(masked, len(EPISODE_SPECS), ds.ts_len)
@@ -365,7 +366,7 @@ def test_collate_masks_post_crop_history_region():
         if torch.any(u[:, :H_SMALL] != 0.0) and torch.all(m[:, :H_SMALL] == 0.0)
     ]
     # Only the value stream still has a history region to mask: the event stream is sliced to
-    # in-stay records at collation, so `use_historical_records` has nothing left to zero there.
+    # in-stay records at collation, so the history switches have nothing left to zero there.
     assert len(mask_pairs) >= 1, \
         f'expected the val mask to be zeroed, found {len(mask_pairs)}'
     for m, u in mask_pairs:
@@ -485,7 +486,8 @@ def test_prepare_dataloaders_applies_crop():
             batch_size=len(EPISODE_SPECS),
             num_workers=0,
             pin_memory=False,
-            use_historical_records=False,
+            use_historical_nontext_records=False,
+            use_historical_text_records=False,
             history_len_steps=H_SMALL,
             episode_len_steps=E_SMALL,
         )[0]

@@ -386,7 +386,8 @@ if __name__ == "__main__":
             balance_text=USE_TEXT,
             world_size=_world_size,
             rank=_rank,
-            use_historical_records=USE_HISTORICAL_RECORDS,
+            use_historical_nontext_records=USE_HISTORICAL_RECORDS,
+            use_historical_text_records=USE_HISTORICAL_RECORDS,
             history_len_steps=history_len_steps,
             episode_len_steps=episode_len_steps,
             extracted_history_len_steps=MAX_HISTORY_LEN_STEPS

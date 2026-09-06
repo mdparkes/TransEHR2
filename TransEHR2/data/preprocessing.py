@@ -1229,7 +1229,9 @@ def filter_timeseries_records(
 
 def collate_tensorized(
     batch: MixedDataset,
-    use_historical_records: bool = True,
+    use_historical_nontext_records: bool = True,
+    use_historical_text_records: bool = True,
+    use_instay_records: bool = True,
     history_len_steps: int = 0
 ) -> MixedTensorDataset:
     """Collate function for MixedDataset.
@@ -1242,16 +1244,24 @@ def collate_tensorized(
 
     Args:
         batch: List of episode dicts from MixedDataset.__getitem__.
-        use_historical_records: If False, zero out masks for the
-            history region [0, history_len_steps) so the model
-            ignores pre-admission data. Defaults to True.
+        use_historical_nontext_records: If False, drop the numeric, categorical,
+            ordinal and multilabel records in the history region
+            [0, history_len_steps). Defaults to True.
+        use_historical_text_records: If False, drop the text records in the
+            history region. All text is pre-admission, because the in-stay
+            window closes before a discharge summary can be written, so this
+            is the switch that removes text entirely. Defaults to True.
+        use_instay_records: If False, drop every record from
+            [history_len_steps, ...), leaving a history-only model. The event
+            stream is in-stay by construction and is emptied with it.
+            Defaults to True.
         history_len_steps: Number of leading timestep indices in the
             incoming tensors that hold historical records. This is the
             post-crop history length (see MixedDataset), not necessarily
             the extraction-time MAX_HISTORY_LEN_STEPS. The event stream is
             always sliced at this index so the THP sees in-stay records
-            only; it additionally masks the value history when
-            use_historical_records is False.
+            only; it is also where the value stream is divided when any of
+            the three record switches is False.
     """
 
     # Stack simple tensors directly
@@ -1260,9 +1270,6 @@ def collate_tensorized(
     event_times = torch.stack([b['event_times'] for b in batch], dim=0)
     event_masks = torch.stack([b['event_masks'] for b in batch], dim=0)
 
-    # Mask out history region when historical records are disabled
-    if not use_historical_records and history_len_steps > 0:
-        val_masks[:, :history_len_steps] = 0.0
     static_data = torch.stack([b['static_data'] for b in batch], dim=0)
 
     # Stack indicator tensors
@@ -1293,6 +1300,40 @@ def collate_tensorized(
         event_times = event_times[:, history_len_steps:].contiguous()
         event_masks = event_masks[:, history_len_steps:].contiguous()
         event_ind = event_ind[:, history_len_steps:].contiguous()
+
+    # Record switches. Each clears the indicators of the streams it disables and then rebuilds
+    # the timestep mask from what survives, so a timestep left with nothing observed becomes
+    # padding rather than an empty non-padding step. The mask is only recomputed in the regions
+    # a switch actually touches: with every switch on, nothing below runs and the batch is
+    # exactly what it would have been.
+    nontext_ind = [val_numeric_ind, val_categorical_ind, val_ordinal_ind, val_multilabel_ind]
+
+    def _observed(indicators, region):
+        """Whether any feature is still recorded at each timestep of `region`."""
+        present = torch.zeros_like(val_masks[:, region], dtype=torch.bool)
+        for tensor in indicators:
+            if tensor.shape[-1] > 0:
+                present |= tensor[:, region].bool().any(dim=-1)
+        return present
+
+    if history_len_steps > 0 and not (use_historical_nontext_records
+                                      and use_historical_text_records):
+        history = slice(0, history_len_steps)
+        if not use_historical_nontext_records:
+            for tensor in nontext_ind:
+                tensor[:, history] = 0.0
+        if not use_historical_text_records:
+            val_text_ind[:, history] = 0.0
+        val_masks[:, history] *= _observed(nontext_ind + [val_text_ind], history).float()
+
+    if not use_instay_records:
+        in_stay = slice(history_len_steps, val_masks.shape[1])
+        for tensor in nontext_ind + [val_text_ind]:
+            tensor[:, in_stay] = 0.0
+        val_masks[:, in_stay] = 0.0
+        # The event stream holds in-stay records only, so it empties with them.
+        event_masks = torch.zeros_like(event_masks)
+        event_ind = torch.zeros_like(event_ind)
 
     # Stack per-feature value tensors
     n_numeric_feats = len(batch[0]['val_numeric_values'])
@@ -1330,11 +1371,22 @@ def collate_tensorized(
                            dtype=torch.int64)
                 for index, b in enumerate(batch)
             ]) if batch else torch.zeros(0, dtype=torch.int64)
+            timesteps = torch.cat([b['val_text_embeddings'][f][0] for b in batch])
+            values = torch.cat([b['val_text_embeddings'][f][1] for b in batch])
+            # The indicators above were cleared for the disabled regions; the embeddings are a
+            # separate sparse block and have to be filtered to match, or a dropped record would
+            # still reach the encoder through its embedding.
+            if not use_historical_text_records or not use_instay_records:
+                keep = torch.ones_like(timesteps, dtype=torch.bool)
+                if not use_historical_text_records:
+                    keep &= timesteps >= history_len_steps
+                if not use_instay_records:
+                    keep &= timesteps < history_len_steps
+                episodes, timesteps, values = episodes[keep], timesteps[keep], values[keep]
             val_text_sparse.append({
                 'episode_index': episodes,
-                'timestep_index': torch.cat(
-                    [b['val_text_embeddings'][f][0] for b in batch]),
-                'values': torch.cat([b['val_text_embeddings'][f][1] for b in batch]),
+                'timestep_index': timesteps,
+                'values': values,
             })
         text_embed_dim = batch[0]['val_text_embeddings'][0][1].shape[-1]
     else:
@@ -2138,7 +2190,9 @@ def prepare_dataloaders(
     balance_text: bool = False,
     world_size: Optional[int] = None,
     rank: Optional[int] = None,
-    use_historical_records: bool = True,
+    use_historical_nontext_records: bool = True,
+    use_historical_text_records: bool = True,
+    use_instay_records: bool = True,
     history_len_steps: Optional[int] = None,
     episode_len_steps: Optional[int] = None,
     extracted_history_len_steps: Optional[int] = None,
@@ -2198,10 +2252,16 @@ def prepare_dataloaders(
             Can be obtained from accelerator.num_processes.
         rank (int, optional): Current process rank. Required if balance_text=True. Can be obtained
             from accelerator.process_index.
-        use_historical_records (bool, optional): If False, zero out masks for the history region
-            so the model ignores pre-admission data. Defaults to True. Note that this masks
-            history in place, leaving the sequence length unchanged; `history_len_steps=0`
-            instead removes those timesteps entirely, which is cheaper.
+        use_historical_nontext_records (bool, optional): If False, drop the non-text records in
+            the history region. Defaults to True.
+        use_historical_text_records (bool, optional): If False, drop the text records in the
+            history region. Defaults to True.
+        use_instay_records (bool, optional): If False, drop every in-stay record, emptying the
+            event stream with them. Defaults to True.
+            Dropping history in place leaves the sequence length unchanged; when both history
+            switches are off, `history_len_steps=0` removes those timesteps entirely instead,
+            which is cheaper. Text is pre-admission in its entirety, so a run that keeps text
+            must keep the region.
         history_len_steps (int, optional): Runtime cap on historical timesteps per episode.
             Sequences are cropped at load time, which is equivalent to re-extracting with a
             smaller MAX_HISTORY_LEN_STEPS (see `MixedDataset`). Must not exceed the extracted
@@ -2277,7 +2337,9 @@ def prepare_dataloaders(
         
         collate_fn = partial(
             collate_tensorized,
-            use_historical_records=use_historical_records,
+            use_historical_nontext_records=use_historical_nontext_records,
+            use_historical_text_records=use_historical_text_records,
+            use_instay_records=use_instay_records,
             # Post-crop history length: masking must target the history region of the tensors
             # that __getitem__ actually returns, not the extraction-time region.
             history_len_steps=dataset.history_len_steps,

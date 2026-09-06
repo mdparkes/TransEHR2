@@ -58,6 +58,8 @@ _PROCESS_START = time.perf_counter()
 
 from accelerate import Accelerator
 from accelerate.utils import DistributedType, set_seed
+
+from TransEHR2.data.cohorts import COHORTS
 from torch.utils.tensorboard import SummaryWriter
 from typing import Any, Dict, List, Optional, Union
 
@@ -100,7 +102,10 @@ RECORDED_HYPERPARAMETERS = (
     'HISTORY_LEN_STEPS',
     'EPISODE_LEN_STEPS',
     'USE_TEXT',
-    'USE_HISTORICAL_RECORDS',
+    'USE_HISTORICAL_NONTEXT_RECORDS',
+    'USE_HISTORICAL_TEXT_RECORDS',
+    'USE_INSTAY_RECORDS',
+    'COHORT_SUBSET',
 )
 
 
@@ -529,7 +534,43 @@ def main():
     # ranks rare labels above common ones, which is a modelling stance, not a correction.
     FINETUNE_POS_WEIGHT_TASKS = tuple(
         experiment_config.get('FINETUNE_POS_WEIGHT_TASKS', ['mortality']))
-    USE_HISTORICAL_RECORDS = experiment_config.get('USE_HISTORICAL_RECORDS', True)
+    # Which records reach the model. All text is pre-admission -- the in-stay window closes at
+    # 48 h, before a discharge summary exists -- so USE_HISTORICAL_TEXT_RECORDS is what removes
+    # text records, while USE_TEXT decides whether the model has a text pathway at all.
+    #
+    # USE_HISTORICAL_RECORDS is the single switch these two replace. It is still read, because
+    # every config the finished tuning phases generated carries it, but it cannot be combined
+    # with either replacement: one config saying both things has no unambiguous reading.
+    history_default = experiment_config.get('USE_HISTORICAL_RECORDS', True)
+    if 'USE_HISTORICAL_RECORDS' in experiment_config:
+        conflicting = [key for key in ('USE_HISTORICAL_NONTEXT_RECORDS',
+                                       'USE_HISTORICAL_TEXT_RECORDS')
+                       if key in experiment_config]
+        if conflicting:
+            raise ValueError(
+                f"{args.experiment_config} sets USE_HISTORICAL_RECORDS alongside "
+                f"{', '.join(conflicting)}. USE_HISTORICAL_RECORDS is the switch those replace; "
+                f"drop it and state the two separately."
+            )
+    USE_HISTORICAL_NONTEXT_RECORDS = experiment_config.get(
+        'USE_HISTORICAL_NONTEXT_RECORDS', history_default)
+    USE_HISTORICAL_TEXT_RECORDS = experiment_config.get('USE_HISTORICAL_TEXT_RECORDS',
+                                                        history_default)
+    USE_INSTAY_RECORDS = experiment_config.get('USE_INSTAY_RECORDS', True)
+    if not (USE_HISTORICAL_NONTEXT_RECORDS or USE_HISTORICAL_TEXT_RECORDS
+            or USE_INSTAY_RECORDS):
+        raise ValueError(
+            f'{args.experiment_config} disables every record stream, leaving the model nothing '
+            f'to read.'
+        )
+    # Restricts the run to episodes carrying a kind of pre-admission record; see
+    # TransEHR2.data.cohorts. None runs every episode.
+    COHORT_SUBSET = experiment_config.get('COHORT_SUBSET', None)
+    if COHORT_SUBSET is not None and COHORT_SUBSET not in COHORTS:
+        raise ValueError(
+            f'{args.experiment_config} sets COHORT_SUBSET={COHORT_SUBSET!r}; expected one of '
+            f'{COHORTS} or nothing.'
+        )
     # Runtime sequence-length caps. None uses everything that was extracted; smaller values crop
     # at load time, which is equivalent to re-extracting with the shorter limit.
     HISTORY_LEN_STEPS = experiment_config.get('HISTORY_LEN_STEPS', None)
@@ -638,7 +679,10 @@ def main():
             # text-heavy episodes. With one process there is nothing to balance against, and
             # prepare_dataloaders skips the sampler at world_size 1 regardless.
             balance_text=False,
-            use_historical_records=USE_HISTORICAL_RECORDS,
+            use_historical_nontext_records=USE_HISTORICAL_NONTEXT_RECORDS,
+            use_historical_text_records=USE_HISTORICAL_TEXT_RECORDS,
+            use_instay_records=USE_INSTAY_RECORDS,
+            cohort=COHORT_SUBSET,
             history_len_steps=HISTORY_LEN_STEPS,
             episode_len_steps=EPISODE_LEN_STEPS,
             extracted_history_len_steps=MAX_HISTORY_LEN_STEPS
