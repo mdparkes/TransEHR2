@@ -13,6 +13,10 @@
 #   7  History, text, full dataset, 70B LLM
 #   8  History, text, full dataset, 70B LLM, bigger encoders (not used)
 #   9  History only, text, full dataset, 1B LLM (control 2)
+#
+# The revision experiments, 10-17, are grouped by cohort into two sets of tables, so the
+# cohort is stated in each table's caption rather than repeated in every column heading.
+# Their text encoder is BAAI/bge-m3, which is not a size the heading needs to carry.
 
 columns:
   1: "Historical + in-stay records, no text features, 1B parameter LLM"
@@ -24,3 +28,11 @@ columns:
   7: "Historical + in-stay records, text features, 70B parameter LLM"
   8: "Historical + in-stay records, text features, 70B parameter LLM, larger encoders"
   9: "Historical records only, text features, 1B parameter LLM"
+  10: "In-stay records only"
+  11: "Historical records only, text features"
+  12: "Historical + in-stay records, no text features"
+  13: "Historical + in-stay records, text features"
+  14: "In-stay records + text features"
+  15: "In-stay records only"
+  16: "Historical records only, text features"
+  17: "Historical + in-stay records, text features"
