@@ -3,17 +3,10 @@
 # Expand with:
 #     python generate_tuning_configs.py TransEHR2/configs/experiments/tuning/phase3_spec.yaml
 #
-# THIS SPEC DEPENDS ON PHASE 2 HAVING FINISHED. BASE_CONFIG below is not in the repository:
-# it is written by the selection step, which picks the encoding arm and the five tuned
-# hyperparameters out of the Phase 2 results and assembles them into one complete config.
-#
-#     python select_tuned_hyperparameters.py \
-#         TransEHR2/configs/experiments/tuning/phase2_manifest.yaml \
-#         --output TransEHR2/configs/experiments/tuning/phase3_base.yaml \
-#         --experiment_name phase3_base
-#
-# Running the generator before that step fails with a message saying so, rather than quietly
-# sweeping history against untuned settings.
+# BASE_CONFIG is phase3_base.yaml, which carries the encoding arm and the five hyperparameters
+# Phase 2 settled. It is in the repository beside this spec, and each of its values has a
+# decision record in this directory: phase2a_additive_cell.yaml for the schedules,
+# phase2c_additive_selection.yaml for the masking ratios and the time loss weight.
 #
 # The sweep is the same additive shape as Phase 2 with a grid of one, so it needs no new
 # machinery and no new SLURM scripts -- the same manifest-driven arrays run it:

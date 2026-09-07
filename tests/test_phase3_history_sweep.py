@@ -24,8 +24,8 @@ from hp_tuning.spec import (expand_trials, extra_trials, finetune_trials, load_s
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PHASE3_SPEC = os.path.join(REPO, 'TransEHR2', 'configs', 'experiments', 'tuning',
                            'phase3_spec.yaml')
-PHASE2_BASE = os.path.join(REPO, 'TransEHR2', 'configs', 'experiments', 'tuning',
-                           'phase2_base.yaml')
+PHASE3_BASE = os.path.join(REPO, 'TransEHR2', 'configs', 'experiments', 'tuning',
+                           'phase3_base.yaml')
 
 # What the plan's history arms are, in order. The first is the extraction capacity and is the
 # no-crop centre; the last removes pre-admission history while leaving the in-stay episode.
@@ -33,20 +33,14 @@ HISTORY_ARMS = [500, 225, 100, 40, 5, 0]
 
 
 def _write_spec(root, **overrides):
-    """Materialise the real Phase 3 spec against a stand-in for Phase 2's assembled base.
+    """Materialise the real Phase 3 spec and its real base config under `root`.
 
-    The shipped spec points at `phase3_base.yaml`, which does not exist until Phase 2 finishes
-    and `select_tuned_hyperparameters.py` writes it. Standing in for it here keeps the test
-    exercising the spec that will actually run, rather than a copy that can drift from it.
+    Only the paths are redirected, so what is exercised is the pair that will actually run
+    rather than a copy of it that can drift.
     """
-    base = yaml.safe_load(open(PHASE2_BASE))
-    base.update({'EXPERIMENT_NAME': 'phase3_base', 'POSITION_ENCODING': 'rope'})
-    base_path = os.path.join(root, 'phase3_base.yaml')
-    yaml.dump(base, open(base_path, 'w'), sort_keys=False)
-
     spec = yaml.safe_load(open(PHASE3_SPEC))
     spec.update({
-        'BASE_CONFIG': base_path,
+        'BASE_CONFIG': PHASE3_BASE,
         'DATASET_CONFIG': os.path.join(REPO, 'TransEHR2/configs/datasets/mimic4.yaml'),
         'OUTPUT_DIR': os.path.join(root, 'configs'),
         'MANIFEST': os.path.join(root, 'manifest.yaml'),
