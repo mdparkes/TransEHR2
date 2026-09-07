@@ -175,6 +175,7 @@ def create_inference_loader(
     use_historical_text_records: bool = True,
     use_instay_records: bool = True,
     cohort: Optional[str] = None,
+    cohort_episodes: Optional[str] = None,
     history_len_steps: Optional[int] = None,
     episode_len_steps: Optional[int] = None,
     extracted_history_len_steps: Optional[int] = None,
@@ -202,6 +203,9 @@ def create_inference_loader(
         cohort: Restrict the split to a named cohort. Must match the cohort the
             model was trained on, or the predictions describe a different set of
             episodes from the one the model was fitted to.
+        cohort_episodes: Restrict the split to an explicit list of patient-episode
+            IDs. Must be the same list the model was trained on, for the same
+            reason.
         history_len_steps: Runtime cap on historical timesteps, applied
             by cropping at load time. None uses all extracted history.
         episode_len_steps: Runtime cap on in-stay timesteps. None uses
@@ -232,6 +236,7 @@ def create_inference_loader(
         episode_len_steps=episode_len_steps,
         extracted_history_len_steps=extracted_history_len_steps,
         cohort=cohort,
+        cohort_episodes=cohort_episodes,
     )
     total = len(dataset)
 
@@ -661,6 +666,13 @@ if __name__ == '__main__':
     # Likewise the cohort: predictions over a different set of episodes cannot be paired
     # against another experiment's, which is what the corrected resampled t test needs.
     COHORT_SUBSET = experiment_config.get('COHORT_SUBSET', None)
+    COHORT_EPISODES = experiment_config.get('COHORT_EPISODES', None)
+    if COHORT_EPISODES is not None and not os.path.exists(COHORT_EPISODES):
+        raise FileNotFoundError(
+            f'{args.experiment_config} sets COHORT_EPISODES={COHORT_EPISODES!r}, which does '
+            f'not exist. It must be the same list the model was trained on, or the dumped '
+            f'predictions describe a different set of episodes.'
+        )
     # Runtime sequence-length caps; must match the values the model was trained with.
     HISTORY_LEN_STEPS = experiment_config.get('HISTORY_LEN_STEPS', None)
     EPISODE_LEN_STEPS = experiment_config.get('EPISODE_LEN_STEPS', None)
@@ -757,6 +769,7 @@ if __name__ == '__main__':
                 use_historical_text_records=USE_HISTORICAL_TEXT_RECORDS,
                 use_instay_records=USE_INSTAY_RECORDS,
                 cohort=COHORT_SUBSET,
+                cohort_episodes=COHORT_EPISODES,
                 history_len_steps=HISTORY_LEN_STEPS,
                 episode_len_steps=EPISODE_LEN_STEPS,
                 extracted_history_len_steps=MAX_HISTORY_LEN_STEPS,

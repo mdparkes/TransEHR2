@@ -6,10 +6,14 @@ task's metrics, compares every experiment against a nominated control with the c
 resampled t test of Nadeau & Bengio (2003), controls the false discovery rate with the
 Benjamini-Hochberg procedure, and writes a numbered table per task.
 
-The experiments split into two cohorts, each reported against its own in-stay-only control:
-every model in a set is compared with the one that reads no pre-admission data at all, which is
-the contrast the tables exist to make. Column order and control are properties of the design,
-so they are declared below rather than retyped per run.
+The experiments split into cohorts, each reported against its own in-stay-only control: every
+model in a set is compared with the one that reads no pre-admission data at all, which is the
+contrast the tables exist to make. Column order and control are properties of the design, so
+they are declared below rather than retyped per run.
+
+A cohort may also declare which tasks it reports. The Charlson arm is a logistic regression on
+age, sex and the comorbidity index, so it predicts in-hospital mortality and nothing else, and
+asking for its length-of-stay table would only report a missing file.
 
 Usage:
     python report_results_tables.py
@@ -37,14 +41,17 @@ from reporting.cli import build_parser, run
 from reporting.tasks import TASK_SPECS, TASKS
 
 
-# (key, caption suffix, experiment numbers in column order, control)
+# (key, caption suffix, experiment numbers in column order, control, tasks or None for all)
 COHORTS = (
     ('dischargesubset',
      'patients with at least one pre-admission discharge summary',
-     (10, 11, 12, 13, 14), 10),
+     (10, 11, 12, 13, 14), 10, None),
     ('historysubset',
      'patients with at least one pre-admission record',
-     (15, 16, 17), 15),
+     (15, 16, 17), 15, None),
+    ('charlson',
+     'patients with a Charlson comorbidity index from an earlier hospital admission',
+     (18, 19), 18, ('mortality',)),
 )
 
 COHORT_KEYS = tuple(key for key, *_ in COHORTS)
@@ -74,7 +81,7 @@ def report_one(task_spec, argv):
 
 
 def selected_cohorts(args):
-    """The (key, caption, experiments, control) groups this run reports."""
+    """The (key, caption, experiments, control, tasks) groups this run reports."""
     if args.experiments:
         if args.control is None:
             raise SystemExit('--experiments needs --control naming the reference column.')
@@ -84,7 +91,7 @@ def selected_cohorts(args):
                 f'{" ".join(str(n) for n in args.experiments)}; the control is one of the '
                 f'columns, not a separate model.'
             )
-        return [('custom', None, tuple(args.experiments), args.control)]
+        return [('custom', None, tuple(args.experiments), args.control, None)]
     return [group for group in COHORTS if group[0] in args.cohorts]
 
 
@@ -112,13 +119,20 @@ def main(argv=None):
     os.makedirs(args.tables_dir, exist_ok=True)
     status, missing = 0, []
 
-    for key, cohort_caption, experiments, control in selected_cohorts(args):
+    for key, cohort_caption, experiments, control, cohort_tasks in selected_cohorts(args):
+        tasks = ([task for task in args.tasks if task in cohort_tasks] if cohort_tasks
+                 else list(args.tasks))
+        if not tasks:
+            print(f'\n=== {key} ===')
+            print(f'  skipped: reports {", ".join(cohort_tasks)} only')
+            continue
+
         output = os.path.join(args.tables_dir, f'{key}_tables.docx')
         if not args.dry_run and os.path.exists(output):
             # Tables are appended, so a stale document would grow rather than be replaced.
             os.remove(output)
         written = 0
-        for number, task in enumerate(args.tasks, start=1):
+        for number, task in enumerate(tasks, start=1):
             task_spec = TASK_SPECS[task]
             caption = (f'{task_spec.caption} results, {cohort_caption}.' if cohort_caption
                        else f'{task_spec.caption} evaluation results.')

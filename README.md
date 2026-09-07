@@ -87,6 +87,8 @@ TransEHR2/
 ├── generate_finetune_grid.py      Finetuning grid or seed repeats over one shared encoder
 ├── report_experiment_results.py   Tabulate finished runs by name pattern
 ├── dump_finetuned_predictions.py  Per-fold prediction CSVs
+├── compute_charlson_index.py      Charlson index per episode, and the cohort manifest
+├── run_charlson_logistic_regression.py  Charlson mortality baseline, per fold
 ├── report_results_tables.py       Result tables, one document per cohort
 └── experiment_descriptions.md     What each experiment number means
 ```
@@ -163,6 +165,75 @@ python select_tuned_hyperparameters.py ${MANIFEST} --arm ${ARM} --output ${CONFI
 ```
 
 Trials are ranked on the criterion each hyperparameter's grid entry names in the spec: `select_on: pretrain` ranks on pretraining loss, `select_on: mortality` on mortality validation performance.
+
+## Charlson comorbidity baseline
+
+A logistic regression on age at admission, sex and the Charlson comorbidity index, reported
+against an in-stay-only model as a conventional-severity-score reference for in-hospital
+mortality. The index is that of the patient's most recent earlier hospital admission.
+
+**The cohort is an explicit episode manifest, and both arms are given the same file.** An
+episode belongs to the comparison exactly when all three features exist -- an index, an age
+and a sex -- which is not a predicate over the extracted arrays, because whether the index
+could be computed depends on `diagnoses.csv`. Both arms resolve that one file by
+patient-episode ID through the same loader, so they select identical episodes in identical
+order, which is what the paired test needs. Do not substitute the `diagnosis_history` cohort:
+it asks whether the *text* of an earlier admission's diagnoses survived extraction, which
+neither arm reads, and it excludes episodes whose codes are perfectly available.
+
+**1. Score the earlier admissions and write the cohort.** Reads `stays.csv` and
+`diagnoses.csv` per subject, then intersects the result with the episodes that have an age and
+a sex in the extracted arrays. The printed funnel shows what each condition removed, and the
+run fails if any fold is short of a cohort episode.
+
+```shell
+python compute_charlson_index.py ${DATASET_CONFIG} -w 8 --write_cohort
+```
+
+Writes `misc/charlson/charlson_index.csv` and `misc/charlson/charlson_cohort.txt`.
+
+**2. Generate the configs.** Experiment 18 records the manifest path in `COHORT_EPISODES`, so
+write the manifest first; `run_experiment.py` refuses to start if the file is missing.
+
+```shell
+python generate_revision_experiments.py
+```
+
+**3. Fit the regression.** One fit per fold on that fold's training split, predicting its
+validation and test splits, in the layout `dump_finetuned_predictions.py` uses.
+
+```shell
+python run_charlson_logistic_regression.py ${DATASET_CONFIG}
+```
+
+**4. Train the control.** Experiment 18 is the in-stay-only model on the same episodes, and it
+has to be trained like any other experiment.
+
+```shell
+EXPERIMENT_CONFIG=TransEHR2/configs/experiments/experiment18_instay_charlsonsubset_rev.yaml \
+TASKS=mortality \
+    sbatch --array=0-4 SLURM/slurm_run_experiment.sh
+```
+
+```shell
+sbatch --array=0-0 SLURM/slurm_dump_predictions.sh \
+    TransEHR2/configs/experiments/experiment18_instay_charlsonsubset_rev.yaml
+```
+
+**5. Build the table.**
+
+```shell
+python report_results_tables.py --cohorts charlson
+```
+
+The fit is unpenalized by default, so it is plain maximum likelihood with no regularization
+strength to tune. Its decision threshold is calibrated by the reporter on the validation
+split, exactly as for every other arm. Per-fold coefficients and odds ratios are written to
+`charlson_coefficients.csv` in the experiment directory.
+
+Age and sex are read from the extracted `static_data` array, so they are the values the deep
+models receive. Note that the extraction's `Age` is MIMIC-IV `anchor_age` carried onto every
+stay of a patient rather than an age recomputed at each admission.
 
 ## Reporting results
 

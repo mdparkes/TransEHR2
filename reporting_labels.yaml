@@ -14,9 +14,13 @@
 #   8  History, text, full dataset, 70B LLM, bigger encoders (not used)
 #   9  History only, text, full dataset, 1B LLM (control 2)
 #
-# The revision experiments, 10-17, are grouped by cohort into two sets of tables, so the
+# The revision experiments, 10-19, are grouped by cohort into sets of tables, so the
 # cohort is stated in each table's caption rather than repeated in every column heading.
 # Their text encoder is BAAI/bge-m3, which is not a size the heading needs to carry.
+#
+# 18 and 19 are the Charlson comparison: an in-stay-only model and a logistic regression on
+# age, sex and the Charlson comorbidity index, both on the episodes for which all three of
+# those features exist.
 
 columns:
   1: "Historical + in-stay records, no text features, 1B parameter LLM"
@@ -36,3 +40,5 @@ columns:
   15: "In-stay records only"
   16: "Historical records only, text features"
   17: "Historical + in-stay records, text features"
+  18: "In-stay records only"
+  19: "Age, sex and Charlson comorbidity index"
