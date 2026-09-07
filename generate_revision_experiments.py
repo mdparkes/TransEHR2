@@ -18,7 +18,10 @@ Cohorts. Comparing a model that reads pre-admission history against one that doe
 diluted by episodes with no history to read, and the paired tests need both arms on the same
 episodes. `discharge_summary` keeps episodes with at least one pre-admission discharge summary;
 `any_history` keeps those with at least one pre-admission value-stream record, which is the
-wider cohort for contrasts the narrower one underpowers.
+wider cohort for contrasts the narrower one underpowers. `diagnosis_history` keeps those with
+at least one pre-admission set of discharge diagnoses, which is the cohort a Charlson
+comorbidity index can be computed on; experiment 18 is the in-stay-only control that
+`run_charlson_logistic_regression.py` is compared against.
 
 Text. The in-stay window closes at 48 h, before a discharge summary is written, so every text
 record is pre-admission. A model reading in-stay records only therefore has no text available
@@ -73,6 +76,9 @@ EXPERIMENTS = [
      'In-Stay + Historical Records, Text Features, '
      'Patients With At Least 1 Historical Record',
      'any_history', True, True, True, True),
+    ('experiment18_instay_charlsonsubset_rev',
+     'In-Stay Records Only, Patients With At Least 1 Set Of Historical Discharge Diagnoses',
+     'diagnosis_history', False, False, False, True),
 ]
 
 

@@ -87,6 +87,8 @@ TransEHR2/
 ├── generate_finetune_grid.py      Finetuning grid or seed repeats over one shared encoder
 ├── report_experiment_results.py   Tabulate finished runs by name pattern
 ├── dump_finetuned_predictions.py  Per-fold prediction CSVs
+├── compute_charlson_index.py      Charlson index of each episode's last earlier admission
+├── run_charlson_logistic_regression.py  Charlson mortality baseline, per fold
 ├── report_results_tables.py       Result tables, one document per cohort
 └── experiment_descriptions.md     What each experiment number means
 ```
@@ -163,6 +165,59 @@ python select_tuned_hyperparameters.py ${MANIFEST} --arm ${ARM} --output ${CONFI
 ```
 
 Trials are ranked on the criterion each hyperparameter's grid entry names in the spec: `select_on: pretrain` ranks on pretraining loss, `select_on: mortality` on mortality validation performance.
+
+## Charlson comorbidity baseline
+
+A logistic regression on age at admission, sex and the Charlson comorbidity index, reported
+against an in-stay-only model as a conventional-severity-score reference for in-hospital
+mortality. It runs on the `diagnosis_history` cohort -- the episodes carrying at least one
+pre-admission set of discharge diagnoses, which is what gives them an earlier coded diagnosis
+set to score -- and the index is that of the most recent such admission.
+
+**1. Score the earlier admissions.** Reads `stays.csv` and `diagnoses.csv` per subject and
+writes one row per scorable episode. `--check_cohort` verifies the result against a fold's
+extracted arrays: the cohort is decided from the arrays and the index from the CSVs, so the
+two must agree episode for episode or the arms would be reported on different populations.
+
+```shell
+python compute_charlson_index.py ${DATASET_CONFIG} -w 8 --check_cohort fold1
+```
+
+**2. Fit the regression.** One fit per fold on that fold's training split, predicting its
+validation and test splits. The predictions land in the layout
+`dump_finetuned_predictions.py` uses, so the reporter treats this arm as one more column.
+
+```shell
+python run_charlson_logistic_regression.py ${DATASET_CONFIG}
+```
+
+**3. Train the control.** Experiment 18 is the in-stay-only model on the same cohort, and it
+has to be trained like any other experiment -- the comparison is only fair against a model
+fitted on the same episodes.
+
+```shell
+python generate_revision_experiments.py
+python run_experiment.py ${DATASET_CONFIG} \
+    TransEHR2/configs/experiments/experiment18_instay_charlsonsubset_rev.yaml
+python dump_finetuned_predictions.py ${DATASET_CONFIG} \
+    TransEHR2/configs/experiments/experiment18_instay_charlsonsubset_rev.yaml \
+    experiment18_instay_charlsonsubset_rev
+```
+
+**4. Build the table.**
+
+```shell
+python report_results_tables.py --cohorts charlson
+```
+
+The fit is unpenalized by default, so it is plain maximum likelihood with no regularization
+strength to tune. Its decision threshold is calibrated by the reporter on the validation
+split, exactly as for every other arm. Per-fold coefficients and odds ratios are written to
+`charlson_coefficients.csv` in the experiment directory.
+
+Note that the extraction's `Age` is MIMIC-IV `anchor_age` carried onto every stay of a
+patient rather than an age recomputed at each admission. Age and sex are read from the
+extracted `static_data` array, so they are the values the deep models receive.
 
 ## Reporting results
 

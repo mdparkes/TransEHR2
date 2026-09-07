@@ -23,3 +23,15 @@ patients it runs on.
 15. In-Stay Records Only, Patients With At Least 1 Historical Record
 16. Historical Records Only, Text Features, Patients With At Least 1 Historical Record
 17. In-Stay + Historical Records, Text Features, Patients With At Least 1 Historical Record
+18. In-Stay Records Only, Patients With At Least 1 Set Of Historical Discharge Diagnoses
+
+## Charlson comparison
+
+19 is not a TransEHR2 run. It is a logistic regression on age at admission, sex and the
+Charlson comorbidity index of the patient's most recent earlier hospital admission, fitted by
+`run_charlson_logistic_regression.py` on the index that `compute_charlson_index.py` computes.
+18 is its control: the same in-stay-only model as 10 and 15, trained on the cohort the index
+is defined on so that the two arms run on identical episodes.
+
+19. Age, Sex And Charlson Comorbidity Index, Patients With At Least 1 Set Of Historical
+    Discharge Diagnoses

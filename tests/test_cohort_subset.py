@@ -92,3 +92,66 @@ def test_no_cohort_means_every_episode():
     assert cohort_indices(arrays, None) is None
     with pytest.raises(ValueError, match='unknown cohort'):
         cohort_mask(arrays, 'everyone')
+
+
+def _text_arrays(history_len, n_episodes, n_text_feats):
+    """Minimal arrays for the text cohort predicates.
+
+    `cohort_mask` reads only the value-stream mask, the text presence indicators and the width
+    of the history region, and accepts them as a dict, so a full episode fixture is not needed
+    to probe which record qualifies an episode.
+    """
+    ts_len = history_len + 4
+    return {
+        'val_masks': np.zeros((n_episodes, ts_len), dtype=np.float32),
+        'val_text_indicators': np.zeros((n_episodes, ts_len, n_text_feats), dtype=np.float32),
+        'max_history_len_steps': history_len,
+    }
+
+
+def test_the_diagnosis_cohort_keys_off_its_own_text_feature():
+    """The two text features are separate cohorts: a discharge summary does not qualify an
+    episode for the index, which is computed from coded diagnoses, and vice versa."""
+    history_len = 3
+    arrays = _text_arrays(history_len, 4, 2)
+    arrays['val_masks'][:, history_len - 1] = 1.0
+
+    # Episode 0: summary only. 1: diagnoses only. 2: both. 3: neither.
+    arrays['val_text_indicators'][0, history_len - 1, 0] = 1.0
+    arrays['val_text_indicators'][1, history_len - 1, 1] = 1.0
+    arrays['val_text_indicators'][2, history_len - 1, :] = 1.0
+
+    assert list(cohort_mask(arrays, 'diagnosis_history')) == [False, True, True, False]
+    assert list(cohort_mask(arrays, 'discharge_summary')) == [True, False, True, False]
+    assert list(cohort_indices(arrays, 'diagnosis_history')) == [1, 2]
+
+
+def test_an_in_stay_diagnosis_record_does_not_qualify_an_episode():
+    """The index scores an *earlier* admission. A record at or after the admission timestep is
+    the current stay's own coding, which is what the extraction blanks."""
+    history_len = 3
+    arrays = _text_arrays(history_len, 2, 2)
+    arrays['val_masks'][:, history_len] = 1.0
+    arrays['val_text_indicators'][0, history_len, 1] = 1.0      # first in-stay timestep
+    arrays['val_masks'][1, history_len - 1] = 1.0
+    arrays['val_text_indicators'][1, history_len - 1, 1] = 1.0  # last history timestep
+
+    assert list(cohort_mask(arrays, 'diagnosis_history')) == [False, True]
+
+
+def test_an_unobserved_timestep_does_not_qualify_an_episode():
+    """Presence is the intersection of the indicator with the observed mask, so an indicator
+    left set on a padding timestep must not admit the episode."""
+    history_len = 3
+    arrays = _text_arrays(history_len, 1, 2)
+    arrays['val_text_indicators'][0, history_len - 1, 1] = 1.0  # indicator, but mask is zero
+
+    assert list(cohort_mask(arrays, 'diagnosis_history')) == [False]
+
+
+def test_the_diagnosis_cohort_needs_the_feature_to_exist():
+    """An extraction with one text feature cannot serve the index; the error names the config
+    key to look at rather than reporting an index error."""
+    arrays = _text_arrays(3, 2, 1)
+    with pytest.raises(ValueError, match='TEXT_FEATS'):
+        cohort_mask(arrays, 'diagnosis_history')

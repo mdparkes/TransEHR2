@@ -13,6 +13,12 @@ episode does not leave the cohort because a sweep arm stopped showing the model 
 Selection is per episode, matching `filter_listfiles_by_discharge_summary.py`. An episode with
 no pre-admission record is what biases the comparison, whether or not the same patient has
 another episode that does.
+
+`diagnosis_history` is the cohort a Charlson comorbidity index can be computed on: one
+pre-admission diagnosis-descriptions record is one earlier hospital admission's discharge
+diagnoses, so an episode carrying at least one of them has a coded diagnosis set to score.
+Membership is decided on the same arrays the models read, which is what keeps the index and
+the models on identical episodes -- see `compute_charlson_index.py`.
 """
 
 from typing import Optional
@@ -20,10 +26,11 @@ from typing import Optional
 import numpy as np
 
 
-# Position of the discharge summary in the dataset config's TEXT_FEATS list.
+# Positions in the dataset config's TEXT_FEATS list.
 DISCHARGE_SUMMARY_INDEX = 0
+DIAGNOSIS_DESCRIPTIONS_INDEX = 1
 
-COHORTS = ('discharge_summary', 'any_history')
+COHORTS = ('discharge_summary', 'diagnosis_history', 'any_history')
 
 
 def history_observed(masks, max_history_len_steps: int) -> np.ndarray:
@@ -105,7 +112,8 @@ def cohort_mask(arrays, cohort: Optional[str]) -> Optional[np.ndarray]:
     Args:
         arrays: Any object exposing `val_masks`, `val_text_indicators` and
             `max_history_len_steps` -- a loaded `MixedDataset`, or the arrays behind one.
-        cohort: 'discharge_summary', 'any_history', or None for every episode.
+        cohort: 'discharge_summary', 'diagnosis_history', 'any_history', or None for every
+            episode.
 
     Returns:
         (n_episodes,) boolean array, or None when `cohort` is None.
@@ -122,9 +130,11 @@ def cohort_mask(arrays, cohort: Optional[str]) -> Optional[np.ndarray]:
         return arrays[name] if isinstance(arrays, dict) else getattr(arrays, name)
 
     hist = int(field('max_history_len_steps'))
-    if cohort == 'discharge_summary':
+    text_index = {'discharge_summary': DISCHARGE_SUMMARY_INDEX,
+                  'diagnosis_history': DIAGNOSIS_DESCRIPTIONS_INDEX}.get(cohort)
+    if text_index is not None:
         return has_historical_text(field('val_masks'), field('val_text_indicators'), hist,
-                                   DISCHARGE_SUMMARY_INDEX)
+                                   text_index)
     return has_value_history(field('val_masks'), hist)
 
 
