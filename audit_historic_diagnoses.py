@@ -44,6 +44,19 @@ Outputs (written to --output_dir)
 * `historic_diagnosis_audit_by_phenotype.csv` -- one row per benchmark phenotype
 * `historic_diagnosis_audit_per_episode.csv`  -- one row per stay (with --write_per_episode)
 
+Pass --cohort (or --cohort-episodes) to restrict the audit to the episodes an
+experiment actually ran on. Without it the audit describes the listfile cohort,
+which is a superset: the extraction drops episodes that fail the minimum-length
+criterion, and the revision experiments restrict themselves further to a named
+cohort. A supplementary table should describe the population that was evaluated.
+
+Note that a named cohort is an array-side predicate: 'diagnosis_history' selects
+episodes whose *extracted* arrays carry a pre-admission diagnosis-descriptions
+record, whereas this audit reads the source CSVs. The two can disagree, and
+TransEHR2/data/cohorts.py documents why. Restricting to a cohort makes the
+audited population match the experiment; it does not make the two definitions
+identical.
+
 Usage:
     python audit_historic_diagnoses.py TransEHR2/configs/datasets/mimic4.yaml -w 8
     python audit_historic_diagnoses.py TransEHR2/configs/datasets/mimic4.yaml --unfiltered
@@ -52,14 +65,19 @@ Usage:
 
 import argparse
 import os
+import pickle
 import re
 import sys
 import yaml
 
+import numpy as np
 import pandas as pd
 
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
+
+from TransEHR2.data.cohorts import COHORTS, cohort_indices
+from TransEHR2.data.preprocessing import load_episode_ids
 
 TEXT_FEATURE = 'Diagnosis Descriptions'
 TASK_PREFIX = 'phenotyping'
@@ -123,6 +141,74 @@ def listfile_path(fold_dir, name, unfiltered):
         if os.path.exists(backup):
             return backup
     return path
+
+
+def cohort_episode_id_set(data_dir, fold_names, cohort, manifest):
+    """Patient-episode IDs a cohort keeps, unioned over every fold and partition.
+
+    Cohort membership is a property of an episode's extracted arrays, so an
+    episode's status is the same wherever it lands in the cross-validation
+    splits; taking the union simply collects every episode that was extracted
+    somewhere. Delegates the predicate itself to `TransEHR2.data.cohorts`, so
+    this selects exactly what an experiment configured the same way selects.
+
+    Args:
+        data_dir: Root directory holding the fold subdirectories.
+        fold_names: Fold directory names to scan.
+        cohort: A name in `COHORTS`, or None.
+        manifest: An explicit episode manifest, or None.
+
+    Returns:
+        Set of patient-episode IDs, or None when no restriction is requested.
+    """
+    if cohort is None and manifest is None:
+        return None
+
+    selected = set()
+    partitions_read = 0
+    for fold_name in fold_names:
+        for partition in ('train', 'val', 'test'):
+            part_dir = os.path.join(data_dir, fold_name, partition)
+            if not os.path.isdir(part_dir):
+                continue
+            try:
+                episode_ids = load_episode_ids(part_dir)
+            except FileNotFoundError as exc:
+                print(f'  WARNING: {exc}', file=sys.stderr)
+                continue
+
+            def load_mmap(name):
+                return np.load(os.path.join(part_dir, f'{name}.npy'), mmap_mode='r')
+
+            with open(os.path.join(part_dir, 'metadata.pkl'), 'rb') as handle:
+                metadata = pickle.load(handle)
+            max_history = metadata.get('max_history_len_steps')
+            if max_history is None:
+                raise ValueError(
+                    f'{part_dir}/metadata.pkl does not record max_history_len_steps, so '
+                    'cohort membership cannot be computed against this extraction.'
+                )
+
+            indices = cohort_indices(
+                {
+                    'val_masks': load_mmap('val_masks'),
+                    'val_text_indicators': load_mmap('val_text_indicators'),
+                    'max_history_len_steps': int(max_history),
+                },
+                cohort,
+                episode_ids=episode_ids,
+                manifest=manifest,
+            )
+            kept = episode_ids if indices is None else episode_ids[indices]
+            selected.update(int(i) for i in kept)
+            partitions_read += 1
+
+    if not partitions_read:
+        raise FileNotFoundError(
+            f'no extracted partitions found under {data_dir} for folds {fold_names}, so '
+            'the cohort cannot be resolved. Extract the data first, or drop --cohort.'
+        )
+    return selected
 
 
 def episode_key(path):
@@ -488,7 +574,9 @@ def print_report(summary_df, by_phenotype_df, merge_synonyms=False):
     if merge_synonyms:
         print("  (ICD-9/ICD-10 synonymous phenotype names merged for matching)\n")
     for metric, value in summary_df.itertuples(index=False):
-        if isinstance(value, float):
+        if isinstance(value, bool) or isinstance(value, str):
+            print(f"  {metric:<56s} {value:>12s}")
+        elif isinstance(value, float):
             print(f"  {metric:<56s} {value:>12.2f}")
         else:
             print(f"  {metric:<56s} {value:>12d}")
@@ -533,6 +621,18 @@ def main():
     parser.add_argument(
         '--output_dir', type=str, default='.',
         help="Directory for the output CSV files (default: current directory)"
+    )
+    parser.add_argument(
+        '--cohort', type=str, default=None, choices=list(COHORTS),
+        help="Restrict the audit to the episodes a named cohort keeps, so that it "
+             "describes the population an experiment configured the same way ran on. "
+             "Requires the extracted arrays."
+    )
+    parser.add_argument(
+        '--cohort_episodes', type=str, default=None,
+        help="Restrict the audit to an explicit episode manifest (one patient-episode ID "
+             "per line), as compute_charlson_index.py --write_cohort writes. Combines with "
+             "--cohort: an episode must then satisfy both."
     )
     parser.add_argument(
         '--merge_synonymous_phenotypes', action='store_true',
@@ -581,12 +681,42 @@ def main():
     print(f"  {n_rows} listfile rows -> {len(episodes)} unique stays, "
           f"{len(phenotype_names)} phenotypes")
 
+    n_listfile_stays = len(episodes)
+    cohort_ids = cohort_episode_id_set(data_dir, fold_names, args.cohort,
+                                       args.cohort_episodes)
+    if cohort_ids is not None:
+        label = args.cohort or 'manifest'
+        if args.cohort and args.cohort_episodes:
+            label = f'{args.cohort} + manifest'
+        episodes = {
+            key: value for key, value in episodes.items()
+            if value[0] * 1000 + value[1] in cohort_ids
+        }
+        labels = {key: value for key, value in labels.items() if key in episodes}
+        print(f"  cohort '{label}' keeps {len(episodes)} of {n_listfile_stays} stays "
+              f"({len(cohort_ids)} episodes in the cohort overall)")
+        if not episodes:
+            print('The cohort selects none of the listfile stays.', file=sys.stderr)
+            sys.exit(1)
+
     print(f"\nAuditing historical diagnosis text with {args.n_workers} worker(s)...")
     results = run_audit(episodes, code_to_groups, args.n_workers)
 
     per_episode_df, by_phenotype_df, summary_df = tabulate(
         results, labels, phenotype_names, args.merge_synonymous_phenotypes
     )
+
+    restriction = args.cohort or ''
+    if args.cohort_episodes:
+        restriction = (f'{restriction} + manifest' if restriction else 'manifest')
+    summary_df = pd.concat([
+        pd.DataFrame([
+            ('cohort_restriction', restriction or 'none'),
+            ('stays_in_listfiles', n_listfile_stays),
+            ('stays_after_cohort_restriction', len(episodes)),
+        ], columns=['metric', 'value']),
+        summary_df,
+    ], ignore_index=True)
 
     os.makedirs(args.output_dir, exist_ok=True)
     summary_path = os.path.join(args.output_dir, 'historic_diagnosis_audit_summary.csv')

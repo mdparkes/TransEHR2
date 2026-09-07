@@ -48,6 +48,13 @@ That order is recorded in ``{fold}/{split}_ids.pkl`` as patient-episode IDs
 lengths agree and refuses to proceed otherwise, because a silent misalignment
 would invalidate every number it prints.
 
+The revision experiments restrict themselves to a cohort, so their prediction
+CSVs hold one row per *cohort* episode rather than one per extracted episode.
+Pass ``--experiment-config`` and the same ``COHORT_SUBSET`` / ``COHORT_EPISODES``
+the run used is read from it and applied here through the same
+``cohort_indices`` over the same arrays, which is what makes the rows line up
+by construction rather than by argument.
+
 Usage:
     python stratify_predictions_by_history.py \
         TransEHR2/configs/datasets/mimic4.yaml experiment2_text
@@ -65,6 +72,9 @@ import sys
 import numpy as np
 import pandas as pd
 import yaml
+
+from TransEHR2.data.cohorts import COHORTS, cohort_indices
+from TransEHR2.data.preprocessing import load_episode_ids
 
 TASK = 'phenotype'
 DEFAULT_AUDIT_CSV = os.path.join(
@@ -113,7 +123,87 @@ def discover_folds(data_dir, requested_folds=None):
     ])
 
 
-def load_fold(data_dir, model_dir, experiment_name, fold_name, split):
+def resolve_cohort(experiment_config, cohort, cohort_episodes):
+    """Determine the cohort restriction a run used.
+
+    Explicit arguments win; anything not given is read from the experiment
+    config, which is where the run itself got it.
+
+    Args:
+        experiment_config: Path to the experiment YAML, or None.
+        cohort: A name in `COHORTS`, or None.
+        cohort_episodes: Path to an episode manifest, or None.
+
+    Returns:
+        Tuple of (cohort name or None, manifest path or None).
+    """
+    if experiment_config:
+        with open(experiment_config) as handle:
+            config = yaml.safe_load(handle) or {}
+        if cohort is None:
+            cohort = config.get('COHORT_SUBSET')
+        if cohort_episodes is None:
+            cohort_episodes = config.get('COHORT_EPISODES')
+    if cohort is not None and cohort not in COHORTS:
+        raise ValueError(f'unknown cohort {cohort!r}; expected one of {COHORTS}')
+    return cohort, cohort_episodes
+
+
+def cohort_episode_ids(data_dir, fold_name, split, cohort, manifest):
+    """Patient-episode IDs of the rows the experiment's dataset exposed, in row order.
+
+    This walks the same selection path `dump_finetuned_predictions.py` went
+    through -- `cohort_indices` over `val_masks` and `val_text_indicators` from
+    the same partition -- so the IDs correspond to the prediction rows by
+    construction. Membership is computed on the full extracted history and does
+    not move with a runtime `HISTORY_LEN_STEPS` crop.
+
+    Args:
+        data_dir: Root directory holding the fold subdirectories.
+        fold_name: Fold directory name.
+        split: Partition name.
+        cohort: A name in `COHORTS`, or None for every episode.
+        manifest: An explicit episode manifest, or None.
+
+    Returns:
+        Ordered array of patient-episode IDs.
+
+    Raises:
+        ValueError: If the extraction does not record its history/in-stay split,
+            which makes cohort membership uncomputable.
+    """
+    part_dir = os.path.join(data_dir, fold_name, split)
+    episode_ids = load_episode_ids(part_dir)
+    if cohort is None and manifest is None:
+        return episode_ids
+
+    def load_mmap(name):
+        return np.load(os.path.join(part_dir, f'{name}.npy'), mmap_mode='r')
+
+    with open(os.path.join(part_dir, 'metadata.pkl'), 'rb') as handle:
+        metadata = pickle.load(handle)
+    max_history = metadata.get('max_history_len_steps')
+    if max_history is None:
+        raise ValueError(
+            f'{part_dir}/metadata.pkl does not record max_history_len_steps, so cohort '
+            'membership cannot be computed against this extraction.'
+        )
+
+    indices = cohort_indices(
+        {
+            'val_masks': load_mmap('val_masks'),
+            'val_text_indicators': load_mmap('val_text_indicators'),
+            'max_history_len_steps': int(max_history),
+        },
+        cohort,
+        episode_ids=episode_ids,
+        manifest=manifest,
+    )
+    return episode_ids if indices is None else episode_ids[indices]
+
+
+def load_fold(data_dir, model_dir, experiment_name, fold_name, split,
+              cohort=None, manifest=None):
     """Load one fold's predictions, targets and episode IDs.
 
     Returns:
@@ -128,13 +218,9 @@ def load_fold(data_dir, model_dir, experiment_name, fold_name, split):
         model_dir, experiment_name, fold_name, TASK,
         f'{TASK}_{split}_finetuned_output.csv'
     )
-    ids_path = os.path.join(data_dir, fold_name, f'{split}_ids.pkl')
 
     if not os.path.exists(pred_path):
         print(f"  {fold_name}: no predictions at {pred_path}", file=sys.stderr)
-        return None
-    if not os.path.exists(ids_path):
-        print(f"  {fold_name}: no episode IDs at {ids_path}", file=sys.stderr)
         return None
 
     df = pd.read_csv(pred_path)
@@ -149,14 +235,22 @@ def load_fold(data_dir, model_dir, experiment_name, fold_name, split):
     if [c[len('target_'):] for c in targ_cols] != names:
         raise ValueError(f'Prediction and target columns disagree in {pred_path}')
 
-    with open(ids_path, 'rb') as f:
-        episode_ids = pickle.load(f)
+    try:
+        episode_ids = cohort_episode_ids(data_dir, fold_name, split, cohort, manifest)
+    except FileNotFoundError as exc:
+        print(f'  {fold_name}: {exc}', file=sys.stderr)
+        return None
 
     if len(episode_ids) != len(df):
+        restriction = (f'cohort {cohort!r}' if cohort else 'no cohort')
+        if manifest:
+            restriction += f' plus manifest {manifest}'
         raise ValueError(
-            f'{fold_name}: {len(df)} prediction rows but {len(episode_ids)} '
-            f'episode IDs in {ids_path}. Rows cannot be aligned to stays; '
-            'the predictions and the extracted arrays are out of step.'
+            f'{fold_name}: {len(df)} prediction rows but {len(episode_ids)} episode IDs '
+            f'after applying {restriction}. Rows cannot be aligned to stays. The usual '
+            'cause is a cohort mismatch: the revision experiments restrict themselves '
+            'to a cohort, so pass --experiment-config pointing at the config the run '
+            'used (its COHORT_SUBSET / COHORT_EPISODES), or --cohort explicitly.'
         )
 
     return (df[pred_cols].to_numpy(dtype=float),
@@ -418,6 +512,14 @@ def main(argv=None):
                         help='Which split to analyse (default: test)')
     parser.add_argument('--folds', nargs='*', default=None,
                         help='Specific folds (default: all)')
+    parser.add_argument('--experiment-config', default=None,
+                        help='Experiment YAML the run used. Its COHORT_SUBSET and '
+                             'COHORT_EPISODES are applied so the prediction rows can '
+                             'be aligned to stays.')
+    parser.add_argument('--cohort', default=None, choices=list(COHORTS),
+                        help='Override the cohort from --experiment-config')
+    parser.add_argument('--cohort-episodes', default=None,
+                        help='Override the episode manifest from --experiment-config')
     parser.add_argument('--output-dir', default=None,
                         help='Directory for the output CSVs')
     args = parser.parse_args(argv)
@@ -425,8 +527,13 @@ def main(argv=None):
     with open(args.dataset_config) as f:
         data_dir = yaml.safe_load(f)['DATA_DIR']
 
+    cohort, manifest = resolve_cohort(args.experiment_config, args.cohort,
+                                      args.cohort_episodes)
+
     audit = load_audit(args.audit_csv)
     print(f'Read {len(audit):,} audited stays from {args.audit_csv}')
+    print(f'Cohort restriction: {cohort or "none"}'
+          + (f' plus manifest {manifest}' if manifest else ''))
 
     fold_names = discover_folds(data_dir, args.folds)
     if not fold_names:
@@ -437,7 +544,7 @@ def main(argv=None):
     per_fold, coverages, phenotype_names = [], [], None
     for fold_name in fold_names:
         loaded = load_fold(data_dir, args.model_dir, args.experiment_name,
-                           fold_name, args.split)
+                           fold_name, args.split, cohort, manifest)
         if loaded is None:
             continue
         scores, targets, episode_ids, names = loaded
