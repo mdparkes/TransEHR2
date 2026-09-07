@@ -12,12 +12,18 @@ any special case:
 
 Cohort and row order
 --------------------
-The run is restricted to the `diagnosis_history` cohort: episodes carrying at least one
-pre-admission diagnosis-descriptions record, which is what gives them an earlier coded
-diagnosis set to score. That is the same cohort the in-stay-only control is trained on, and it
-is resolved with the same `load_dataset(..., cohort=...)` call, so both arms see one identical
-set of episodes in one identical order. Row `i` of a prediction CSV is therefore the same
-episode in both arms, which is what the paired test requires.
+The cohort is the episode manifest `compute_charlson_index.py --write_cohort` writes: exactly
+those episodes for which all three features exist. Both arms are given that one file -- this
+one here, the in-stay-only control through `COHORT_EPISODES` in its experiment config -- and
+both resolve it through the same `load_dataset(..., cohort_episodes=...)` call, which selects
+rows by patient-episode ID in ascending array order. Row `i` of a prediction CSV is therefore
+the same episode in both arms, which is what the paired test requires.
+
+A manifest is used rather than a predicate over the arrays because membership depends on
+something the arrays do not carry: whether the index could be computed from `diagnoses.csv`.
+The array-side proxy `diagnosis_history` answers a different question -- whether the *text* of
+an earlier admission's diagnoses survived extraction -- which neither arm reads, and which
+excludes episodes whose codes are perfectly available.
 
 Features
 --------
@@ -37,7 +43,8 @@ the validation split, as it does for every other arm.
 Usage:
     python run_charlson_logistic_regression.py TransEHR2/configs/datasets/mimic4.yaml
     python run_charlson_logistic_regression.py TransEHR2/configs/datasets/mimic4.yaml \
-        --charlson_csv misc/charlson/charlson_index.csv --model_dir models
+        --charlson_csv misc/charlson/charlson_index.csv \
+        --cohort_episodes misc/charlson/charlson_cohort.txt --model_dir models
     python run_charlson_logistic_regression.py TransEHR2/configs/datasets/mimic4.yaml \
         --class_weight balanced --penalty l2
 """
@@ -52,61 +59,20 @@ import pandas as pd
 import yaml
 from sklearn.linear_model import LogisticRegression
 
-from TransEHR2.data.preprocessing import compute_static_feat_dims, load_dataset
+from TransEHR2.data.cohorts import load_episode_manifest
+from TransEHR2.data.preprocessing import load_dataset
+from TransEHR2.data.statics import decode_categorical, static_offsets
 
-COHORT = 'diagnosis_history'
 TASK = 'mortality'
 SPLITS = ('train', 'val', 'test')
 DEFAULT_EXPERIMENT = 'experiment19_charlson_logreg_charlsonsubset_rev'
 DEFAULT_CHARLSON_CSV = os.path.join('misc', 'charlson', 'charlson_index.csv')
+DEFAULT_COHORT = os.path.join('misc', 'charlson', 'charlson_cohort.txt')
 
 
 # ---------------------------------------------------------------------------
 # Feature assembly
 # ---------------------------------------------------------------------------
-
-def static_offsets(variable_properties, static_feats, max_token_length):
-    """Column offset of each static feature in the stored `static_data` array.
-
-    A categorical static is allocated `size` columns, so the offsets are cumulative widths
-    rather than feature positions. They come from the same helper the extraction sizes the
-    array with, so the two cannot drift apart.
-
-    Args:
-        variable_properties: Parsed `variable_properties.yaml`.
-        static_feats: The STATIC_FEATS list from the dataset config, in order.
-        max_token_length: Width given to a static text feature.
-
-    Returns:
-        Dict mapping feature name to its first column.
-    """
-    widths = compute_static_feat_dims(variable_properties, static_feats, max_token_length)
-    offsets, position = {}, 0
-    for feature, width in zip(static_feats, widths):
-        offsets[feature] = position
-        position += width
-    return offsets
-
-
-def decode_sex(codes, category_map):
-    """Turn the stored categorical codes of a categorical static into their labels.
-
-    The extraction writes a categorical static as a single 1-based code at the feature's first
-    column, offset from the lowest key of its `category_map`, and leaves the column at zero
-    when the value is missing.
-
-    Args:
-        codes: (n_episodes,) array of stored codes.
-        category_map: The feature's `category_map` from `variable_properties.yaml`.
-
-    Returns:
-        (n_episodes,) array of label strings; missing values become `'Missing'`.
-    """
-    first_key = min(int(key) for key in category_map) if category_map else 0
-    labels = {int(code) - first_key + 1: str(label) for code, label in category_map.items()}
-    return np.array([labels.get(int(code), 'Missing') for code in np.asarray(codes)],
-                    dtype=object)
-
 
 def sex_encoding(train_labels, min_count):
     """Choose the reference sex category and the ones to give an indicator.
@@ -160,7 +126,7 @@ def build_design_matrix(age, sex_labels, charlson, sex_indicators):
     return np.column_stack(columns), names
 
 
-def load_split(data_dir, fold, split, charlson, offsets, category_map,
+def load_split(data_dir, fold, split, charlson, offsets, category_map, manifest,
                extracted_history_len_steps=None):
     """Load one fold-split's cohort episodes with their features and labels.
 
@@ -171,6 +137,7 @@ def load_split(data_dir, fold, split, charlson, offsets, category_map,
         charlson: Series mapping patient-episode ID to Charlson index.
         offsets: Output of `static_offsets`.
         category_map: The `Gender` feature's category map.
+        manifest: Path to the cohort's episode manifest, or the IDs themselves.
         extracted_history_len_steps: Width of the history region, for datasets written before
             the layout was recorded in metadata.
 
@@ -188,13 +155,15 @@ def load_split(data_dir, fold, split, charlson, offsets, category_map,
 
     # The cohort is applied by the loader, so `episode_indices` is exactly the row subset and
     # order that the in-stay-only control's inference loader produces for this partition.
-    dataset = load_dataset(base, cohort=COHORT,
+    # The manifest is what the control arm is also given, so both select the same rows in the
+    # same order and the reporter can pair them by position.
+    dataset = load_dataset(base, cohort_episodes=manifest,
                            extracted_history_len_steps=extracted_history_len_steps)
     rows = dataset.episode_indices
     if rows is None:
         raise ValueError(
             f'{fold}/{split}: the loader applied no cohort, so the rows cannot be matched to '
-            f'the control arm. Expected cohort {COHORT!r} to select a subset.'
+            f'the control arm. The episode manifest should have selected a subset.'
         )
 
     ids_path = os.path.join(data_dir, fold, f'{split}_ids.pkl')
@@ -210,7 +179,7 @@ def load_split(data_dir, fold, split, charlson, offsets, category_map,
 
     static = np.asarray(dataset.static_data)[rows]
     age = static[:, offsets['Age']].astype(np.float64)
-    sex = decode_sex(static[:, offsets['Gender']], category_map)
+    sex = decode_categorical(static[:, offsets['Gender']], category_map)
 
     missing = [int(episode_id) for episode_id in episode_ids
                if episode_id not in charlson.index]
@@ -219,11 +188,11 @@ def load_split(data_dir, fold, split, charlson, offsets, category_map,
         more = '' if len(missing) <= 20 else f', ... ({len(missing)} total)'
         raise ValueError(
             f'{fold}/{split}: {len(missing)} of {len(episode_ids)} cohort episodes have no '
-            f'Charlson index: {shown}{more}. The cohort is decided from the extracted arrays '
-            f'and the index from the per-subject CSVs; run compute_charlson_index.py with '
-            f'--check_cohort {fold} to see where the two disagree. Dropping the episodes is '
-            f'not an option, because it would break the row correspondence with the control '
-            f'arm that the paired test relies on.'
+            f'Charlson index: {shown}{more}. The manifest is supposed to name only episodes '
+            f'that have one, so it and the index table are out of step -- rewrite it with '
+            f'compute_charlson_index.py --write_cohort. Dropping the episodes is not an '
+            f'option, because it would break the row correspondence with the control arm '
+            f'that the paired test relies on.'
         )
 
     return {
@@ -343,6 +312,10 @@ def main(argv=None):
     parser.add_argument('--charlson_csv', default=DEFAULT_CHARLSON_CSV,
                         help=f'Table written by compute_charlson_index.py '
                              f'(default: {DEFAULT_CHARLSON_CSV})')
+    parser.add_argument('--cohort_episodes', default=DEFAULT_COHORT,
+                        help=f'Episode manifest written by compute_charlson_index.py '
+                             f'--write_cohort. Must be the same file the control arm names in '
+                             f'COHORT_EPISODES (default: {DEFAULT_COHORT})')
     parser.add_argument('--model_dir', default='models',
                         help='Directory holding one subdirectory per experiment '
                              '(default: models)')
@@ -386,6 +359,14 @@ def main(argv=None):
                              dataset_config.get('MAX_TOKEN_LENGTH', 0))
     category_map = variable_properties['Gender'].get('category_map', {})
 
+    if not os.path.exists(args.cohort_episodes):
+        raise SystemExit(
+            f'{args.cohort_episodes} does not exist. Write it with compute_charlson_index.py '
+            f'--write_cohort; it is what puts this arm and the control on the same episodes.'
+        )
+    cohort = load_episode_manifest(args.cohort_episodes)
+    print(f'Cohort: {len(cohort)} episodes from {args.cohort_episodes}')
+
     charlson_frame = pd.read_csv(args.charlson_csv)
     charlson = charlson_frame.set_index('episode_id')['charlson_index']
     if charlson.index.has_duplicates:
@@ -410,7 +391,7 @@ def main(argv=None):
         splits = {}
         for split in SPLITS:
             splits[split] = load_split(data_dir, fold, split, charlson, offsets,
-                                       category_map,
+                                       category_map, args.cohort_episodes,
                                        dataset_config.get('MAX_HISTORY_LEN_STEPS'))
         if splits.get('train') is None:
             print('  no extracted train partition; skipped')

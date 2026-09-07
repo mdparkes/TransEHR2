@@ -16,10 +16,19 @@ whose `DISCHTIME` is at or before its own `INTIME`, and the most recent set of d
 diagnoses is the latest `DISCHTIME` among them. That row's `HADM_ID` selects the codes from
 `diagnoses.csv`.
 
-Reproducing the extraction's rule here rather than re-deriving one is the point: the cohort is
-decided from the arrays, so any disagreement about which records count would put the index and
-the models on different episodes. `--check_cohort` verifies the agreement against a fold's
-extracted arrays and reports every episode the two disagree on.
+The cohort
+----------
+`--write_cohort` also writes the episode manifest the analysis runs on: the episodes for which
+all three features exist -- a Charlson index, an age and a sex. Both arms are handed that one
+file, the regression directly and the in-stay-only control through `COHORT_EPISODES` in its
+experiment config, and both resolve it by patient-episode ID through the same loader. That is
+what puts them on the same episodes; nothing has to be argued about two predicates agreeing.
+
+Membership is deliberately *not* the array-side predicate `diagnosis_history`, which asks
+whether the text of an earlier admission's diagnoses survived extraction. Neither arm reads
+that text -- the control reads in-stay records only, and the index comes from `diagnoses.csv`
+-- and it excludes episodes whose codes are perfectly available. The printed funnel shows how
+many episodes each condition removes.
 
 Outputs
 -------
@@ -29,16 +38,16 @@ Outputs
     source_hadm_id, n_codes, n_unmapped_codes, hours_before_admission,
     and one 0/1 column per comorbidity, named as in `TransEHR2.data.charlson`
 
+`charlson_cohort.txt` with `--write_cohort`, one patient-episode ID per line.
+
 Usage:
+    python compute_charlson_index.py TransEHR2/configs/datasets/mimic4.yaml -w 8 \
+        --write_cohort
     python compute_charlson_index.py TransEHR2/configs/datasets/mimic4.yaml
-    python compute_charlson_index.py TransEHR2/configs/datasets/mimic4.yaml -w 8
-    python compute_charlson_index.py TransEHR2/configs/datasets/mimic4.yaml \
-        --check_cohort fold1
 """
 
 import argparse
 import os
-import pickle
 import re
 import sys
 from collections import defaultdict
@@ -50,10 +59,11 @@ import yaml
 
 from TransEHR2.data.charlson import (CONDITION_KEYS, charlson_conditions,
                                      conditions_for_code, WEIGHTS)
-from TransEHR2.data.cohorts import cohort_mask
+from TransEHR2.data.statics import (MISSING_LABEL, age_observed, decode_categorical,
+                                    static_offsets)
 
 DEFAULT_OUTPUT = os.path.join('misc', 'charlson', 'charlson_index.csv')
-COHORT = 'diagnosis_history'
+DEFAULT_COHORT = os.path.join('misc', 'charlson', 'charlson_cohort.txt')
 
 
 # ---------------------------------------------------------------------------
@@ -261,54 +271,135 @@ def score_all(episodes, n_workers):
 
 
 # ---------------------------------------------------------------------------
-# Cohort agreement
+# The cohort manifest
 # ---------------------------------------------------------------------------
 
-def check_cohort(data_dir, fold_name, scored, extracted_history_len_steps=None):
-    """Compare the scored episodes against a fold's extracted cohort membership.
-
-    The cohort is decided from the arrays and the index is computed from the CSVs, so the two
-    must agree episode for episode or the index and the models would be reported on different
-    populations. This reports the disagreement in both directions.
+def feature_availability(data_dir, fold, offsets, category_map,
+                         extracted_history_len_steps=None):
+    """Which extracted episodes of one fold have an age and a sex on record.
 
     Args:
         data_dir: Directory holding the fold subdirectories.
-        fold_name: Fold whose partitions to check.
-        scored: Set of patient-episode IDs that were scored successfully.
+        fold: Fold whose partitions to read. Folds partition the same episodes, so one fold's
+            three partitions cover the extraction once.
+        offsets: Output of `static_offsets`.
+        category_map: The `Gender` feature's category map.
         extracted_history_len_steps: Width of the history region, for datasets written before
             the layout was recorded in metadata.
 
     Returns:
-        Tuple of (n_in_cohort, missing, extra) where `missing` are cohort episodes with no
-        index and `extra` are scored episodes outside the cohort, both as sorted ID lists.
-    """
-    from TransEHR2.data.preprocessing import load_dataset
+        Tuple of (extracted, has_age, has_sex), each a set of patient-episode IDs.
 
-    in_cohort = set()
+    Raises:
+        FileNotFoundError: If the fold has no extracted partitions.
+    """
+    from TransEHR2.data.preprocessing import load_dataset, load_episode_ids
+
+    extracted, has_age, has_sex = set(), set(), set()
     for split in ('train', 'val', 'test'):
-        base = os.path.join(data_dir, fold_name, split)
+        base = os.path.join(data_dir, fold, split)
         if not os.path.exists(os.path.join(base, 'metadata.pkl')):
             continue
         dataset = load_dataset(base, extracted_history_len_steps=extracted_history_len_steps)
-        mask = cohort_mask(dataset, COHORT)
+        ids = load_episode_ids(base, n_episodes=dataset.n_extracted_episodes)
+        static = np.asarray(dataset.static_data)
 
-        ids_path = os.path.join(data_dir, fold_name, f'{split}_ids.pkl')
-        with open(ids_path, 'rb') as handle:
-            episode_ids = pickle.load(handle)
-        if len(episode_ids) != len(mask):
-            raise ValueError(
-                f'{fold_name}/{split}: {len(mask)} episodes in the arrays but '
-                f'{len(episode_ids)} ids in {ids_path}. The ids and the extracted arrays are '
-                f'out of step, so cohort membership cannot be attributed to an episode.'
-            )
-        in_cohort.update(np.asarray(episode_ids, dtype=np.int64)[mask].tolist())
+        extracted.update(ids.tolist())
+        has_age.update(ids[age_observed(static[:, offsets['Age']])].tolist())
+        sex = decode_categorical(static[:, offsets['Gender']], category_map)
+        has_sex.update(ids[sex != MISSING_LABEL].tolist())
 
-    if not in_cohort:
+    if not extracted:
         raise FileNotFoundError(
-            f'No extracted partitions found under {os.path.join(data_dir, fold_name)}, so '
-            f'there is no cohort to check against.'
+            f'no extracted partitions under {os.path.join(data_dir, fold)}, so feature '
+            f'availability cannot be determined.'
         )
-    return len(in_cohort), sorted(in_cohort - scored), sorted(scored - in_cohort)
+    return extracted, has_age, has_sex
+
+
+def build_cohort(scored, extracted, has_age, has_sex):
+    """The episodes the analysis runs on, and the funnel that produced them.
+
+    An episode belongs to the cohort exactly when all three features exist: a Charlson index,
+    an age and a sex. Defining it this way rather than by a predicate over the arrays is what
+    lets both arms be handed one list -- see `TransEHR2.data.cohorts.manifest_mask`.
+
+    Args:
+        scored: IDs with a Charlson index.
+        extracted: IDs present in the extracted arrays.
+        has_age: IDs with an age on record.
+        has_sex: IDs with a sex on record.
+
+    Returns:
+        Tuple of (cohort, funnel) where `cohort` is the sorted ID list and `funnel` is an
+        ordered list of (label, count) explaining what each condition removed.
+    """
+    in_arrays = scored & extracted
+    with_age = in_arrays & has_age
+    with_both = with_age & has_sex
+    funnel = [
+        ('with a Charlson index', len(scored)),
+        ('  and in the extracted arrays', len(in_arrays)),
+        ('  and with an age on record', len(with_age)),
+        ('  and with a sex on record', len(with_both)),
+    ]
+    return sorted(with_both), funnel
+
+
+def write_cohort(path, cohort, description):
+    """Write the episode manifest both arms are given.
+
+    Args:
+        path: Output path.
+        cohort: Sorted patient-episode IDs.
+        description: One line recorded as a comment, so a manifest found later says what it is.
+
+    Returns:
+        The path written.
+    """
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, 'w') as handle:
+        handle.write(f'# {description}\n')
+        handle.write('# One patient-episode id per line: patient_id * 1000 + episode_number.\n')
+        handle.write(f'# {len(cohort)} episodes.\n')
+        for episode_id in cohort:
+            handle.write(f'{episode_id}\n')
+    return path
+
+
+def check_folds_agree(data_dir, fold_names, cohort, extracted_history_len_steps=None):
+    """Confirm every fold's partitions cover the same cohort episodes.
+
+    Folds are partitions of one episode set, so a manifest built from one fold has to be
+    selectable in all of them. A fold that is missing some would train the control on fewer
+    episodes than the regression, which is the failure this rules out.
+
+    Args:
+        data_dir: Directory holding the fold subdirectories.
+        fold_names: Folds to check.
+        cohort: The manifest's IDs.
+        extracted_history_len_steps: As for `feature_availability`.
+
+    Returns:
+        Dict mapping fold name to the sorted IDs it does not carry.
+    """
+    from TransEHR2.data.preprocessing import load_dataset, load_episode_ids
+
+    wanted = set(int(episode_id) for episode_id in cohort)
+    missing = {}
+    for fold in fold_names:
+        covered = set()
+        for split in ('train', 'val', 'test'):
+            base = os.path.join(data_dir, fold, split)
+            if not os.path.exists(os.path.join(base, 'metadata.pkl')):
+                continue
+            dataset = load_dataset(base,
+                                   extracted_history_len_steps=extracted_history_len_steps)
+            covered.update(load_episode_ids(
+                base, n_episodes=dataset.n_extracted_episodes).tolist())
+        if covered:
+            missing[fold] = sorted(wanted - covered)
+    return missing
 
 
 # ---------------------------------------------------------------------------
@@ -354,9 +445,14 @@ def main(argv=None):
                              '(default: every fold)')
     parser.add_argument('-w', '--workers', type=int, default=1,
                         help='Worker processes (default: 1)')
-    parser.add_argument('--check_cohort', metavar='FOLD', default=None,
-                        help="Verify the scored episodes against this fold's extracted cohort "
-                             'membership and exit non-zero on disagreement')
+    parser.add_argument('--write_cohort', nargs='?', const=DEFAULT_COHORT, default=None,
+                        metavar='PATH',
+                        help=f'Also write the episode manifest the analysis runs on -- the '
+                             f'episodes with an index, an age and a sex. This is the file both '
+                             f'arms are given (default path: {DEFAULT_COHORT})')
+    parser.add_argument('--cohort_fold', default=None, metavar='FOLD',
+                        help='Fold whose extracted arrays supply age and sex when building the '
+                             'manifest (default: the first fold that has any)')
     args = parser.parse_args(argv)
 
     with open(args.dataset_config) as handle:
@@ -391,30 +487,62 @@ def main(argv=None):
     frame.to_csv(args.output, index=False)
     print(f'\nWrote {len(frame)} rows to {args.output}')
 
-    if args.check_cohort:
-        print(f'\nChecking cohort agreement on {args.check_cohort}...')
-        n_in_cohort, missing, extra = check_cohort(
-            data_dir, args.check_cohort, set(frame['episode_id'].tolist()),
-            dataset_config.get('MAX_HISTORY_LEN_STEPS'),
-        )
-        print(f'  episodes in the {COHORT!r} cohort: {n_in_cohort}')
-        print(f'  in the cohort with no index:      {len(missing)}')
-        print(f'  scored but outside the cohort:    {len(extra)}')
-        if missing or extra:
-            for label, ids in (('no index', missing), ('outside cohort', extra)):
-                if ids:
-                    shown = ', '.join(str(i) for i in ids[:20])
-                    more = '' if len(ids) <= 20 else f', ... ({len(ids)} total)'
-                    print(f'  {label}: {shown}{more}', file=sys.stderr)
-            print(
-                '\nThe cohort is decided from the extracted arrays and the index from the '
-                'per-subject CSVs. A disagreement means the two disagree about which earlier '
-                'admissions an episode can see, so the index and the models would be reported '
-                'on different populations.',
-                file=sys.stderr,
-            )
-            return 1
+    if not args.write_cohort:
+        return 0
 
+    with open(dataset_config['VARIABLE_PROPERTIES_PATH']) as handle:
+        variable_properties = yaml.safe_load(handle)
+    static_feats = dataset_config['STATIC_FEATS']
+    for required in ('Age', 'Gender'):
+        if required not in static_feats:
+            raise SystemExit(
+                f'{args.dataset_config} does not list {required!r} in STATIC_FEATS, so the '
+                f'extracted arrays do not carry it and the cohort cannot be defined on it.'
+            )
+    offsets = static_offsets(variable_properties, static_feats,
+                             dataset_config.get('MAX_TOKEN_LENGTH', 0))
+    extracted_history = dataset_config.get('MAX_HISTORY_LEN_STEPS')
+
+    cohort_fold = args.cohort_fold or fold_names[0]
+    print(f'\nBuilding the cohort manifest from {cohort_fold}...')
+    extracted, has_age, has_sex = feature_availability(
+        data_dir, cohort_fold, offsets, variable_properties['Gender'].get('category_map', {}),
+        extracted_history,
+    )
+    cohort, funnel = build_cohort(set(frame['episode_id'].tolist()), extracted, has_age,
+                                 has_sex)
+    width = max(len(label) for label, _ in funnel)
+    for label, count in funnel:
+        print(f'  {label:{width}}  {count}')
+    if not cohort:
+        print('\nThe cohort is empty, so there is nothing to run on.', file=sys.stderr)
+        return 1
+
+    # Every fold has to be able to select the whole manifest, or the control would train on
+    # fewer episodes in some fold than the regression scores.
+    missing_by_fold = check_folds_agree(data_dir, fold_names, cohort, extracted_history)
+    short = {fold: ids for fold, ids in missing_by_fold.items() if ids}
+    for fold, ids in sorted(short.items()):
+        shown = ', '.join(str(i) for i in ids[:20])
+        more = '' if len(ids) <= 20 else f', ... ({len(ids)} total)'
+        print(f'  {fold} does not carry {len(ids)} of them: {shown}{more}', file=sys.stderr)
+    if short:
+        print(
+            '\nFolds are partitions of one episode set, so every fold must carry every cohort '
+            'episode. Rebuild the manifest against a fold that does, or re-extract the folds '
+            'that are short.',
+            file=sys.stderr,
+        )
+        return 1
+    print(f'  every fold carries all {len(cohort)} of them')
+
+    path = write_cohort(
+        args.write_cohort, cohort,
+        'Charlson analysis cohort: episodes with a Charlson index, an age and a sex.',
+    )
+    print(f'\nWrote {len(cohort)} episode ids to {path}')
+    print('Name this file in COHORT_EPISODES for the control experiment, and pass it to '
+          'run_charlson_logistic_regression.py --cohort_episodes.')
     return 0
 
 

@@ -19,11 +19,18 @@ import sys
 import pandas as pd
 import pytest
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from compute_charlson_index import (build_table, collect_episodes,
-                                    most_recent_earlier_admission, score_patient)
+from test_charlson_logreg import (CODE_F, CODE_MISSING, GENDER_MAP, STATIC_FEATS,
+                                 VARIABLE_PROPERTIES, _write_fold)
+
+from compute_charlson_index import (build_cohort, build_table, check_folds_agree,
+                                    collect_episodes, feature_availability,
+                                    most_recent_earlier_admission, score_patient, write_cohort)
 from TransEHR2.data.charlson import CONDITION_KEYS, WEIGHTS
+from TransEHR2.data.cohorts import load_episode_manifest
+from TransEHR2.data.statics import static_offsets
 
 PATIENT_ID = 12345
 
@@ -283,3 +290,88 @@ def test_no_listfiles_is_an_error_rather_than_an_empty_run(tmp_path):
     (tmp_path / 'fold1').mkdir()
     with pytest.raises(FileNotFoundError, match='listfiles'):
         collect_episodes(str(tmp_path), ['fold1'])
+
+
+# ---------------------------------------------------------------------------
+# The cohort manifest
+# ---------------------------------------------------------------------------
+
+def test_the_cohort_is_the_intersection_of_all_three_features():
+    """Membership is availability of the features, not a proxy for it: an episode missing any
+    one of the index, the age or the sex cannot be given to the regression at all."""
+    scored = {1, 2, 3, 4, 5}
+    extracted = {1, 2, 3, 4}          # 5 was never extracted
+    has_age = {1, 2, 3}               # 4 has no age
+    has_sex = {1, 2, 4}               # 3 has no sex
+
+    cohort, funnel = build_cohort(scored, extracted, has_age, has_sex)
+    assert cohort == [1, 2]
+    assert [count for _, count in funnel] == [5, 4, 3, 2]
+
+
+def test_a_scored_episode_outside_the_extraction_is_dropped():
+    """It has an index but no arrays, so no model can be run on it."""
+    cohort, _ = build_cohort({1, 2}, {1}, {1, 2}, {1, 2})
+    assert cohort == [1]
+
+
+def test_an_extracted_episode_with_no_index_is_dropped():
+    cohort, _ = build_cohort({1}, {1, 2}, {1, 2}, {1, 2})
+    assert cohort == [1]
+
+
+def test_the_manifest_round_trips_through_the_loader_reader(tmp_path):
+    """What this writes is what `cohorts.load_episode_manifest` reads, so the two must agree on
+    the format -- the header comments included."""
+    path = write_cohort(str(tmp_path / 'sub' / 'cohort.txt'), [1002, 2002, 3003],
+                        'A test cohort.')
+    assert list(load_episode_manifest(path)) == [1002, 2002, 3003]
+    assert open(path).readline().startswith('# A test cohort.')
+
+
+def test_the_availability_sets_come_from_the_extracted_arrays(tmp_path):
+    """Age and sex are read at their cumulative-width offsets; a stored zero in either column
+    means missing rather than a newborn or a category."""
+    data_dir = str(tmp_path / 'data')
+    _write_fold(data_dir, 'fold1', {'train': [
+        (1001, True, 55.0, CODE_F, 0.0),    # both present
+        (1002, True, 0.0, CODE_F, 1.0),     # no age
+        (1003, True, 60.0, CODE_MISSING, 1.0),   # no sex
+    ]})
+    offsets = static_offsets(VARIABLE_PROPERTIES, STATIC_FEATS, 0)
+
+    extracted, has_age, has_sex = feature_availability(
+        data_dir, 'fold1', offsets, GENDER_MAP
+    )
+    assert extracted == {1001, 1002, 1003}
+    assert has_age == {1001, 1003}
+    assert has_sex == {1001, 1002}
+
+    cohort, _ = build_cohort(extracted, extracted, has_age, has_sex)
+    assert cohort == [1001]
+
+
+def test_a_fold_short_of_a_cohort_episode_is_reported(tmp_path):
+    """Folds are partitions of one episode set, so a fold missing a cohort episode would train
+    the control on fewer episodes than the regression scores."""
+    data_dir = str(tmp_path / 'data')
+    _write_fold(data_dir, 'fold1', {'train': [
+        (1001, True, 55.0, CODE_F, 0.0),
+        (1002, True, 60.0, CODE_F, 1.0),
+    ]})
+    _write_fold(data_dir, 'fold2', {'train': [(1001, True, 55.0, CODE_F, 0.0)]})
+
+    missing = check_folds_agree(data_dir, ['fold1', 'fold2'], [1001, 1002])
+    assert missing['fold1'] == []
+    assert missing['fold2'] == [1002]
+
+
+def test_a_fold_with_no_extracted_partitions_is_not_reported_as_short(tmp_path):
+    """An unextracted fold is a different problem from a fold that lost episodes, and calling
+    it short would send the reader looking in the wrong place."""
+    data_dir = str(tmp_path / 'data')
+    _write_fold(data_dir, 'fold1', {'train': [(1001, True, 55.0, CODE_F, 0.0)]})
+    os.makedirs(os.path.join(data_dir, 'fold2'))
+
+    missing = check_folds_agree(data_dir, ['fold1', 'fold2'], [1001])
+    assert missing == {'fold1': []}

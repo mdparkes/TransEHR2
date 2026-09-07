@@ -106,6 +106,7 @@ RECORDED_HYPERPARAMETERS = (
     'USE_HISTORICAL_TEXT_RECORDS',
     'USE_INSTAY_RECORDS',
     'COHORT_SUBSET',
+    'COHORT_EPISODES',
 )
 
 
@@ -571,6 +572,17 @@ def main():
             f'{args.experiment_config} sets COHORT_SUBSET={COHORT_SUBSET!r}; expected one of '
             f'{COHORTS} or nothing.'
         )
+    # Or restricts it to an explicit list of patient-episode ids, for a cohort defined by
+    # something the arrays do not carry. Checked here rather than at first use: the file is
+    # read once per partition per fold, and discovering it is missing after a pretrain has run
+    # wastes the whole job.
+    COHORT_EPISODES = experiment_config.get('COHORT_EPISODES', None)
+    if COHORT_EPISODES is not None and not os.path.exists(COHORT_EPISODES):
+        raise FileNotFoundError(
+            f'{args.experiment_config} sets COHORT_EPISODES={COHORT_EPISODES!r}, which does '
+            f'not exist. Write it with compute_charlson_index.py --write_cohort, or clear the '
+            f'key to run every episode.'
+        )
     # Runtime sequence-length caps. None uses everything that was extracted; smaller values crop
     # at load time, which is equivalent to re-extracting with the shorter limit.
     HISTORY_LEN_STEPS = experiment_config.get('HISTORY_LEN_STEPS', None)
@@ -700,6 +712,7 @@ def main():
             use_historical_text_records=USE_HISTORICAL_TEXT_RECORDS,
             use_instay_records=USE_INSTAY_RECORDS,
             cohort=COHORT_SUBSET,
+            cohort_episodes=COHORT_EPISODES,
             history_len_steps=HISTORY_LEN_STEPS,
             episode_len_steps=EPISODE_LEN_STEPS,
             extracted_history_len_steps=MAX_HISTORY_LEN_STEPS

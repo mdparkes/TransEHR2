@@ -50,7 +50,7 @@ COHORTS = (
      'patients with at least one pre-admission record',
      (15, 16, 17), 15, None),
     ('charlson',
-     'patients with at least one pre-admission set of discharge diagnoses',
+     'patients with a Charlson comorbidity index from an earlier hospital admission',
      (18, 19), 18, ('mortality',)),
 )
 

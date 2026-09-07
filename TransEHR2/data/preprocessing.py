@@ -14,7 +14,7 @@ from functools import partial
 from torch.utils.data import DataLoader, Sampler
 from tqdm import tqdm
 from transformers import AutoTokenizer
-from typing import Dict, Iterator, List, Optional, Tuple, Union
+from typing import Dict, Iterable, Iterator, List, Optional, Tuple, Union
 
 from TransEHR2.constants import HF_API_TOKEN, LLM_NAME, MAX_TOKEN_LENGTH, TOKENIZER_PAD_TOKEN
 from TransEHR2.data.custom_types import EpisodeData, MixedTensorDataset, TensorDimensions
@@ -1513,12 +1513,53 @@ def save_dataset(dataset: MixedDataset, base_path: str) -> None:
     print(f"Saved tensorized dataset to {base_path}/")
 
 
+def load_episode_ids(base_path: str, n_episodes: Optional[int] = None) -> np.ndarray:
+    """Patient-episode IDs for one extracted partition, one per row of its arrays.
+
+    `extract_mimic` writes them beside the partition directory as `{partition}_ids.pkl`; some
+    older extractions put the file inside it, so both places are checked.
+
+    Args:
+        base_path: The partition directory, e.g. `{fold}/train`.
+        n_episodes: Row count the IDs must line up with, or None to skip the check.
+
+    Returns:
+        (n_episodes,) array of IDs, in array row order.
+
+    Raises:
+        FileNotFoundError: If the file is in neither place. Selecting a cohort by ID is
+            impossible without it, and guessing would silently mis-attribute every row.
+        ValueError: If the file and the arrays disagree on length.
+    """
+    split = os.path.basename(os.path.normpath(base_path))
+    candidates = (
+        os.path.join(os.path.dirname(os.path.normpath(base_path)), f'{split}_ids.pkl'),
+        os.path.join(base_path, f'{split}_ids.pkl'),
+    )
+    for path in candidates:
+        if os.path.exists(path):
+            with open(path, 'rb') as handle:
+                ids = np.asarray(pickle.load(handle), dtype=np.int64)
+            if n_episodes is not None and ids.size != n_episodes:
+                raise ValueError(
+                    f'{path} holds {ids.size} ids but {base_path} holds {n_episodes} '
+                    f'episodes. The ids and the extracted arrays are out of step, so a row '
+                    f'cannot be attributed to an episode.'
+                )
+            return ids
+    raise FileNotFoundError(
+        f'no episode ids for {base_path}; looked for ' + ' and '.join(candidates)
+        + '. Restricting a run to a list of episode ids needs them.'
+    )
+
+
 def load_dataset(
     base_path: str,
     history_len_steps: Optional[int] = None,
     episode_len_steps: Optional[int] = None,
     extracted_history_len_steps: Optional[int] = None,
-    cohort: Optional[str] = None
+    cohort: Optional[str] = None,
+    cohort_episodes: Optional[Union[str, Iterable[int]]] = None
 ) -> MixedDataset:
     """
     Load tensorized dataset with memory-mapped arrays.
@@ -1537,6 +1578,11 @@ def load_dataset(
             `TransEHR2.data.cohorts`. None (default) keeps every episode. Membership is
             computed on the full extracted history, so it does not move with
             `history_len_steps`.
+        cohort_episodes: Restrict the dataset to an explicit list of patient-episode IDs --
+            a path to a file of one ID per line, or an iterable of IDs. Rows are matched
+            through `{partition}_ids.pkl`, so this selects the same episodes in every arm that
+            passes the same list, whatever each arm reads. Combines with `cohort`: an episode
+            must then satisfy both.
 
     Raises:
         ValueError: If a crop is requested but the extracted history/episode split is unknown,
@@ -1591,6 +1637,8 @@ def load_dataset(
                     np.load(embed_path, mmap_mode='r')
                 )
 
+    episode_ids = (None if cohort_episodes is None
+                   else load_episode_ids(base_path, n_episodes=len(load_mmap('val_masks'))))
     episode_indices = cohort_indices(
         {
             'val_masks': load_mmap('val_masks'),
@@ -1598,6 +1646,8 @@ def load_dataset(
             'max_history_len_steps': max_history_len_steps,
         },
         cohort,
+        episode_ids=episode_ids,
+        manifest=cohort_episodes,
     )
 
     return MixedDataset(
@@ -2196,7 +2246,8 @@ def prepare_dataloaders(
     history_len_steps: Optional[int] = None,
     episode_len_steps: Optional[int] = None,
     extracted_history_len_steps: Optional[int] = None,
-    cohort: Optional[str] = None
+    cohort: Optional[str] = None,
+    cohort_episodes: Optional[Union[str, Iterable[int]]] = None
 ) -> List[DataLoader]:
     """Prepare training, (validation), and test DataLoaders for MixedDataset.
 
@@ -2272,6 +2323,13 @@ def prepare_dataloaders(
         extracted_history_len_steps (int, optional): Size of the history region in the extracted
             arrays, i.e. the MAX_HISTORY_LEN_STEPS used at extraction time. Only needed for
             datasets extracted before that value was recorded in metadata.pkl. Defaults to None.
+        cohort (str, optional): Restrict every partition to a named cohort; see
+            `TransEHR2.data.cohorts`. Defaults to None (every episode).
+        cohort_episodes (str or iterable of int, optional): Restrict every partition to an
+            explicit list of patient-episode IDs -- a path to a file of one ID per line, or the
+            IDs themselves. Two runs given the same list train on the same episodes whatever
+            each of them reads, which is what a paired comparison needs when membership
+            depends on something the arrays do not carry. Defaults to None.
 
     Returns:
         List[DataLoader]: List of DataLoaders in order: [train_loader, val_loader (if available), 
@@ -2312,9 +2370,12 @@ def prepare_dataloaders(
             episode_len_steps=episode_len_steps,
             extracted_history_len_steps=extracted_history_len_steps,
             cohort=cohort,
+            cohort_episodes=cohort_episodes,
         )
-        if cohort is not None:
-            print(f'  {partition}: cohort {cohort!r} keeps {len(dataset)} of '
+        if cohort is not None or cohort_episodes is not None:
+            described = cohort if cohort_episodes is None else (
+                'the episode manifest' if cohort is None else f'{cohort!r} and the manifest')
+            print(f'  {partition}: cohort {described} keeps {len(dataset)} of '
                   f'{dataset.n_extracted_episodes} episodes')
         
         # Determine sampler and shuffle behavior

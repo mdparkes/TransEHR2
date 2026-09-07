@@ -19,8 +19,8 @@
 # Their text encoder is BAAI/bge-m3, which is not a size the heading needs to carry.
 #
 # 18 and 19 are the Charlson comparison: an in-stay-only model and a logistic regression on
-# age, sex and the Charlson comorbidity index, both on the episodes that carry at least one
-# earlier set of discharge diagnoses.
+# age, sex and the Charlson comorbidity index, both on the episodes for which all three of
+# those features exist.
 
 columns:
   1: "Historical + in-stay records, no text features, 1B parameter LLM"

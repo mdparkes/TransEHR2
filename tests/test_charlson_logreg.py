@@ -25,9 +25,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from reporting.evaluation import load_predictions, prediction_csv_path
 from run_charlson_logistic_regression import (build_design_matrix, coefficient_table,
-                                              decode_sex, fit_fold, get_fold_names, load_split,
-                                              sex_encoding, static_offsets, write_predictions)
+                                              fit_fold, get_fold_names, load_split,
+                                              sex_encoding, write_predictions)
 from TransEHR2.data.datasets import MixedDataset
+from TransEHR2.data.statics import decode_categorical, static_offsets
 from TransEHR2.data.preprocessing import save_dataset
 
 HIST, EPI = 4, 3
@@ -151,11 +152,11 @@ def test_a_reordered_config_moves_the_offsets():
     (CODE_MISSING, 'Missing'),
 ])
 def test_stored_gender_codes_decode_to_their_labels(code, label):
-    assert decode_sex([code], GENDER_MAP)[0] == label
+    assert decode_categorical([code], GENDER_MAP)[0] == label
 
 
 def test_an_unmapped_gender_code_reads_as_missing_rather_than_a_category():
-    assert list(decode_sex([7, 4], GENDER_MAP)) == ['Missing', 'Missing']
+    assert list(decode_categorical([7, 4], GENDER_MAP)) == ['Missing', 'Missing']
 
 
 # ---------------------------------------------------------------------------
@@ -210,9 +211,10 @@ def test_a_category_first_seen_outside_training_falls_into_the_reference():
 # Row correspondence with the control arm
 # ---------------------------------------------------------------------------
 
-def test_the_split_is_the_cohort_in_cohort_order(tmp_path):
-    """Episodes 1 and 3 carry a pre-admission diagnosis record; the loaded split must be
-    exactly those two, in ascending row order, with each one's own features."""
+def test_the_split_is_the_manifest_in_array_row_order(tmp_path):
+    """The manifest names episodes 1 and 3; the loaded split must be exactly those two, in
+    ascending array row order, with each one's own features -- which is the order the control
+    arm's inference loader produces for the same manifest."""
     data_dir = str(tmp_path / 'data')
     episodes = [
         (1001, False, 40.0, CODE_F, 0.0),
@@ -224,7 +226,8 @@ def test_the_split_is_the_cohort_in_cohort_order(tmp_path):
 
     charlson = pd.Series({1002: 4, 2002: 7})
     offsets = static_offsets(VARIABLE_PROPERTIES, STATIC_FEATS, 0)
-    split = load_split(data_dir, 'fold1', 'train', charlson, offsets, GENDER_MAP)
+    split = load_split(data_dir, 'fold1', 'train', charlson, offsets, GENDER_MAP,
+                       manifest=[1002, 2002])
 
     assert list(split['episode_ids']) == [1002, 2002]
     assert list(split['age']) == [55.0, 75.0]
@@ -244,7 +247,8 @@ def test_a_cohort_episode_without_an_index_is_refused(tmp_path):
     offsets = static_offsets(VARIABLE_PROPERTIES, STATIC_FEATS, 0)
 
     with pytest.raises(ValueError, match='no Charlson index'):
-        load_split(data_dir, 'fold1', 'train', pd.Series({1001: 3}), offsets, GENDER_MAP)
+        load_split(data_dir, 'fold1', 'train', pd.Series({1001: 3}), offsets, GENDER_MAP,
+                   manifest=[1001, 1002])
 
 
 def test_ids_out_of_step_with_the_arrays_are_refused(tmp_path):
@@ -259,7 +263,7 @@ def test_ids_out_of_step_with_the_arrays_are_refused(tmp_path):
 
     with pytest.raises(ValueError, match='out of step'):
         load_split(data_dir, 'fold1', 'train', pd.Series({1001: 3, 1002: 4}), offsets,
-                   GENDER_MAP)
+                   GENDER_MAP, manifest=[1001, 1002])
 
 
 def test_an_unextracted_partition_is_absent_rather_than_an_error(tmp_path):
@@ -267,7 +271,7 @@ def test_an_unextracted_partition_is_absent_rather_than_an_error(tmp_path):
     _write_fold(data_dir, 'fold1', {'train': [(1001, True, 40.0, CODE_F, 0.0)]})
     offsets = static_offsets(VARIABLE_PROPERTIES, STATIC_FEATS, 0)
     assert load_split(data_dir, 'fold1', 'val', pd.Series({1001: 1}), offsets,
-                      GENDER_MAP) is None
+                      GENDER_MAP, manifest=[1001]) is None
 
 
 # ---------------------------------------------------------------------------
