@@ -171,7 +171,10 @@ def create_inference_loader(
     batch_size: int,
     num_workers: int,
     pin_memory: bool,
-    use_historical_records: bool = True,
+    use_historical_nontext_records: bool = True,
+    use_historical_text_records: bool = True,
+    use_instay_records: bool = True,
+    cohort: Optional[str] = None,
     history_len_steps: Optional[int] = None,
     episode_len_steps: Optional[int] = None,
     extracted_history_len_steps: Optional[int] = None,
@@ -190,8 +193,15 @@ def create_inference_loader(
         batch_size: Number of samples per batch.
         num_workers: Number of DataLoader worker processes.
         pin_memory: Whether to use pinned memory for CUDA transfers.
-        use_historical_records: If False, zero out masks for the
-            history region so the model ignores pre-admission data.
+        use_historical_nontext_records: If False, drop the non-text records in
+            the history region.
+        use_historical_text_records: If False, drop the text records in the
+            history region.
+        use_instay_records: If False, drop every in-stay record, emptying the
+            event stream with them.
+        cohort: Restrict the split to a named cohort. Must match the cohort the
+            model was trained on, or the predictions describe a different set of
+            episodes from the one the model was fitted to.
         history_len_steps: Runtime cap on historical timesteps, applied
             by cropping at load time. None uses all extracted history.
         episode_len_steps: Runtime cap on in-stay timesteps. None uses
@@ -221,6 +231,7 @@ def create_inference_loader(
         history_len_steps=history_len_steps,
         episode_len_steps=episode_len_steps,
         extracted_history_len_steps=extracted_history_len_steps,
+        cohort=cohort,
     )
     total = len(dataset)
 
@@ -234,7 +245,9 @@ def create_inference_loader(
 
     collate_fn = partial(
         collate_tensorized,
-        use_historical_records=use_historical_records,
+        use_historical_nontext_records=use_historical_nontext_records,
+        use_historical_text_records=use_historical_text_records,
+        use_instay_records=use_instay_records,
         history_len_steps=dataset.history_len_steps,
     )
     loader = DataLoader(
@@ -637,9 +650,17 @@ if __name__ == '__main__':
     MAX_HISTORY_LEN_STEPS = dataset_config.get('MAX_HISTORY_LEN_STEPS', 0)
 
     USE_TEXT = experiment_config['USE_TEXT']
-    USE_HISTORICAL_RECORDS = experiment_config.get(
-        'USE_HISTORICAL_RECORDS', True
-    )
+    # These must match what the model was trained with. A model fitted without in-stay records
+    # and scored with them reads inputs it never saw, and the predictions describe nothing.
+    history_default = experiment_config.get('USE_HISTORICAL_RECORDS', True)
+    USE_HISTORICAL_NONTEXT_RECORDS = experiment_config.get(
+        'USE_HISTORICAL_NONTEXT_RECORDS', history_default)
+    USE_HISTORICAL_TEXT_RECORDS = experiment_config.get(
+        'USE_HISTORICAL_TEXT_RECORDS', history_default)
+    USE_INSTAY_RECORDS = experiment_config.get('USE_INSTAY_RECORDS', True)
+    # Likewise the cohort: predictions over a different set of episodes cannot be paired
+    # against another experiment's, which is what the corrected resampled t test needs.
+    COHORT_SUBSET = experiment_config.get('COHORT_SUBSET', None)
     # Runtime sequence-length caps; must match the values the model was trained with.
     HISTORY_LEN_STEPS = experiment_config.get('HISTORY_LEN_STEPS', None)
     EPISODE_LEN_STEPS = experiment_config.get('EPISODE_LEN_STEPS', None)
@@ -662,20 +683,30 @@ if __name__ == '__main__':
         tot_val_feat_dim += variable_properties[feature]['size']
     if USE_TEXT:
         n_val_feats = len(VALUED_FEATS) + len(TEXT_FEATS)
-        # Read text_embed_dim from the first fold's dataset metadata
-        fold_names_all = get_fold_names(DATA_DIR, exclude=['fold0'])
-        first_fold_meta_path = os.path.join(
-            DATA_DIR, fold_names_all[0], 'train', 'metadata.pkl'
-        )
-        with open(first_fold_meta_path, 'rb') as f:
-            _meta = pickle.load(f)
-        text_embed_dim = _meta['text_embed_dim']
-        if text_embed_dim == 0:
+        # Every partition, not just the first fold's train split: load_dataset falls back to a
+        # width of 0 where embeddings are absent, and the classifier is built from whichever
+        # partition was read here, so an unembedded split reaches the value encoder's input
+        # projection len(TEXT_FEATS) * embed_dim columns short.
+        widths = {}
+        for fold_name in get_fold_names(DATA_DIR, exclude=['fold0']):
+            for partition in ('train', 'val', 'test'):
+                meta_path = os.path.join(DATA_DIR, fold_name, partition, 'metadata.pkl')
+                if not os.path.exists(meta_path):
+                    continue
+                with open(meta_path, 'rb') as f:
+                    widths[f'{fold_name}/{partition}'] = pickle.load(f).get('text_embed_dim', 0)
+        missing = sorted(name for name, width in widths.items() if not width)
+        if missing:
             raise RuntimeError(
-                "text_embed_dim is 0 in dataset metadata. "
-                "Run embed_text.py to pre-compute text embeddings "
-                "before inference."
+                f"USE_TEXT is set, but these partitions carry no text embeddings: "
+                f"{', '.join(missing)}. Run embed_text.py over them before inference."
             )
+        if len(set(widths.values())) > 1:
+            raise RuntimeError(
+                f"partitions disagree on the text embedding width: {widths}. They must come "
+                f"from one embedding model, or the classifier is built for the wrong one."
+            )
+        text_embed_dim = next(iter(widths.values()))
         tot_val_feat_dim += len(TEXT_FEATS) * text_embed_dim
     else:
         n_val_feats = len(VALUED_FEATS)
@@ -722,7 +753,10 @@ if __name__ == '__main__':
             loader, total = create_inference_loader(
                 fold_dir, split, BATCH_SIZE,
                 args.num_workers, pin_memory,
-                use_historical_records=USE_HISTORICAL_RECORDS,
+                use_historical_nontext_records=USE_HISTORICAL_NONTEXT_RECORDS,
+                use_historical_text_records=USE_HISTORICAL_TEXT_RECORDS,
+                use_instay_records=USE_INSTAY_RECORDS,
+                cohort=COHORT_SUBSET,
                 history_len_steps=HISTORY_LEN_STEPS,
                 episode_len_steps=EPISODE_LEN_STEPS,
                 extracted_history_len_steps=MAX_HISTORY_LEN_STEPS,

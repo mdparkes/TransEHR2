@@ -58,6 +58,8 @@ _PROCESS_START = time.perf_counter()
 
 from accelerate import Accelerator
 from accelerate.utils import DistributedType, set_seed
+
+from TransEHR2.data.cohorts import COHORTS
 from torch.utils.tensorboard import SummaryWriter
 from typing import Any, Dict, List, Optional, Union
 
@@ -100,7 +102,10 @@ RECORDED_HYPERPARAMETERS = (
     'HISTORY_LEN_STEPS',
     'EPISODE_LEN_STEPS',
     'USE_TEXT',
-    'USE_HISTORICAL_RECORDS',
+    'USE_HISTORICAL_NONTEXT_RECORDS',
+    'USE_HISTORICAL_TEXT_RECORDS',
+    'USE_INSTAY_RECORDS',
+    'COHORT_SUBSET',
 )
 
 
@@ -529,7 +534,43 @@ def main():
     # ranks rare labels above common ones, which is a modelling stance, not a correction.
     FINETUNE_POS_WEIGHT_TASKS = tuple(
         experiment_config.get('FINETUNE_POS_WEIGHT_TASKS', ['mortality']))
-    USE_HISTORICAL_RECORDS = experiment_config.get('USE_HISTORICAL_RECORDS', True)
+    # Which records reach the model. All text is pre-admission -- the in-stay window closes at
+    # 48 h, before a discharge summary exists -- so USE_HISTORICAL_TEXT_RECORDS is what removes
+    # text records, while USE_TEXT decides whether the model has a text pathway at all.
+    #
+    # USE_HISTORICAL_RECORDS is the single switch these two replace. It is still read, because
+    # every config the finished tuning phases generated carries it, but it cannot be combined
+    # with either replacement: one config saying both things has no unambiguous reading.
+    history_default = experiment_config.get('USE_HISTORICAL_RECORDS', True)
+    if 'USE_HISTORICAL_RECORDS' in experiment_config:
+        conflicting = [key for key in ('USE_HISTORICAL_NONTEXT_RECORDS',
+                                       'USE_HISTORICAL_TEXT_RECORDS')
+                       if key in experiment_config]
+        if conflicting:
+            raise ValueError(
+                f"{args.experiment_config} sets USE_HISTORICAL_RECORDS alongside "
+                f"{', '.join(conflicting)}. USE_HISTORICAL_RECORDS is the switch those replace; "
+                f"drop it and state the two separately."
+            )
+    USE_HISTORICAL_NONTEXT_RECORDS = experiment_config.get(
+        'USE_HISTORICAL_NONTEXT_RECORDS', history_default)
+    USE_HISTORICAL_TEXT_RECORDS = experiment_config.get('USE_HISTORICAL_TEXT_RECORDS',
+                                                        history_default)
+    USE_INSTAY_RECORDS = experiment_config.get('USE_INSTAY_RECORDS', True)
+    if not (USE_HISTORICAL_NONTEXT_RECORDS or USE_HISTORICAL_TEXT_RECORDS
+            or USE_INSTAY_RECORDS):
+        raise ValueError(
+            f'{args.experiment_config} disables every record stream, leaving the model nothing '
+            f'to read.'
+        )
+    # Restricts the run to episodes carrying a kind of pre-admission record; see
+    # TransEHR2.data.cohorts. None runs every episode.
+    COHORT_SUBSET = experiment_config.get('COHORT_SUBSET', None)
+    if COHORT_SUBSET is not None and COHORT_SUBSET not in COHORTS:
+        raise ValueError(
+            f'{args.experiment_config} sets COHORT_SUBSET={COHORT_SUBSET!r}; expected one of '
+            f'{COHORTS} or nothing.'
+        )
     # Runtime sequence-length caps. None uses everything that was extracted; smaller values crop
     # at load time, which is equivalent to re-extracting with the shorter limit.
     HISTORY_LEN_STEPS = experiment_config.get('HISTORY_LEN_STEPS', None)
@@ -605,17 +646,34 @@ def main():
 
     if USE_TEXT:
         n_val_feats = len(VALUED_FEATS) + len(TEXT_FEATS)
-        # text_embed_dim is a property of the extraction, so read it from the fold actually
+        # text_embed_dim is a property of the extraction, so read it from the folds actually
         # being run rather than from whichever fold happens to sort first.
-        meta_path = os.path.join(DATA_DIR, fold_name_list[0], 'train', 'metadata.pkl')
-        with open(meta_path, 'rb') as f:
-            _meta = pickle.load(f)
-        text_embed_dim = _meta['text_embed_dim']
-        if text_embed_dim == 0:
+        #
+        # Every partition is checked, not just the first fold's train split. `load_dataset`
+        # falls back to text_embed_dim 0 when a partition has no embedding files, and the model
+        # is built from whichever partition was read here: an unembedded test split then reaches
+        # the value encoder's input projection 2048 columns short, after the run has already
+        # paid for pretraining and finetuning.
+        widths = {}
+        for fold_name in fold_name_list:
+            for partition in ('train', 'val', 'test'):
+                meta_path = os.path.join(DATA_DIR, fold_name, partition, 'metadata.pkl')
+                if not os.path.exists(meta_path):
+                    continue
+                with open(meta_path, 'rb') as f:
+                    widths[f'{fold_name}/{partition}'] = pickle.load(f).get('text_embed_dim', 0)
+        missing = sorted(name for name, width in widths.items() if not width)
+        if missing:
             raise RuntimeError(
-                "text_embed_dim is 0 in dataset metadata. "
-                "Run embed_text.py to pre-compute text embeddings before training."
+                f"USE_TEXT is set, but these partitions carry no text embeddings: "
+                f"{', '.join(missing)}. Run embed_text.py over them before training."
             )
+        if len(set(widths.values())) > 1:
+            raise RuntimeError(
+                f"partitions disagree on the text embedding width: {widths}. They must come "
+                f"from one embedding model, or the encoder is built for the wrong one."
+            )
+        text_embed_dim = next(iter(widths.values()))
         tot_val_feat_dim += len(TEXT_FEATS) * text_embed_dim
         print(f"Text embedding dimension: {text_embed_dim}\n")
     else:
@@ -638,7 +696,10 @@ def main():
             # text-heavy episodes. With one process there is nothing to balance against, and
             # prepare_dataloaders skips the sampler at world_size 1 regardless.
             balance_text=False,
-            use_historical_records=USE_HISTORICAL_RECORDS,
+            use_historical_nontext_records=USE_HISTORICAL_NONTEXT_RECORDS,
+            use_historical_text_records=USE_HISTORICAL_TEXT_RECORDS,
+            use_instay_records=USE_INSTAY_RECORDS,
+            cohort=COHORT_SUBSET,
             history_len_steps=HISTORY_LEN_STEPS,
             episode_len_steps=EPISODE_LEN_STEPS,
             extracted_history_len_steps=MAX_HISTORY_LEN_STEPS
@@ -831,7 +892,12 @@ def main():
             if skip_finetuning:
                 print(f"\nFinetuned {task} model found, skipping finetuning.\n")
 
-            checkpoint_dir = f'./checkpoints/{EXPERIMENT_NAME}/{fold_name}/finetuned'
+            # Per task, like the log directory beside it. One directory shared by every task
+            # is resumed from by whichever task runs next: a requeue during phenotyping would
+            # load mortality's model and optimizer state into the phenotyping stage. It also
+            # forecloses running the tasks as separate concurrent jobs, which is how a fold
+            # fans out across GPUs.
+            checkpoint_dir = f'./checkpoints/{EXPERIMENT_NAME}/{fold_name}/finetuned_{task}'
             log_dir = f'./log/{EXPERIMENT_NAME}/{fold_name}/finetuned_{task}'
             os.makedirs(log_dir, exist_ok=True)
             writer = SummaryWriter(log_dir)

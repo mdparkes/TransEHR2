@@ -1,12 +1,11 @@
-"""Shared command-line machinery for the per-task reporting scripts.
+"""Shared command-line machinery for the result tables.
 
-Each task has its own entry point (``report_mortality.py``,
-``report_length_of_stay.py``, ``report_phenotype.py``) because the tasks
-differ in which metrics they report and how those metrics are grouped.
-Everything the three have in common lives here: argument parsing,
-resolving experiment numbers to column headings, running the corrected
-resampled t tests, controlling the false discovery rate, and assembling
-the result into a :class:`~reporting.jmir.tables.Table`.
+``report_results_tables.py`` is the entry point. The tasks differ in which
+metrics they report and how those metrics are grouped, which is declared in
+:mod:`reporting.tasks`; everything they have in common lives here: argument
+parsing, resolving experiment numbers to column headings, running the corrected
+resampled t tests, controlling the false discovery rate, and assembling the
+result into a :class:`~reporting.jmir.tables.Table`.
 """
 
 import argparse

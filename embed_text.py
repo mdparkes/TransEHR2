@@ -115,21 +115,70 @@ def load_partition_text(
 
 
 def load_episode_ids(part_dir: str) -> Optional[List]:
-    """Load episode IDs from a partition directory.
+    """Load the patient-episode ids for a partition, in extracted-array row order.
 
-    Tries common naming conventions: train_ids.pkl, val_ids.pkl,
-    test_ids.pkl.  Returns None if no ID file is found.
+    `extract_mimic` writes the ids beside the partition directory rather than inside it --
+    `{fold}/{partition}_ids.pkl` against `{fold}/{partition}/` -- so that is where this looks
+    first. The partition directory is still checked, for datasets written before that layout.
+
+    These ids are what makes deduplication possible: the folds re-partition one set of
+    patients, so an episode recurs in every fold and its text needs embedding once. Without
+    them the cache key falls back to the partition path and nothing can ever hit.
+
+    Returns:
+        The ids, or None if no file was found.
     """
     split = os.path.basename(part_dir)
-    ids_path = os.path.join(part_dir, f'{split}_ids.pkl')
-    if os.path.exists(ids_path):
-        with open(ids_path, 'rb') as f:
-            return pickle.load(f)
-    for fname in os.listdir(part_dir):
+    candidates = [
+        os.path.join(os.path.dirname(part_dir), f'{split}_ids.pkl'),
+        os.path.join(part_dir, f'{split}_ids.pkl'),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            with open(path, 'rb') as f:
+                return pickle.load(f)
+    for fname in sorted(os.listdir(part_dir)):
         if fname.endswith('_ids.pkl'):
             with open(os.path.join(part_dir, fname), 'rb') as f:
                 return pickle.load(f)
     return None
+
+
+def length_sorted_batches(token_array, mask_array, flat_indices, batch_size):
+    """Yield batches ordered by real sequence length, with the padding tail trimmed.
+
+    Sequences are stored padded to MAX_TOKEN_LENGTH. A batch drawn in storage order almost
+    always contains one long note, so trimming alone would save nothing; sorting by real length
+    first makes each batch nearly uniform, and the trim then costs each batch its own longest
+    sequence rather than the global maximum. Attention is quadratic in that length.
+
+    Padding is on the right -- `LLMTextProcessor` refuses a tokenizer that pads left, because
+    CLS pooling reads position 0 -- so dropping the tail beyond a batch's longest real sequence
+    removes only padding, and the embeddings are unchanged.
+
+    Args:
+        token_array: (n, token_len) token ids.
+        mask_array: (n, token_len) attention masks, nonzero on real tokens.
+        flat_indices: (n,) destination index of each row in the partition's embedding array.
+        batch_size: Rows per batch.
+
+    Yields:
+        (indices, tokens, masks) per batch, where `indices` says where each row's embedding
+        belongs. Rows are permuted, so the caller must scatter by `indices` rather than assume
+        input order.
+    """
+    lengths = np.asarray(mask_array).sum(axis=1)
+    order = np.argsort(lengths, kind='stable')
+    token_array = np.asarray(token_array)[order]
+    mask_array = np.asarray(mask_array)[order]
+    flat_indices = np.asarray(flat_indices)[order]
+
+    for start in range(0, len(flat_indices), batch_size):
+        end = min(start + batch_size, len(flat_indices))
+        masks = mask_array[start:end]
+        # At least one column, so an all-empty batch still has a shape the model accepts.
+        keep = max(int(masks.sum(axis=1).max()), 1)
+        yield flat_indices[start:end], token_array[start:end, :keep], masks[:, :keep]
 
 
 @torch.no_grad()
@@ -187,6 +236,18 @@ def process_partition(
     metadata, offsets, values, masks, timesteps, n_text_feats = \
         load_partition_text(part_dir)
     episode_ids = load_episode_ids(part_dir)
+    if episode_ids is None:
+        # Without ids the cache key falls back to the partition path, which is unique, so every
+        # text is re-embedded in every fold. That is six times the work and it is invisible in
+        # the output, so say so rather than quietly running long.
+        print(f"  WARNING: no episode ids beside {part_dir}. Deduplication across folds is "
+              f"off, so this partition re-embeds text other folds already did.")
+    elif len(episode_ids) != offsets[0].shape[0] - 1:
+        raise ValueError(
+            f'{part_dir}: {offsets[0].shape[0] - 1} episodes in the arrays but '
+            f'{len(episode_ids)} ids beside them. Caching on mismatched ids would attach one '
+            f"episode's embeddings to another."
+        )
     # CSR format: n+1 offsets for n episodes
     n_episodes = offsets[0].shape[0] - 1
 
@@ -247,21 +308,13 @@ def process_partition(
             token_array = np.stack(need_embed_tokens, axis=0)
             mask_array = np.stack(need_embed_masks, axis=0)
 
-            for batch_start in range(
-                0, len(need_embed_indices), batch_size
+            for batch_indices, batch_tokens, batch_masks in length_sorted_batches(
+                token_array, mask_array, need_embed_indices, batch_size
             ):
-                batch_end = min(
-                    batch_start + batch_size,
-                    len(need_embed_indices)
-                )
-                batch_tokens = token_array[batch_start:batch_end]
-                batch_masks = mask_array[batch_start:batch_end]
                 batch_embeds = embed_batch(
                     llm, batch_tokens, batch_masks, device
                 )
-                for i, flat_idx in enumerate(
-                    need_embed_indices[batch_start:batch_end]
-                ):
+                for i, flat_idx in enumerate(batch_indices):
                     all_embeddings[flat_idx] = batch_embeds[i]
 
             new_embeddings_count += len(need_embed_indices)

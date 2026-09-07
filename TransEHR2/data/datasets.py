@@ -149,6 +149,7 @@ class MixedDataset(Dataset):
         max_history_len_steps: int = 0,
         history_len_steps: Optional[int] = None,
         episode_len_steps: Optional[int] = None,
+        episode_indices: Optional[np.ndarray] = None,
     ):
         """Initialize an instance.
 
@@ -163,11 +164,19 @@ class MixedDataset(Dataset):
             episode_len_steps: Runtime cap on in-stay timesteps. Must not exceed
                 `max_ts_len - max_history_len_steps`. None (default) uses all extracted
                 episode steps.
+            episode_indices: Rows of the extracted arrays to expose, for restricting a run to
+                a cohort. None (default) exposes every episode. The arrays themselves are left
+                memory-mapped and whole; only the index the dataset reports is narrowed.
 
         Raises:
-            ValueError: If a requested length is negative or exceeds what was extracted.
+            ValueError: If a requested length is negative or exceeds what was extracted, or if
+                `episode_indices` falls outside the extracted rows.
         """
-        self.n_episodes = val_times.shape[0]
+        self.n_extracted_episodes = val_times.shape[0]
+        self.episode_indices = self._resolve_indices(episode_indices,
+                                                     self.n_extracted_episodes)
+        self.n_episodes = (self.n_extracted_episodes if self.episode_indices is None
+                           else int(self.episode_indices.size))
         self.max_ts_len = max_ts_len
         self.max_history_len_steps = max_history_len_steps
         self.max_episode_len_steps = max_ts_len - max_history_len_steps
@@ -215,9 +224,46 @@ class MixedDataset(Dataset):
         self.event_times = event_times
         self.event_masks = event_masks
         self.static_data = static_data
-        self.mortality = mortality
-        self.length_of_stay = length_of_stay
-        self.phenotype = phenotype
+        if self.episode_indices is None:
+            self.mortality = mortality
+            self.length_of_stay = length_of_stay
+            self.phenotype = phenotype
+        else:
+            # Labels are small and are read whole by `positive_class_weight`, which counts the
+            # array rather than iterating the loader. Subsetting them here keeps the class
+            # weight consistent with the episodes the run actually sees.
+            self.mortality = np.asarray(mortality)[self.episode_indices]
+            self.length_of_stay = np.asarray(length_of_stay)[self.episode_indices]
+            self.phenotype = np.asarray(phenotype)[self.episode_indices]
+
+    @staticmethod
+    def _resolve_indices(episode_indices, n_extracted: int):
+        """Validate the requested row subset.
+
+        Args:
+            episode_indices: Rows to expose, or None for all of them.
+            n_extracted: Number of rows in the extracted arrays.
+
+        Returns:
+            An int64 array of row indices, or None.
+
+        Raises:
+            ValueError: If the subset is empty or names a row that was never extracted.
+        """
+        if episode_indices is None:
+            return None
+        indices = np.asarray(episode_indices, dtype=np.int64).ravel()
+        if indices.size == 0:
+            raise ValueError(
+                'episode_indices selects no episodes. A cohort that matches nothing would '
+                'train on an empty dataset rather than fail.'
+            )
+        if indices.min() < 0 or indices.max() >= n_extracted:
+            raise ValueError(
+                f'episode_indices spans [{indices.min()}, {indices.max()}] but the extracted '
+                f'arrays hold {n_extracted} episodes.'
+            )
+        return indices
 
     @staticmethod
     def _resolve_len(requested: Optional[int], extracted: int, arg_name: str,
@@ -266,6 +312,13 @@ class MixedDataset(Dataset):
         """
         Return episode as torch tensors, reconstructing dense text embeddings on-the-fly.
         """
+        # Feature arrays are left whole and memory-mapped, so a cohort subset is applied by
+        # remapping once here rather than at each array read below. The label arrays are the
+        # exception: they were subset in __init__ so that `positive_class_weight` counts the
+        # episodes the run sees, and they are therefore read by position, not by row.
+        position = idx
+        if self.episode_indices is not None:
+            idx = int(self.episode_indices[idx])
         ts_start, ts_end = self.ts_start, self.ts_end
 
         # Text embeddings stay sparse here. Densified to (ts_len, embed_dim) per feature they are
@@ -317,7 +370,8 @@ class MixedDataset(Dataset):
             'event_times': torch.from_numpy(self.event_times[idx, ts_start:ts_end].copy()),
             'event_masks': torch.from_numpy(self.event_masks[idx, ts_start:ts_end].copy()),
             'static_data': torch.from_numpy(self.static_data[idx].copy()),
-            'mortality': torch.tensor(float(self.mortality[idx]), dtype=torch.float32),
-            'length_of_stay': torch.tensor(float(self.length_of_stay[idx]), dtype=torch.float32),
-            'phenotype': torch.from_numpy(self.phenotype[idx].copy()),
+            'mortality': torch.tensor(float(self.mortality[position]), dtype=torch.float32),
+            'length_of_stay': torch.tensor(float(self.length_of_stay[position]),
+                                           dtype=torch.float32),
+            'phenotype': torch.from_numpy(self.phenotype[position].copy()),
         }

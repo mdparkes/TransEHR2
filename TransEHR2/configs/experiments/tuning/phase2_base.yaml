@@ -16,8 +16,9 @@ BATCH_SIZE: 200
 # Tuning runs against the fully featured model -- text and pre-admission history both on --
 # because that is the configuration whose hyperparameters the manuscript needs.
 USE_TEXT: True
-USE_HISTORICAL_RECORDS: True
-
+USE_HISTORICAL_NONTEXT_RECORDS: true
+USE_HISTORICAL_TEXT_RECORDS: true
+USE_INSTAY_RECORDS: true
 # Runtime sequence-length caps, applied by cropping the extracted arrays at load time.
 # `null` uses every timestep that was extracted. Phase 3 sweeps HISTORY_LEN_STEPS; Phase 2
 # leaves both uncapped so the tuned values are not conditioned on a truncation.

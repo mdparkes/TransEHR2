@@ -38,6 +38,8 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 import numpy as np
 
+from TransEHR2.data.cohorts import (has_any_history, has_historical_text,
+                                    has_value_history)
 from TransEHR2.data.preprocessing import load_dataset
 
 
@@ -47,20 +49,6 @@ DIAGNOSIS_INDEX = 1
 
 CIRCLE_COLOURS = ('#4878a8', '#c0653a')
 OUTER_COLOUR = '#8a8a8a'
-
-
-def history_mask(times, masks, cutoff: float) -> np.ndarray:
-    """Boolean array marking observed timesteps that precede ICU admission.
-
-    Args:
-        times: (n_episodes, max_ts_len) timestamps in hours relative to admission.
-        masks: (n_episodes, max_ts_len) nonzero at non-padding timesteps.
-        cutoff: Timestamp below which a record is pre-admission history.
-
-    Returns:
-        (n_episodes, max_ts_len) boolean array.
-    """
-    return (np.asarray(masks) > 0) & (np.asarray(times, dtype=np.float64) < cutoff)
 
 
 def patient_ids(data_dir: str, fold: str, split: str, n_episodes: int) -> np.ndarray:
@@ -91,7 +79,7 @@ def patient_ids(data_dir: str, fold: str, split: str, n_episodes: int) -> np.nda
     return np.asarray(episode_ids, dtype=np.int64) // 1000
 
 
-def collect_partition(data_dir: str, fold: str, split: str, cutoff: float,
+def collect_partition(data_dir: str, fold: str, split: str,
                       extracted_history_len_steps=None) -> dict:
     """Patient id sets for one partition.
 
@@ -99,7 +87,6 @@ def collect_partition(data_dir: str, fold: str, split: str, cutoff: float,
         data_dir: Directory holding the fold subdirectories.
         fold: Fold name.
         split: Partition name.
-        cutoff: History cutoff passed to `history_mask`.
         extracted_history_len_steps: Width of the history region, for datasets written before
             the layout was recorded in metadata.
 
@@ -108,32 +95,28 @@ def collect_partition(data_dir: str, fold: str, split: str, cutoff: float,
     """
     dataset = load_dataset(os.path.join(data_dir, fold, split),
                            extracted_history_len_steps=extracted_history_len_steps)
-    val_before = history_mask(dataset.val_times, dataset.val_masks, cutoff)
-    event_before = history_mask(dataset.event_times, dataset.event_masks, cutoff)
-    text = np.asarray(dataset.val_text_indicators) > 0
-    if text.shape[2] <= DIAGNOSIS_INDEX:
-        raise ValueError(
-            f'{fold}/{split} carries {text.shape[2]} text features; this needs at least '
-            f'{DIAGNOSIS_INDEX + 1}. Check TEXT_FEATS in the dataset config used to extract it.'
-        )
-
-    has_summary = (val_before & text[:, :, SUMMARY_INDEX]).any(axis=1)
-    has_diagnosis = (val_before & text[:, :, DIAGNOSIS_INDEX]).any(axis=1)
-    has_any = val_before.any(axis=1) | event_before.any(axis=1)
+    hist = dataset.max_history_len_steps
+    has_summary = has_historical_text(dataset.val_masks, dataset.val_text_indicators, hist,
+                                      SUMMARY_INDEX)
+    has_diagnosis = has_historical_text(dataset.val_masks, dataset.val_text_indicators, hist,
+                                        DIAGNOSIS_INDEX)
+    has_any = has_any_history(dataset.val_masks, dataset.event_masks, hist)
+    has_readable = has_value_history(dataset.val_masks, hist)
 
     patients = patient_ids(data_dir, fold, split, len(has_any))
     return {
         'summary': set(patients[has_summary].tolist()),
         'diagnosis': set(patients[has_diagnosis].tolist()),
         'any': set(patients[has_any].tolist()),
+        'readable': set(patients[has_readable].tolist()),
         'all': set(patients.tolist()),
     }
 
 
-def collect_sets(data_dir: str, folds, splits, cutoff: float,
+def collect_sets(data_dir: str, folds, splits,
                  extracted_history_len_steps=None) -> dict:
     """Union the patient id sets over every requested partition."""
-    totals = {key: set() for key in ('summary', 'diagnosis', 'any', 'all')}
+    totals = {key: set() for key in ('summary', 'diagnosis', 'any', 'readable', 'all')}
     seen = 0
     for fold in folds:
         for split in splits:
@@ -141,7 +124,7 @@ def collect_sets(data_dir: str, folds, splits, cutoff: float,
             if not os.path.isdir(path):
                 print(f'  {fold}/{split}: not found, skipping', file=sys.stderr)
                 continue
-            partition = collect_partition(data_dir, fold, split, cutoff,
+            partition = collect_partition(data_dir, fold, split,
                                           extracted_history_len_steps)
             for key, value in partition.items():
                 totals[key] |= value
@@ -318,6 +301,7 @@ def region_counts(sets: dict) -> dict:
         'diagnosis_only': len(diagnosis - summary),
         'any_only': len(any_record - summary - diagnosis),
         'no_history': len(everyone - any_record),
+        'readable': len(sets['readable']),
     }
 
 
@@ -327,6 +311,7 @@ def report(counts: dict) -> None:
     rows = [
         ('Patients', counts['all']),
         ('Any pre-admission record', counts['any']),
+        ('  readable by the model', counts['readable']),
         ('No pre-admission record', counts['no_history']),
         ('Discharge summary', counts['summary']),
         ('Diagnosis description', counts['diagnosis']),
@@ -359,9 +344,6 @@ def main(argv=None):
                         help='Figure path; the extension picks the format')
     parser.add_argument('--csv', default=None, help='Also write the counts to this CSV')
     parser.add_argument('--title', default='', help='Figure title (default: none)')
-    parser.add_argument('--history-cutoff-hours', type=float, default=0.0,
-                        help='Timestamp below which a record counts as pre-admission history '
-                             '(default: 0.0, i.e. time measured forward from admission)')
     parser.add_argument('--extracted-history-len-steps', type=int, default=None,
                         help='Width of the history region in the extracted arrays. Only needed '
                              'for datasets written before the layout was recorded in metadata.')
@@ -372,7 +354,7 @@ def main(argv=None):
     print(f'Reading {args.data_dir}: folds {" ".join(args.folds)}, '
           f'splits {" ".join(args.splits)}')
     sets = collect_sets(args.data_dir, args.folds, args.splits,
-                        args.history_cutoff_hours, args.extracted_history_len_steps)
+                        args.extracted_history_len_steps)
     counts = region_counts(sets)
     report(counts)
 

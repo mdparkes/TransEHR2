@@ -34,6 +34,7 @@ def test_the_regions_partition_each_set():
     counts = region_counts({
         'all': set(range(1000)),
         'any': set(range(700)),
+        'readable': set(range(650)),
         'summary': set(range(400)),
         'diagnosis': set(range(250, 600)),
     })
@@ -50,6 +51,7 @@ def test_text_outside_the_any_record_set_is_refused():
         region_counts({
             'all': set(range(10)),
             'any': set(range(3)),
+            'readable': set(range(3)),
             'summary': set(range(5)),
             'diagnosis': set(),
         })
