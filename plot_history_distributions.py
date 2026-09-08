@@ -48,10 +48,17 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
 import numpy as np
 
-from TransEHR2.data.cohorts import (has_any_history, has_value_history,
-                                   history_observed)
+from TransEHR2.data.cohorts import (COHORTS, cohort_mask, has_any_history,
+                                   has_value_history, history_observed)
 from TransEHR2.data.preprocessing import load_dataset, load_episode_ids
 
+
+# Figure caption per cohort, completing "n = {N} ...".
+CAPTIONS = {
+    'any_history': 'episodes with at least one pre-admission value record',
+    'discharge_summary': 'episodes with at least one pre-admission discharge summary',
+    'diagnosis_history': 'episodes with at least one pre-admission diagnosis description',
+}
 
 COUNT_COLOUR = '#4878a8'
 GAP_COLOUR = '#c0653a'
@@ -153,7 +160,7 @@ def latest_history_time(times, masks, hist: int) -> np.ndarray:
                     np.nan)
 
 
-def collect_partition(data_dir: str, fold: str, split: str,
+def collect_partition(data_dir: str, fold: str, split: str, cohort: str,
                       extracted_history_len_steps=None) -> dict:
     """Per-episode counts, gaps and cohort flags for one partition.
 
@@ -161,6 +168,7 @@ def collect_partition(data_dir: str, fold: str, split: str,
         data_dir: Directory holding the fold subdirectories.
         fold: Fold name.
         split: Partition name.
+        cohort: A name in `TransEHR2.data.cohorts.COHORTS`, selecting the population.
         extracted_history_len_steps: Width of the history region, for datasets written before
             the layout was recorded in metadata.
 
@@ -196,13 +204,15 @@ def collect_partition(data_dir: str, fold: str, split: str,
         'val_count': val_count,
         'val_latest': val_latest,
         'event_latest': event_latest,
+        'in_cohort': cohort_mask(dataset, cohort),
         'in_value': has_value_history(dataset.val_masks, hist),
         'in_any': has_any_history(dataset.val_masks, dataset.event_masks, hist),
         'hist': hist,
     }
 
 
-def collect(data_dir: str, folds, splits, extracted_history_len_steps=None) -> dict:
+def collect(data_dir: str, folds, splits, cohort: str,
+            extracted_history_len_steps=None) -> dict:
     """Concatenate the per-episode arrays over every requested partition.
 
     Raises:
@@ -217,11 +227,12 @@ def collect(data_dir: str, folds, splits, extracted_history_len_steps=None) -> d
             if not os.path.isdir(path):
                 print(f'  {fold}/{split}: not found, skipping', file=sys.stderr)
                 continue
-            part = collect_partition(data_dir, fold, split, extracted_history_len_steps)
+            part = collect_partition(data_dir, fold, split, cohort,
+                                     extracted_history_len_steps)
             widths.add(part.pop('hist'))
             parts.append(part)
             print(f'  {fold}/{split}: {len(part["val_count"])} episodes, '
-                  f'{int(part["in_value"].sum())} with value history')
+                  f'{int(part["in_cohort"].sum())} in the cohort')
     if not parts:
         raise SystemExit('No partitions were read. Check --data_dir, --folds and --splits.')
     if len(widths) > 1:
@@ -278,7 +289,8 @@ def bin_counts(values: np.ndarray, bins) -> list:
     return out
 
 
-def draw(count_rows, gap_rows, n_episodes: int, output: str, title: str) -> None:
+def draw(count_rows, gap_rows, n_episodes: int, caption: str, output: str,
+         title: str) -> None:
     """Draw the two panels side by side and write the figure."""
     fig, axes = plt.subplots(1, 2, figsize=(13.0, 4.6))
 
@@ -307,8 +319,7 @@ def draw(count_rows, gap_rows, n_episodes: int, output: str, title: str) -> None
 
     if title:
         fig.suptitle(title)
-    fig.text(0.5, -0.02,
-             f'n = {n_episodes:,} episodes with at least one pre-admission value record',
+    fig.text(0.5, -0.02, f'n = {n_episodes:,} {caption}',
              ha='center', fontsize=9, color='#555555')
     fig.tight_layout()
     os.makedirs(os.path.dirname(output) or '.', exist_ok=True)
@@ -317,7 +328,7 @@ def draw(count_rows, gap_rows, n_episodes: int, output: str, title: str) -> None
 
 
 def report(data: dict, count_rows, gap_rows, gap_values: np.ndarray,
-           event_only: int) -> None:
+           cohort: str, n_value: int, n_any: int) -> None:
     """Print the population, the two binnings and the quantiles behind them.
 
     The two panels have different denominators whenever `--gap_stream any` reaches past the value
@@ -327,10 +338,11 @@ def report(data: dict, count_rows, gap_rows, gap_values: np.ndarray,
     n_gap = len(gap_values)
 
     print()
-    print(f'Episodes with a pre-admission value record      : {n:,}')
-    print(f'  excluded, history in the event stream only    : {event_only:,}')
-    print(f'  either-stream population for comparison       : {n + event_only:,}')
-    print(f'History region width (records per stream)       : {data["hist"]}')
+    print(f'Cohort                                         : {cohort}')
+    print(f'Episodes in the cohort                         : {n:,}')
+    print(f'  of the value-history population              : {n_value:,}')
+    print(f'  of the either-stream population              : {n_any:,}')
+    print(f'History region width (records per stream)      : {data["hist"]}')
     if n_gap != n:
         print(f'Episodes with a measurable gap                 : {n_gap:,}')
 
@@ -368,6 +380,13 @@ def main(argv=None):
                              'double counts, and the run stops if it detects that.')
     parser.add_argument('--splits', nargs='+', default=['train', 'val', 'test'],
                         help='Partitions within each fold (default: train val test)')
+    parser.add_argument('--cohort', choices=list(COHORTS), default='any_history',
+                        help='Population, from TransEHR2.data.cohorts. "any_history" is the '
+                             'value-history set -- it resolves to has_value_history, not to '
+                             'has_any_history, because the models read no pre-admission '
+                             'event. "discharge_summary" and "diagnosis_history" narrow it to '
+                             'episodes carrying at least one pre-admission record of that '
+                             'text feature.')
     parser.add_argument('--gap_stream', choices=('value', 'any'), default='value',
                         help='Which stream supplies the most recent pre-admission record. '
                              '"value" is what the models read and matches the population. '
@@ -390,15 +409,21 @@ def main(argv=None):
 
     print(f'Reading {args.data_dir}: folds {" ".join(args.folds)}, '
           f'splits {" ".join(args.splits)}')
-    data = collect(args.data_dir, args.folds, args.splits,
+    data = collect(args.data_dir, args.folds, args.splits, args.cohort,
                    args.extracted_history_len_steps)
 
-    event_only = int(np.count_nonzero(data['in_any'] & ~data['in_value']))
-    keep = data['in_value']
+    n_value = int(data['in_value'].sum())
+    n_any = int(data['in_any'].sum())
+    keep = data['in_cohort']
     data = {key: (value[keep] if isinstance(value, np.ndarray) else value)
             for key, value in data.items()}
     n = int(keep.sum())
-    if data['val_count'].size and int(data['val_count'].min()) < 1:
+    if n == 0:
+        raise SystemExit(
+            f'the {args.cohort} cohort is empty in {args.data_dir}. Check that the extraction '
+            f'carries the text feature the cohort selects on.'
+        )
+    if int(data['val_count'].min()) < 1:
         raise SystemExit('an episode in the population holds no value record, so the count '
                          'bins do not start low enough.')
     if args.expect_n is not None and n != args.expect_n:
@@ -424,7 +449,7 @@ def main(argv=None):
 
     count_rows = bin_counts(data['val_count'], count_bins(data['hist']))
     gap_rows = bin_counts(gap_values, GAP_BINS)
-    report(data, count_rows, gap_rows, gap_values, event_only)
+    report(data, count_rows, gap_rows, gap_values, args.cohort, n_value, n_any)
 
     if sum(value for _, value in count_rows) != n:
         raise SystemExit('the count bins do not cover every episode.')
@@ -442,7 +467,8 @@ def main(argv=None):
         print(f'Wrote {args.csv}')
 
     if not args.no_figure:
-        draw(count_rows, gap_rows, n, args.output, args.title)
+        draw(count_rows, gap_rows, n, CAPTIONS[args.cohort], args.output,
+             args.title)
     return 0
 
 
