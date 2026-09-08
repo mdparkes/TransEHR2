@@ -541,7 +541,7 @@ def main(argv=None):
         return 1
     print(f'Found {len(fold_names)} fold(s): {fold_names}')
 
-    per_fold, coverages, phenotype_names = [], [], None
+    per_fold, used_folds, coverages, phenotype_names = [], [], [], None
     for fold_name in fold_names:
         loaded = load_fold(data_dir, args.model_dir, args.experiment_name,
                            fold_name, args.split, cohort, manifest)
@@ -556,6 +556,9 @@ def main(argv=None):
         rows, coverage = stratify_fold(scores, targets, episode_ids, names,
                                        audit)
         per_fold.append(rows)
+        # Track which folds actually contributed. Zipping against the requested
+        # fold names would mislabel every fold after a skipped one.
+        used_folds.append(fold_name)
         coverages.append(coverage)
         print(f'  {fold_name}: {coverage["n_matched_to_audit"]:,}/'
               f'{coverage["n_rows"]:,} rows matched, '
@@ -576,7 +579,7 @@ def main(argv=None):
         long_form = os.path.join(args.output_dir,
                                  f'carryforward_{stem}_per_fold.csv')
         pd.concat([pd.DataFrame(rows).assign(fold=fold)
-                   for rows, fold in zip(per_fold, fold_names)]
+                   for rows, fold in zip(per_fold, used_folds)]
                   ).to_csv(long_form, index=False)
         print(f'Wrote {by_label}\nWrote {long_form}')
 
