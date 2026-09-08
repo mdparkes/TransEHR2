@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """Histogram the pre-admission record count and the gap to ICU admission.
 
-Two panels over the episodes carrying at least one pre-admission record in either stream --
-the `any` set of `plot_history_text_venn.py`. Episodes are indexed to a patient's last ICU
-stay, one episode per patient, so the population is the same object either way.
+Two panels over the episodes carrying at least one pre-admission value-associated record --
+the `readable` set of `plot_history_text_venn.py`, and `has_value_history` in
+`TransEHR2.data.cohorts`. Episodes are indexed to a patient's last ICU stay, one episode per
+patient, so the population is the same object counted either way.
 
     count  value-stream pre-admission records per episode
-    gap    hours from the most recent pre-admission record to ICU admission (t = 0)
+    gap    hours from the most recent pre-admission value record to ICU admission (t = 0)
 
-The count is value-stream only because that is the stream the model reads: `collate_tensorized`
-slices the history region off the event stream before the batch is built, so no pre-admission
-event reaches the encoder. The population is still the either-stream set, so episodes whose
-only history is an event record carry a value count of zero and occupy the first bar; their
-number is reported separately, because that bar is otherwise read as a contradiction of the
-population definition.
+Both the population and the count are value-stream only, because that is the whole of the
+history the models read: `collate_tensorized` slices the history region off the event stream
+before the batch is built, so no pre-admission event reaches the encoder and the event stream
+contributes only in-stay records. An episode whose sole history is an event record is therefore
+outside the population rather than a zero in it; the number excluded that way is reported, so
+the difference from the either-stream `any` set stays visible.
 
 Extraction keeps at most `MAX_HISTORY_LEN_STEPS` records per stream, dropping the oldest, so
 the count is right-censored. The final bin is therefore left-closed at that width and labelled
@@ -47,18 +48,19 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
 import numpy as np
 
-from TransEHR2.data.cohorts import has_any_history, history_observed
+from TransEHR2.data.cohorts import (has_any_history, has_value_history,
+                                   history_observed)
 from TransEHR2.data.preprocessing import load_dataset, load_episode_ids
 
 
 COUNT_COLOUR = '#4878a8'
 GAP_COLOUR = '#c0653a'
 
-# (label, lower, upper) with integer bounds inclusive. The final entry's upper is None: it is
-# the censored bin, and its lower bound is replaced by the extraction's history width so the
-# label cannot claim a limit the data does not have.
+# (label, lower, upper) with integer bounds inclusive. There is no zero bin: the population is
+# defined by carrying at least one value record, and a bar that cannot be nonzero is noise. The
+# final entry's upper is None -- it is the censored bin, and its lower bound is replaced by the
+# extraction's history width so the label cannot claim a limit the data does not have.
 COUNT_BINS = [
-    ('0', 0, 0),
     ('1', 1, 1),
     ('2-5', 2, 5),
     ('6-10', 6, 10),
@@ -194,8 +196,8 @@ def collect_partition(data_dir: str, fold: str, split: str,
         'val_count': val_count,
         'val_latest': val_latest,
         'event_latest': event_latest,
-        'in_cohort': has_any_history(dataset.val_masks, dataset.event_masks, hist),
-        'has_value_history': val_observed.any(axis=1),
+        'in_value': has_value_history(dataset.val_masks, hist),
+        'in_any': has_any_history(dataset.val_masks, dataset.event_masks, hist),
         'hist': hist,
     }
 
@@ -219,7 +221,7 @@ def collect(data_dir: str, folds, splits, extracted_history_len_steps=None) -> d
             widths.add(part.pop('hist'))
             parts.append(part)
             print(f'  {fold}/{split}: {len(part["val_count"])} episodes, '
-                  f'{int(part["in_cohort"].sum())} with history')
+                  f'{int(part["in_value"].sum())} with value history')
     if not parts:
         raise SystemExit('No partitions were read. Check --data_dir, --folds and --splits.')
     if len(widths) > 1:
@@ -305,7 +307,8 @@ def draw(count_rows, gap_rows, n_episodes: int, output: str, title: str) -> None
 
     if title:
         fig.suptitle(title)
-    fig.text(0.5, -0.02, f'n = {n_episodes:,} episodes with at least one pre-admission record',
+    fig.text(0.5, -0.02,
+             f'n = {n_episodes:,} episodes with at least one pre-admission value record',
              ha='center', fontsize=9, color='#555555')
     fig.tight_layout()
     os.makedirs(os.path.dirname(output) or '.', exist_ok=True)
@@ -313,23 +316,23 @@ def draw(count_rows, gap_rows, n_episodes: int, output: str, title: str) -> None
     print(f'Wrote {output}')
 
 
-def report(data: dict, count_rows, gap_rows, gap_values: np.ndarray) -> None:
+def report(data: dict, count_rows, gap_rows, gap_values: np.ndarray,
+           event_only: int) -> None:
     """Print the population, the two binnings and the quantiles behind them.
 
-    The two panels have different denominators whenever `--gap_stream value` drops the
-    event-only episodes, so each set of shares is taken against its own panel's total.
+    The two panels have different denominators whenever `--gap_stream any` reaches past the value
+    stream, so each set of shares is taken against its own panel's total.
     """
     n = len(data['val_count'])
     n_gap = len(gap_values)
-    zero_value = int(np.count_nonzero(~data['has_value_history']))
 
     print()
-    print(f'Episodes with at least one pre-admission record : {n:,}')
-    print(f'  with at least one value-stream record         : {n - zero_value:,}')
-    print(f'  event-stream history only, value count is 0   : {zero_value:,}')
+    print(f'Episodes with a pre-admission value record      : {n:,}')
+    print(f'  excluded, history in the event stream only    : {event_only:,}')
+    print(f'  either-stream population for comparison       : {n + event_only:,}')
     print(f'History region width (records per stream)       : {data["hist"]}')
     if n_gap != n:
-        print(f'Episodes with a measurable gap                  : {n_gap:,}')
+        print(f'Episodes with a measurable gap                 : {n_gap:,}')
 
     counts = data['val_count']
     print()
@@ -365,11 +368,11 @@ def main(argv=None):
                              'double counts, and the run stops if it detects that.')
     parser.add_argument('--splits', nargs='+', default=['train', 'val', 'test'],
                         help='Partitions within each fold (default: train val test)')
-    parser.add_argument('--gap_stream', choices=('any', 'value'), default='any',
+    parser.add_argument('--gap_stream', choices=('value', 'any'), default='value',
                         help='Which stream supplies the most recent pre-admission record. '
-                             '"any" takes the later of the two, so every episode in the '
-                             'population has a gap; "value" restricts it to what the model '
-                             'reads and leaves the event-only episodes undefined.')
+                             '"value" is what the models read and matches the population. '
+                             '"any" takes the later of the two streams, which can be an event '
+                             'record the models never see.')
     parser.add_argument('--output', default='tables/history_distributions.png',
                         help='Figure path; the extension picks the format')
     parser.add_argument('--csv', default=None, help='Also write the bin counts to this CSV')
@@ -378,8 +381,9 @@ def main(argv=None):
                         help='Width of the history region in the extracted arrays. Only needed '
                              'for datasets written before the layout was recorded in metadata.')
     parser.add_argument('--expect_n', type=int, default=None,
-                        help='Population size to check against, e.g. the "any" count in '
-                             'tables/history_text_venn.csv. Mismatches stop the run.')
+                        help='Population size to check against, i.e. the "readable by the '
+                             'model" line of plot_history_text_venn.py. Mismatches stop the '
+                             'run.')
     parser.add_argument('--no-figure', action='store_true',
                         help='Print the binnings without drawing anything')
     args = parser.parse_args(argv)
@@ -389,10 +393,14 @@ def main(argv=None):
     data = collect(args.data_dir, args.folds, args.splits,
                    args.extracted_history_len_steps)
 
-    keep = data['in_cohort']
+    event_only = int(np.count_nonzero(data['in_any'] & ~data['in_value']))
+    keep = data['in_value']
     data = {key: (value[keep] if isinstance(value, np.ndarray) else value)
             for key, value in data.items()}
     n = int(keep.sum())
+    if data['val_count'].size and int(data['val_count'].min()) < 1:
+        raise SystemExit('an episode in the population holds no value record, so the count '
+                         'bins do not start low enough.')
     if args.expect_n is not None and n != args.expect_n:
         raise SystemExit(
             f'the population holds {n:,} episodes but --expect_n is {args.expect_n:,}. '
@@ -416,7 +424,7 @@ def main(argv=None):
 
     count_rows = bin_counts(data['val_count'], count_bins(data['hist']))
     gap_rows = bin_counts(gap_values, GAP_BINS)
-    report(data, count_rows, gap_rows, gap_values)
+    report(data, count_rows, gap_rows, gap_values, event_only)
 
     if sum(value for _, value in count_rows) != n:
         raise SystemExit('the count bins do not cover every episode.')
