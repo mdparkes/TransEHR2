@@ -1,23 +1,29 @@
 #!/usr/bin/env python3
 """Count patients by the kind of pre-admission record they carry, and draw the diagram.
 
-Three sets, over patients rather than episodes -- a patient qualifies if any of their
+Four sets, over patients rather than episodes -- a patient qualifies if any of their
 episodes carries the record:
 
     summary    at least one pre-admission discharge summary
     diagnosis  at least one pre-admission diagnosis description
     any        at least one pre-admission record of any kind, value or event stream
+    all        every patient in the extraction, with or without a pre-admission record
 
 Text records share the value stream's timestep axis and are found by intersecting that
 stream's observed history with the feature's presence indicator, so `summary` and `diagnosis`
-are subsets of `any` by construction. The figure is therefore an Euler diagram -- two circles
-inside a third -- rather than a three-circle Venn with four empty regions. The script checks
-the containment rather than assuming it.
+are subsets of `any`, which is in turn a subset of `all`. The figure is therefore an Euler
+diagram -- two circles inside a third, inside a fourth -- rather than a Venn with empty
+regions. The script checks the text containment rather than assuming it.
+
+Drawing `all` puts the denominator the other counts are read against into the figure: the
+patients carrying no pre-admission record occupy the outermost ring, so the share of the
+cohort each inner circle covers can be read off rather than computed from a caption.
 
 Circle areas are proportional to set size, and the distance between the two text circles is
-solved so their overlap is proportional too. When the inner pair cannot fit inside the outer
-circle at that scale, they are shrunk together and the figure says so; every region carries
-its own count either way.
+solved so their overlap is proportional too. The cohort and history circles are concentric,
+their nesting being exact. When the text pair cannot fit inside the history circle at that
+scale, they are shrunk together and the figure says so; every region carries its own count
+either way.
 
 Usage:
     python plot_history_text_venn.py --data_dir data/ --output tables/history_text_venn.png
@@ -48,7 +54,14 @@ SUMMARY_INDEX = 0
 DIAGNOSIS_INDEX = 1
 
 CIRCLE_COLOURS = ('#4878a8', '#c0653a')
-OUTER_COLOUR = '#8a8a8a'
+ANY_COLOUR = '#8a8a8a'
+ALL_COLOUR = '#b8b8b8'
+
+# A ring thinner than this, in units of the cohort circle's radius, cannot hold a count, so
+# the count is placed outside the figure on a leader line instead.
+MIN_RING_LABEL_GAP = 0.14
+# How far beyond the cohort circle such a label sits.
+RING_LABEL_OFFSET = 0.20
 
 
 def patient_ids(data_dir: str, fold: str, split: str, n_episodes: int) -> np.ndarray:
@@ -167,6 +180,79 @@ def solve_distance(r1: float, r2: float, target: float) -> float:
     return 0.5 * (low + high)
 
 
+def layout(counts: dict) -> dict:
+    """Circle radii and centres for the figure, in units of the cohort circle's radius.
+
+    The cohort circle is fixed at radius 1 and every other circle is sized from it by area, so
+    a radius is the square root of that set's share of the cohort. The cohort and history
+    circles are concentric: every patient with history is a patient, so that nesting is exact
+    and needs no solving, and concentric circles leave a ring of even width to label. The two
+    text circles are placed on the x axis at the separation that makes their overlap
+    proportional too, and the pair is then centred.
+
+    Args:
+        counts: Region counts from `region_counts`.
+
+    Returns:
+        Dict with 'all_r' and 'any_r', the two text circles as (centre_x, radius) under
+        'summary' and 'diagnosis', and 'to_scale' -- False when the text pair had to be shrunk
+        to fit inside the history circle.
+    """
+    n_all, n_any = counts['all'], counts['any']
+    scale = 1.0 / math.sqrt(n_all) if n_all else 1.0
+    all_r = 1.0
+    any_r = math.sqrt(n_any) * scale
+    r_sum = math.sqrt(counts['summary']) * scale
+    r_diag = math.sqrt(counts['diagnosis']) * scale
+    separation = solve_distance(r_sum, r_diag, math.pi * counts['both'] * scale ** 2)
+
+    x_sum, x_diag = -separation / 2.0, separation / 2.0
+    shift = -0.5 * ((x_sum - r_sum) + (x_diag + r_diag))
+    x_sum += shift
+    x_diag += shift
+
+    # The text pair may not fit inside the history circle even though the sets nest, since
+    # equal areas do not imply a containing arrangement. Shrink the pair together and report
+    # it rather than drawing a circle that spills outside its own superset.
+    reach = max(abs(x_sum) + r_sum, abs(x_diag) + r_diag)
+    to_scale = reach <= any_r
+    if not to_scale and reach > 0:
+        squeeze = 0.97 * any_r / reach
+        x_sum, x_diag = x_sum * squeeze, x_diag * squeeze
+        r_sum, r_diag = r_sum * squeeze, r_diag * squeeze
+
+    return {'all_r': all_r, 'any_r': any_r, 'summary': (x_sum, r_sum),
+            'diagnosis': (x_diag, r_diag), 'to_scale': to_scale}
+
+
+def ring_label(ax, value: int, inner_r: float, outer_r: float, side: int) -> bool:
+    """Label a ring-shaped region on the vertical axis, above or below the centre.
+
+    Args:
+        ax: Axes to draw on.
+        value: Count to print. A region with no patients gets no label.
+        inner_r: Radius of the ring's inner boundary.
+        outer_r: Radius of its outer boundary.
+        side: +1 to label above the centre, -1 to label below.
+
+    Returns:
+        True if the ring was too thin to hold the count and it was placed outside the figure
+        on a leader line, which the axis limits have to make room for.
+    """
+    if value <= 0:
+        return False
+    midpoint = side * 0.5 * (inner_r + outer_r)
+    if outer_r - inner_r >= MIN_RING_LABEL_GAP:
+        ax.text(0, midpoint, f'{value:,}', ha='center', va='center', fontsize=12,
+                color='#333333')
+        return False
+    ax.annotate(f'{value:,}', xy=(0, midpoint),
+                xytext=(0, side * (1.0 + RING_LABEL_OFFSET)), ha='center',
+                va='bottom' if side > 0 else 'top', fontsize=12, color='#333333',
+                arrowprops=dict(arrowstyle='-', color='#777777', linewidth=0.8))
+    return True
+
+
 def draw(counts: dict, output: str, title: str) -> None:
     """Render the Euler diagram and write it to `output`.
 
@@ -175,41 +261,24 @@ def draw(counts: dict, output: str, title: str) -> None:
         output: Destination path; the extension picks the format.
         title: Figure title.
     """
-    n_any, n_sum, n_diag = counts['any'], counts['summary'], counts['diagnosis']
-    n_both = counts['both']
+    n_all, n_any = counts['all'], counts['any']
+    n_sum, n_diag, n_both = counts['summary'], counts['diagnosis'], counts['both']
 
-    # Radii from areas, with the outer circle fixed at 1, then the centre distance that makes
-    # the overlap proportional too.
-    scale = 1.0 / math.sqrt(n_any) if n_any else 1.0
-    outer_r = 1.0
-    r_sum = math.sqrt(n_sum) * scale
-    r_diag = math.sqrt(n_diag) * scale
-    separation = solve_distance(r_sum, r_diag, math.pi * n_both * scale ** 2)
-
-    # Place the pair on the x axis with their union centred in the outer circle.
-    x_sum, x_diag = -separation / 2.0, separation / 2.0
-    shift = -0.5 * ((x_sum - r_sum) + (x_diag + r_diag))
-    x_sum += shift
-    x_diag += shift
-
-    # The pair may not fit inside the outer circle even though the sets nest, since equal
-    # areas do not imply a containing arrangement. Shrink together and say so rather than
-    # drawing a circle that spills outside its own superset.
-    reach = max(abs(x_sum) + r_sum, abs(x_diag) + r_diag)
-    to_scale = reach <= outer_r
-    if not to_scale and reach > 0:
-        squeeze = 0.97 * outer_r / reach
-        x_sum, x_diag = x_sum * squeeze, x_diag * squeeze
-        r_sum, r_diag = r_sum * squeeze, r_diag * squeeze
+    geometry = layout(counts)
+    all_r, r_any = geometry['all_r'], geometry['any_r']
+    (x_sum, r_sum), (x_diag, r_diag) = geometry['summary'], geometry['diagnosis']
+    to_scale = geometry['to_scale']
 
     fig, ax = plt.subplots(figsize=(7.0, 7.4))
-    outer = plt.Circle((0, 0), outer_r, facecolor=OUTER_COLOUR, alpha=0.18,
-                       edgecolor=OUTER_COLOUR, linewidth=1.4)
+    cohort = plt.Circle((0, 0), all_r, facecolor=ALL_COLOUR, alpha=0.16,
+                        edgecolor=ANY_COLOUR, linewidth=1.4)
+    history = plt.Circle((0, 0), r_any, facecolor=ANY_COLOUR, alpha=0.20,
+                         edgecolor=ANY_COLOUR, linewidth=1.4)
     circle_sum = plt.Circle((x_sum, 0), r_sum, facecolor=CIRCLE_COLOURS[0], alpha=0.45,
                             edgecolor=CIRCLE_COLOURS[0], linewidth=1.4)
     circle_diag = plt.Circle((x_diag, 0), r_diag, facecolor=CIRCLE_COLOURS[1], alpha=0.45,
                              edgecolor=CIRCLE_COLOURS[1], linewidth=1.4)
-    for patch in (outer, circle_sum, circle_diag):
+    for patch in (cohort, history, circle_sum, circle_diag):
         ax.add_patch(patch)
 
     # Disjoint region counts, each at the midpoint of its own span along y = 0, so the three
@@ -224,23 +293,19 @@ def draw(counts: dict, output: str, title: str) -> None:
             ax.text(0.5 * (left + right), 0, f'{value:,}',
                     ha='center', va='center', fontsize=12)
 
-    # History but no text lives in the annulus. Put it in the gap below the inner pair when
-    # that gap is tall enough to hold the text, and outside on a leader line when it is not.
-    inner_bottom = -max(r_sum, r_diag)
-    gap = inner_bottom - (-outer_r)
-    if counts['any_only'] > 0:
-        if gap >= 0.14 * outer_r:
-            ax.text(0, 0.5 * (inner_bottom - outer_r), f"{counts['any_only']:,}",
-                    ha='center', va='center', fontsize=12, color='#333333')
-        else:
-            y_edge = -outer_r + 0.5 * gap
-            ax.annotate(f"{counts['any_only']:,}", xy=(0, y_edge),
-                        xytext=(0, -outer_r - 0.20), ha='center', va='top', fontsize=12,
-                        color='#333333',
-                        arrowprops=dict(arrowstyle='-', color='#777777', linewidth=0.8))
+    # The two ring-shaped regions, labelled on opposite sides of the centre. Either can be too
+    # thin for its count -- the no-history ring usually is, most patients having some history
+    # -- and putting them on opposite sides keeps a leader line from the inner ring off the
+    # outer ring's label. The inner boundary of the history-but-no-text ring is taken as the
+    # lowest extent of either text circle, which is at or below where the union actually
+    # crosses x = 0.
+    leader_below = ring_label(ax, counts['any_only'], max(r_sum, r_diag), r_any, -1)
+    leader_above = ring_label(ax, counts['no_history'], r_any, all_r, +1)
 
     handles = [
-        Patch(facecolor=OUTER_COLOUR, alpha=0.18, edgecolor=OUTER_COLOUR,
+        Patch(facecolor=ALL_COLOUR, alpha=0.16, edgecolor=ANY_COLOUR,
+              label=f'All patients  ({n_all:,})'),
+        Patch(facecolor=ANY_COLOUR, alpha=0.20, edgecolor=ANY_COLOUR,
               label=f'Any pre-admission record  ({n_any:,})'),
         Patch(facecolor=CIRCLE_COLOURS[0], alpha=0.45, edgecolor=CIRCLE_COLOURS[0],
               label=f'Discharge summary  ({n_sum:,})'),
@@ -250,16 +315,14 @@ def draw(counts: dict, output: str, title: str) -> None:
     ax.legend(handles=handles, loc='upper center', bbox_to_anchor=(0.5, 0.0),
               frameon=False, fontsize=10, handlelength=1.4, borderpad=0.2)
 
-    caption = (f"{counts['all']:,} patients; {counts['no_history']:,} with no pre-admission "
-               f"record. Areas are proportional to patient counts.")
+    caption = 'Areas are proportional to patient counts.'
     if not to_scale:
-        caption = (f"{counts['all']:,} patients; {counts['no_history']:,} with no "
-                   f"pre-admission record.\nInner circles scaled to fit; their areas are not "
-                   f"proportional to the outer circle.")
+        caption = ('The two text circles are scaled to fit; their areas are not proportional '
+                   'to the circles containing them.')
     fig.text(0.5, 0.02, caption, ha='center', va='bottom', fontsize=9, color='#555555')
 
     ax.set_xlim(-1.15, 1.15)
-    ax.set_ylim(-1.30, 1.15)
+    ax.set_ylim(-1.30 if leader_below else -1.15, 1.35 if leader_above else 1.15)
     ax.set_aspect('equal')
     ax.axis('off')
     if title:
