@@ -76,7 +76,8 @@ import pandas as pd
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-from TransEHR2.data.cohorts import COHORTS, cohort_indices
+from TransEHR2.data.cohorts import (COHORTS, DIAGNOSIS_DESCRIPTIONS_INDEX,
+                                    cohort_indices)
 from TransEHR2.data.preprocessing import load_episode_ids
 
 TEXT_FEATURE = 'Diagnosis Descriptions'
@@ -143,29 +144,40 @@ def listfile_path(fold_dir, name, unfiltered):
     return path
 
 
-def cohort_episode_id_set(data_dir, fold_names, cohort, manifest):
-    """Patient-episode IDs a cohort keeps, unioned over every fold and partition.
+def retained_dx_records(data_dir, fold_names, cohort, manifest):
+    """Per episode, how many pre-admission diagnosis records extraction kept.
 
-    Cohort membership is a property of an episode's extracted arrays, so an
-    episode's status is the same wherever it lands in the cross-validation
-    splits; taking the union simply collects every episode that was extracted
-    somewhere. Delegates the predicate itself to `TransEHR2.data.cohorts`, so
-    this selects exactly what an experiment configured the same way selects.
+    This is read from the extracted arrays, not inferred from the source CSVs.
+    A timestep in the history region counts when it is observed in `val_masks`
+    and carries the diagnosis-descriptions text feature in
+    `val_text_indicators` -- the same two conditions
+    `TransEHR2.data.cohorts.has_historical_text` reduces with `any`, so an
+    episode has a positive count exactly when it belongs to the
+    `diagnosis_history` cohort. Nothing here approximates the pre-admission
+    window: the arrays already are the window.
+
+    Cohort membership is a property of an episode's arrays, so an episode's
+    count is the same wherever the cross-validation splits place it; the union
+    over folds and partitions simply collects every extracted episode.
 
     Args:
         data_dir: Root directory holding the fold subdirectories.
         fold_names: Fold directory names to scan.
-        cohort: A name in `COHORTS`, or None.
+        cohort: A name in `COHORTS` restricting which episodes are collected,
+            or None for every extracted episode.
         manifest: An explicit episode manifest, or None.
 
     Returns:
-        Set of patient-episode IDs, or None when no restriction is requested.
-    """
-    if cohort is None and manifest is None:
-        return None
+        Dict mapping patient-episode ID to the number of retained
+        pre-admission diagnosis records.
 
-    selected = set()
+    Raises:
+        FileNotFoundError: If no extracted partition can be read.
+        ValueError: If an extraction does not record its history/in-stay split.
+    """
+    counts = {}
     partitions_read = 0
+
     for fold_name in fold_names:
         for partition in ('train', 'val', 'test'):
             part_dir = os.path.join(data_dir, fold_name, partition)
@@ -178,37 +190,52 @@ def cohort_episode_id_set(data_dir, fold_names, cohort, manifest):
                 continue
 
             def load_mmap(name):
-                return np.load(os.path.join(part_dir, f'{name}.npy'), mmap_mode='r')
+                return np.load(os.path.join(part_dir, f'{name}.npy'),
+                               mmap_mode='r')
 
             with open(os.path.join(part_dir, 'metadata.pkl'), 'rb') as handle:
                 metadata = pickle.load(handle)
             max_history = metadata.get('max_history_len_steps')
             if max_history is None:
                 raise ValueError(
-                    f'{part_dir}/metadata.pkl does not record max_history_len_steps, so '
-                    'cohort membership cannot be computed against this extraction.'
+                    f'{part_dir}/metadata.pkl does not record '
+                    'max_history_len_steps, so the pre-admission window of the '
+                    'extracted arrays is unknown.'
                 )
+            max_history = int(max_history)
+
+            val_masks = load_mmap('val_masks')
+            indicators = load_mmap('val_text_indicators')
 
             indices = cohort_indices(
                 {
-                    'val_masks': load_mmap('val_masks'),
-                    'val_text_indicators': load_mmap('val_text_indicators'),
-                    'max_history_len_steps': int(max_history),
+                    'val_masks': val_masks,
+                    'val_text_indicators': indicators,
+                    'max_history_len_steps': max_history,
                 },
                 cohort,
                 episode_ids=episode_ids,
                 manifest=manifest,
             )
-            kept = episode_ids if indices is None else episode_ids[indices]
-            selected.update(int(i) for i in kept)
+
+            observed = np.asarray(val_masks[:, :max_history]) > 0
+            present = np.asarray(
+                indicators[:, :max_history, DIAGNOSIS_DESCRIPTIONS_INDEX]
+            ) > 0
+            retained = (observed & present).sum(axis=1)
+
+            keep = range(len(episode_ids)) if indices is None else indices
+            for row in keep:
+                counts[int(episode_ids[row])] = int(retained[row])
             partitions_read += 1
 
     if not partitions_read:
         raise FileNotFoundError(
-            f'no extracted partitions found under {data_dir} for folds {fold_names}, so '
-            'the cohort cannot be resolved. Extract the data first, or drop --cohort.'
+            f'no extracted partitions found under {data_dir} for folds '
+            f'{fold_names}. The audit is computed on the episodes the models '
+            'ran on, which is read from the extracted arrays.'
         )
-    return selected
+    return counts
 
 
 def episode_key(path):
@@ -299,104 +326,62 @@ def build_title_to_groups(diagnoses_df, code_to_groups):
     return title_to_groups
 
 
-def resolve_history_columns(episode_csv_path, feature_names):
-    """Columns that decide which timesteps enter the extraction's merged frame.
+def historical_titles(episode_csv_path, n_retained):
+    """The ICD long titles of the pre-admission diagnosis records the model saw.
 
-    `filter_timeseries_records` truncates the outer merge of the
-    value-associated and text features, having first dropped rows that are
-    empty across each. Timesteps carrying only event-associated features never
-    enter that ordering, so counting every row of the episode CSV would place
-    a diagnosis record further back than extraction does. Vector-valued
-    features occupy one column per dimension, named `feature_0`, `feature_1`
-    and so on, matching `MIMICDataReader._get_feature_column_names`.
+    `n_retained` comes from the extracted arrays and says how many
+    pre-admission diagnosis records survived extraction. Which records those
+    are follows without inference: extraction keeps a suffix of the
+    time-ordered pre-admission timesteps, so if a diagnosis record was kept
+    then every more recent diagnosis record was kept too. The retained set is
+    therefore exactly the `n_retained` most recent pre-admission diagnosis
+    records in the source CSV.
 
     Args:
-        episode_csv_path: Any episode CSV; the schema is shared across episodes.
-        feature_names: Base names of the value-associated and text features.
+        episode_csv_path: Path to episodeX.csv; the timeseries beside it is read.
+        n_retained: Number of pre-admission diagnosis records extraction kept.
 
     Returns:
-        List of column names, empty if the header cannot be read.
+        Tuple of (titles, n_records, n_records_in_source, status). `titles` and
+        `n_records` cover the retained records; `n_records_in_source` is how
+        many the CSV holds, so what the window discarded can be reported.
+        `status` is 'ok', 'missing_timeseries', 'missing_column', or
+        'fewer_records_than_arrays' when the CSV holds fewer diagnosis records
+        than the arrays retained, which would mean the two disagree about the
+        episode.
     """
     ts_path = re.sub(r'\.csv$', '_timeseries.csv', str(episode_csv_path))
     try:
-        header = pd.read_csv(ts_path, nrows=0)
-    except (FileNotFoundError, ValueError):
-        return []
-    columns = []
-    for base in feature_names:
-        pattern = re.compile(f'^{re.escape(base)}(_\\d+)?$')
-        columns.extend(column for column in header.columns
-                       if pattern.match(column))
-    return columns
-
-
-def historical_titles(episode_csv_path):
-    """Return the ICD long titles in an episode's pre-admission diagnosis text.
-
-    Extraction keeps only the most recent `max_history_len_steps` pre-admission
-    timesteps, so a diagnosis record further back than that exists in the
-    source CSV but never reaches the model. Both figures are returned: the
-    truncated one is what the model could have read, and the untruncated one is
-    what the source data holds, so the difference between them can be reported
-    rather than assumed negligible.
-
-    Returns:
-        Tuple of (titles, n_text_records, titles_all, n_text_records_all,
-        status), where the first pair is confined to the retained window and
-        the second covers every pre-admission record. `status` is 'ok',
-        'missing_timeseries' or 'missing_column'.
-    """
-    limit = _HISTORY_LIMIT
-    columns = _HISTORY_COLUMNS
-
-    ts_path = re.sub(r'\.csv$', '_timeseries.csv', str(episode_csv_path))
-    wanted = {'Hours', TEXT_FEATURE, *columns}
-    try:
-        df = pd.read_csv(ts_path, usecols=lambda column: column in wanted)
+        df = pd.read_csv(ts_path, usecols=['Hours', TEXT_FEATURE])
     except FileNotFoundError:
-        return [], 0, [], 0, 'missing_timeseries'
-    if 'Hours' not in df.columns or TEXT_FEATURE not in df.columns:
-        return [], 0, [], 0, 'missing_column'
+        return [], 0, 0, 'missing_timeseries'
+    except ValueError:
+        # usecols raises ValueError when a requested column is absent
+        return [], 0, 0, 'missing_column'
 
     history = df.loc[df['Hours'] < 0].sort_values('Hours')
+    text = history[TEXT_FEATURE].dropna().astype(str).str.strip()
+    text = text[text != '']
+    n_in_source = int(len(text))
 
-    # Restrict to the timesteps extraction would have ordered, so that the
-    # window counts the same records it does.
-    present = [column for column in columns if column in history.columns]
-    if present:
-        history = history.dropna(how='all', subset=present)
+    if n_retained > n_in_source:
+        return [], 0, n_in_source, 'fewer_records_than_arrays'
 
-    def titles_of(frame):
-        text = frame[TEXT_FEATURE].dropna().astype(str).str.strip()
-        text = text[text != '']
-        titles = []
-        for value in text:
-            titles.extend(t.strip() for t in value.split('|') if t.strip())
-        return titles, int(len(text))
-
-    titles_all, n_all = titles_of(history)
-    if limit is not None and len(history) > limit:
-        titles, n_kept = titles_of(history.iloc[-limit:])
-    else:
-        titles, n_kept = titles_all, n_all
-
-    return titles, n_kept, titles_all, n_all, 'ok'
+    retained = text.iloc[len(text) - n_retained:] if n_retained else text.iloc[0:0]
+    titles = []
+    for value in retained:
+        titles.extend(t.strip() for t in value.split('|') if t.strip())
+    return titles, int(len(retained)), n_in_source, 'ok'
 
 
 # The ICD code -> phenotype group lookup holds ~90k entries. It is shared with
 # the workers once at pool start-up rather than pickled with every task.
 _CODE_TO_GROUPS = {}
-# Extraction's pre-admission window, and the columns that decide which
-# timesteps it orders. None disables truncation.
-_HISTORY_LIMIT = None
-_HISTORY_COLUMNS = ()
 
 
-def _init_worker(code_to_groups, history_limit=None, history_columns=()):
-    global _CODE_TO_GROUPS, _HISTORY_LIMIT, _HISTORY_COLUMNS
+def _init_worker(code_to_groups):
+    global _CODE_TO_GROUPS
     _CODE_TO_GROUPS = code_to_groups
-    _HISTORY_LIMIT = history_limit
-    _HISTORY_COLUMNS = tuple(history_columns)
 
 
 def audit_patient(task):
@@ -431,9 +416,9 @@ def audit_patient(task):
         n_stays = None
 
     results = []
-    for key, episode_number in episode_records:
-        (titles, n_text_records, titles_all, n_text_records_all,
-         status) = historical_titles(key)
+    for key, episode_number, n_retained in episode_records:
+        (titles, n_text_records, n_records_in_source,
+         status) = historical_titles(key, n_retained)
         unique_titles = set(titles)
         groups = set()
         n_unmapped_titles = 0
@@ -450,9 +435,8 @@ def audit_patient(task):
             'is_last_stay': None if n_stays is None else bool(episode_number == n_stays),
             'status': status,
             'n_historical_dx_records': n_text_records,
-            'n_historical_dx_records_untruncated': n_text_records_all,
+            'n_historical_dx_records_in_source': n_records_in_source,
             'n_historical_dx_titles': len(titles),
-            'n_historical_dx_titles_untruncated': len(titles_all),
             'n_unique_historical_dx_titles': len(unique_titles),
             'n_unmapped_historical_dx_titles': n_unmapped_titles,
             'historical_groups': groups,
@@ -460,12 +444,21 @@ def audit_patient(task):
     return results
 
 
-def run_audit(episodes, code_to_groups, n_workers, history_limit=None,
-              history_columns=()):
-    """Audit all episodes, grouping the work by patient."""
+def run_audit(episodes, code_to_groups, n_workers, retained):
+    """Audit all episodes, grouping the work by patient.
+
+    Args:
+        episodes: Mapping from episode key to (patient id, episode number).
+        code_to_groups: ICD code to phenotype group lookup.
+        n_workers: Parallel worker processes.
+        retained: Mapping from patient-episode ID to the number of
+            pre-admission diagnosis records extraction kept.
+    """
     by_patient = defaultdict(list)
     for key, (pt_id, ep_num) in episodes.items():
-        by_patient[os.path.dirname(key)].append((key, ep_num))
+        by_patient[os.path.dirname(key)].append(
+            (key, ep_num, retained[pt_id * 1000 + ep_num])
+        )
 
     tasks = [
         (patient_dir, sorted(records))
@@ -474,7 +467,7 @@ def run_audit(episodes, code_to_groups, n_workers, history_limit=None,
 
     results = []
     if n_workers <= 1:
-        _init_worker(code_to_groups, history_limit, history_columns)
+        _init_worker(code_to_groups)
         for i, task in enumerate(tasks, 1):
             results.extend(audit_patient(task))
             if i % 500 == 0:
@@ -482,7 +475,7 @@ def run_audit(episodes, code_to_groups, n_workers, history_limit=None,
     else:
         with ProcessPoolExecutor(
             max_workers=n_workers, initializer=_init_worker,
-            initargs=(code_to_groups, history_limit, history_columns)
+            initargs=(code_to_groups,)
         ) as executor:
             futures = [executor.submit(audit_patient, task) for task in tasks]
             for i, future in enumerate(as_completed(futures), 1):
@@ -618,24 +611,19 @@ def tabulate(results, labels, phenotype_names, merge_synonyms=False):
          int(audited['n_unmapped_historical_dx_titles'].sum()) if len(audited) else 0),
     ]
 
-    if len(audited) and 'n_historical_dx_records_untruncated' in audited.columns:
-        # What the pre-admission window removed. A stay that loses every
-        # diagnosis record has text in the source data that the model never
-        # saw, and would be counted as carrying history by an audit that
-        # ignored the window.
-        had_any = audited['n_historical_dx_records_untruncated'] > 0
-        lost_all = had_any & (audited['n_historical_dx_records'] == 0)
-        # Counts any loss, so it includes the stays that lost every title.
-        lost_any = (audited['n_historical_dx_titles_untruncated']
-                    > audited['n_historical_dx_titles'])
-        dropped = int((audited['n_historical_dx_titles_untruncated']
-                       - audited['n_historical_dx_titles']).sum())
+    if len(audited) and 'n_historical_dx_records_in_source' in audited.columns:
+        # What the pre-admission window left out. Every audited episode has at
+        # least one retained record by construction, so this is about records
+        # beyond the window rather than about episodes dropped by it.
+        in_source = audited['n_historical_dx_records_in_source']
+        kept = audited['n_historical_dx_records']
         summary_rows += [
-            ('stays_with_dx_text_before_truncation', int(had_any.sum())),
-            ('stays_losing_all_dx_text_to_truncation', int(lost_all.sum())),
-            ('stays_losing_any_dx_titles_to_truncation', int(lost_any.sum())),
-            ('dx_titles_dropped_by_truncation', dropped),
+            ('dx_records_retained', int(kept.sum())),
+            ('dx_records_in_source', int(in_source.sum())),
+            ('dx_records_beyond_window', int((in_source - kept).sum())),
+            ('stays_with_records_beyond_window', int((in_source > kept).sum())),
         ]
+
     if len(per_episode_df):
         for status, count in per_episode_df['status'].value_counts().items():
             if status != 'ok':
@@ -708,14 +696,6 @@ def main():
         help="Directory for the output CSV files (default: current directory)"
     )
     parser.add_argument(
-        '--no_truncate_history', action='store_true',
-        help="Count every pre-admission diagnosis record, including those "
-             "extraction discards. By default the audit keeps only the most "
-             "recent MAX_HISTORY_LEN_STEPS pre-admission timesteps, matching "
-             "what the model can actually read; this reports what the source "
-             "data holds instead."
-    )
-    parser.add_argument(
         '--cohort', type=str, default=None, choices=list(COHORTS),
         help="Restrict the audit to the episodes a named cohort keeps, so that it "
              "describes the population an experiment configured the same way ran on. "
@@ -754,10 +734,6 @@ def main():
     with open(args.dataset_config, 'r') as f:
         config = yaml.safe_load(f)
     data_dir = config['DATA_DIR']
-    history_limit = (None if args.no_truncate_history
-                     else config.get('MAX_HISTORY_LEN_STEPS'))
-    history_feature_names = (list(config.get('VALUED_FEATS', []))
-                             + list(config.get('TEXT_FEATS', [])))
 
     fold_names = discover_folds(data_dir, args.folds)
     if not fold_names:
@@ -779,52 +755,54 @@ def main():
           f"{len(phenotype_names)} phenotypes")
 
     n_listfile_stays = len(episodes)
-    cohort_ids = cohort_episode_id_set(data_dir, fold_names, args.cohort,
-                                       args.cohort_episodes)
-    if cohort_ids is not None:
-        label = args.cohort or 'manifest'
-        if args.cohort and args.cohort_episodes:
-            label = f'{args.cohort} + manifest'
-        episodes = {
-            key: value for key, value in episodes.items()
-            if value[0] * 1000 + value[1] in cohort_ids
-        }
-        labels = {key: value for key, value in labels.items() if key in episodes}
-        print(f"  cohort '{label}' keeps {len(episodes)} of {n_listfile_stays} stays "
-              f"({len(cohort_ids)} episodes in the cohort overall)")
-        if not episodes:
-            print('The cohort selects none of the listfile stays.', file=sys.stderr)
-            sys.exit(1)
 
-    # The episode CSVs share a schema, so the columns are resolved once.
-    history_columns = ()
-    if history_limit is not None and episodes:
-        history_columns = tuple(resolve_history_columns(
-            next(iter(episodes)), history_feature_names
-        ))
-        print(f"  pre-admission window: most recent {history_limit} timesteps "
-              f"ordered over {len(history_columns)} value and text columns")
-    else:
-        print("  pre-admission window: none, counting every historical record")
+    # The analysis cohort is settled by the extracted arrays, not by the source
+    # CSVs: the model cohort is what the experiments ran on, and the audit is
+    # computed on the episodes within it that carry at least one retained
+    # pre-admission diagnosis record. An episode with none cannot contribute a
+    # label the model could have read, so it is not part of the question.
+    retained = retained_dx_records(data_dir, fold_names, args.cohort,
+                                   args.cohort_episodes)
+    label = args.cohort or 'every extracted episode'
+    if args.cohort_episodes:
+        label = f'{label} + manifest' if args.cohort else 'manifest'
+
+    model_cohort = {
+        key: value for key, value in episodes.items()
+        if value[0] * 1000 + value[1] in retained
+    }
+    episodes = {
+        key: value for key, value in model_cohort.items()
+        if retained[value[0] * 1000 + value[1]] > 0
+    }
+    labels = {key: value for key, value in labels.items() if key in episodes}
+
+    n_model_cohort = len(model_cohort)
+    print(f"  model cohort '{label}': {n_model_cohort} of {n_listfile_stays} "
+          'listfile stays')
+    print(f'  of those, {len(episodes)} carry at least one retained '
+          'pre-admission diagnosis record and are audited')
+    if not episodes:
+        print('No episode in the cohort carries a retained pre-admission '
+              'diagnosis record.', file=sys.stderr)
+        sys.exit(1)
 
     print(f"\nAuditing historical diagnosis text with {args.n_workers} worker(s)...")
-    results = run_audit(episodes, code_to_groups, args.n_workers,
-                        history_limit, history_columns)
+    results = run_audit(episodes, code_to_groups, args.n_workers, retained)
 
     per_episode_df, by_phenotype_df, summary_df = tabulate(
         results, labels, phenotype_names, args.merge_synonymous_phenotypes
     )
 
-    window = 'none' if history_limit is None else int(history_limit)
     restriction = args.cohort or ''
     if args.cohort_episodes:
         restriction = (f'{restriction} + manifest' if restriction else 'manifest')
     summary_df = pd.concat([
         pd.DataFrame([
             ('cohort_restriction', restriction or 'none'),
-            ('history_window_steps', window),
             ('stays_in_listfiles', n_listfile_stays),
-            ('stays_after_cohort_restriction', len(episodes)),
+            ('stays_in_model_cohort', n_model_cohort),
+            ('pct_of_model_cohort_audited', pct(len(episodes), n_model_cohort)),
         ], columns=['metric', 'value']),
         summary_df,
     ], ignore_index=True)
