@@ -1248,9 +1248,9 @@ def collate_tensorized(
             ordinal and multilabel records in the history region
             [0, history_len_steps). Defaults to True.
         use_historical_text_records: If False, drop the text records in the
-            history region. All text is pre-admission, because the in-stay
-            window closes before a discharge summary can be written, so this
-            is the switch that removes text entirely. Defaults to True.
+            history region. Text at or after admission is dropped
+            unconditionally, so this is the switch that removes text entirely.
+            Defaults to True.
         use_instay_records: If False, drop every record from
             [history_len_steps, ...), leaving a history-only model. The event
             stream is in-stay by construction and is emptied with it.
@@ -1326,8 +1326,21 @@ def collate_tensorized(
             val_text_ind[:, history] = 0.0
         val_masks[:, history] *= _observed(nontext_ind + [val_text_ind], history).float()
 
+    # No text record at or after admission reaches the model, whatever the switches say.
+    # Every text feature is a discharge-time artifact of an admission -- a discharge summary
+    # and the diagnosis list that goes with it -- so a text record at a non-negative timestamp
+    # belongs to the stay being predicted and states its outcome. Extraction keeps whatever
+    # falls inside the episode window, and a stay shorter than that window has its own
+    # discharge documentation inside it, so the exclusion is enforced rather than assumed.
+    #
+    # Guarded on presence so that a batch carrying no in-stay text is left exactly as it was,
+    # rather than having its in-stay mask rebuilt for nothing.
+    in_stay = slice(history_len_steps, val_masks.shape[1])
+    if val_text_ind.shape[-1] > 0 and bool(val_text_ind[:, in_stay].any()):
+        val_text_ind[:, in_stay] = 0.0
+        val_masks[:, in_stay] *= _observed(nontext_ind + [val_text_ind], in_stay).float()
+
     if not use_instay_records:
-        in_stay = slice(history_len_steps, val_masks.shape[1])
         for tensor in nontext_ind + [val_text_ind]:
             tensor[:, in_stay] = 0.0
         val_masks[:, in_stay] = 0.0
@@ -1373,16 +1386,16 @@ def collate_tensorized(
             ]) if batch else torch.zeros(0, dtype=torch.int64)
             timesteps = torch.cat([b['val_text_embeddings'][f][0] for b in batch])
             values = torch.cat([b['val_text_embeddings'][f][1] for b in batch])
-            # The indicators above were cleared for the disabled regions; the embeddings are a
-            # separate sparse block and have to be filtered to match, or a dropped record would
-            # still reach the encoder through its embedding.
-            if not use_historical_text_records or not use_instay_records:
-                keep = torch.ones_like(timesteps, dtype=torch.bool)
-                if not use_historical_text_records:
-                    keep &= timesteps >= history_len_steps
-                if not use_instay_records:
-                    keep &= timesteps < history_len_steps
-                episodes, timesteps, values = episodes[keep], timesteps[keep], values[keep]
+            # The indicators above were cleared for the disabled regions; the embeddings are
+            # a separate sparse block and have to be filtered to match, or a dropped record
+            # would still reach the encoder through its embedding.
+            #
+            # Text survives only in the history region, and only while history text is
+            # enabled: the in-stay guard above removes the rest, so there is no combination of
+            # switches under which a record at or after admission is kept.
+            keep = ((timesteps < history_len_steps) if use_historical_text_records
+                    else torch.zeros_like(timesteps, dtype=torch.bool))
+            episodes, timesteps, values = episodes[keep], timesteps[keep], values[keep]
             val_text_sparse.append({
                 'episode_index': episodes,
                 'timestep_index': timesteps,
@@ -2306,13 +2319,15 @@ def prepare_dataloaders(
         use_historical_nontext_records (bool, optional): If False, drop the non-text records in
             the history region. Defaults to True.
         use_historical_text_records (bool, optional): If False, drop the text records in the
-            history region. Defaults to True.
+            history region. Text at or after admission is dropped unconditionally -- see
+            `collate_tensorized` -- so this is the switch that removes text entirely.
+            Defaults to True.
         use_instay_records (bool, optional): If False, drop every in-stay record, emptying the
             event stream with them. Defaults to True.
             Dropping history in place leaves the sequence length unchanged; when both history
             switches are off, `history_len_steps=0` removes those timesteps entirely instead,
-            which is cheaper. Text is pre-admission in its entirety, so a run that keeps text
-            must keep the region.
+            which is cheaper. Only pre-admission text reaches the model, so a run that keeps
+            text must keep the region.
         history_len_steps (int, optional): Runtime cap on historical timesteps per episode.
             Sequences are cropped at load time, which is equivalent to re-extracting with a
             smaller MAX_HISTORY_LEN_STEPS (see `MixedDataset`). Must not exceed the extracted

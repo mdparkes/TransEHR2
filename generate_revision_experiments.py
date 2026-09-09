@@ -28,9 +28,11 @@ arms the one file `compute_charlson_index.py --write_cohort` writes is what puts
 same episodes. Generate the configs after writing it: the path is recorded here, and
 `run_experiment.py` refuses to start if it is missing.
 
-Text. The in-stay window closes at 48 h, before a discharge summary is written, so every text
-record is pre-admission. A model reading in-stay records only therefore has no text available
-to it, which is why experiments 10 and 15 carry none.
+Text. Only pre-admission text reaches the model: a text feature is a discharge-time artifact
+of an admission, so `collate_tensorized` drops any text record at or after admission rather
+than let a stay's own discharge documentation predict its outcome. A model reading in-stay
+records only therefore has no text available to it, which is why experiments 10 and 15 carry
+none.
 """
 
 import argparse
@@ -109,8 +111,8 @@ def build(base: dict, name: str, cohort: str, use_text: bool, historical_nontext
     config['USE_HISTORICAL_TEXT_RECORDS'] = historical_text
     config['USE_INSTAY_RECORDS'] = instay
     # With no history of either kind the region is dead weight, so crop it away rather than
-    # masking 500 padded timesteps per episode. A run that keeps text must keep the region,
-    # because all text is pre-admission.
+    # masking 500 padded timesteps per episode. A run that keeps text must keep the region:
+    # only pre-admission text reaches the model, so cropping the region removes all of it.
     config['HISTORY_LEN_STEPS'] = 0 if not (historical_nontext or historical_text) else None
     return config
 

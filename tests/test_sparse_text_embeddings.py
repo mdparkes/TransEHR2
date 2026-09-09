@@ -8,6 +8,11 @@ the batch lands on.
 What has to hold is that the tensor the model receives is bit-identical to the one the old path
 produced, including where the crop window drops notes. These probes rebuild the old
 densification directly from the stored arrays and compare.
+
+The batches here declare their whole timestep axis to be the history region. Text at or after
+admission is dropped by `collate_tensorized` whatever the switches say, so a batch collated
+with no history region carries no text at all and there would be nothing left to compare. That
+exclusion has its own probes in `test_instay_text_guard.py`; these are about densification.
 """
 
 import numpy as np
@@ -97,7 +102,7 @@ def make_batch(note_counts_per_feature, ts_start, ts_end, seed=0):
         for idx in range(n_episodes)
     ], axis=0))
 
-    collated = collate_tensorized(episodes, history_len_steps=0)
+    collated = collate_tensorized(episodes, history_len_steps=cropped_len)
     return collated, oracle
 
 
