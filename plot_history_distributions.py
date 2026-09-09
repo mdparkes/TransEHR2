@@ -84,7 +84,10 @@ GAP_BINS = [
     ('<1 h', 0.0, 1.0),
     ('1-6 h', 1.0, 6.0),
     ('6-24 h', 6.0, 24.0),
-    ('1-7 d', 24.0, 168.0),
+    # 24-48 h is split off from the first day-scale bin so the boundary a minimum-gap
+    # definition of "pre-admission" would sit at is visible rather than pooled.
+    ('24-48 h', 24.0, 48.0),
+    ('2-7 d', 48.0, 168.0),
     ('1-4 wk', 168.0, 672.0),
     ('1-6 mo', 672.0, 4380.0),
     ('6-12 mo', 4380.0, 8760.0),
