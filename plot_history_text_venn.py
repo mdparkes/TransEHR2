@@ -1,29 +1,27 @@
 #!/usr/bin/env python3
 """Count patients by the kind of pre-admission record they carry, and draw the diagram.
 
-Four sets, over patients rather than episodes -- a patient qualifies if any of their
+Three nested sets, over patients rather than episodes -- a patient qualifies if any of their
 episodes carries the record:
 
-    summary    at least one pre-admission discharge summary
-    diagnosis  at least one pre-admission diagnosis description
-    any        at least one pre-admission record of any kind, value or event stream
-    all        every patient in the extraction, with or without a pre-admission record
+    text     at least one pre-admission text record, of either text feature
+    history  at least one pre-admission record the model reads, i.e. the value stream
+    all      every patient in the extraction, with or without a pre-admission record
 
-Text records share the value stream's timestep axis and are found by intersecting that
-stream's observed history with the feature's presence indicator, so `summary` and `diagnosis`
-are subsets of `any`, which is in turn a subset of `all`. The figure is therefore an Euler
-diagram -- two circles inside a third, inside a fourth -- rather than a Venn with empty
-regions. The script checks the text containment rather than assuming it.
+These are the two cohorts the experiments select on, inside the population they are drawn
+from. The nesting is structural: a text record before the cutoff is itself a pre-admission
+record, so `text` is contained in `history`, which is contained in `all`. The script checks
+that containment rather than assuming it.
 
 Drawing `all` puts the denominator the other counts are read against into the figure: the
 patients carrying no pre-admission record occupy the outermost ring, so the share of the
 cohort each inner circle covers can be read off rather than computed from a caption.
 
-Circle areas are proportional to set size, and the distance between the two text circles is
-solved so their overlap is proportional too. The cohort and history circles are concentric,
-their nesting being exact. When the text pair cannot fit inside the history circle at that
-scale, they are shrunk together and the figure says so; every region carries its own count
-either way.
+The circles are concentric and their areas are proportional to set size, which for nested
+sets is always drawable -- a radius is the square root of that set's share of the cohort, and
+nested counts give nested radii. Nothing has to be solved or scaled to fit. The per-feature
+discharge-summary and diagnosis counts are reported in the table rather than drawn: they split
+a population too small to divide, and the experiments no longer separate them.
 
 Usage:
     python plot_history_text_venn.py --data_dir data/ --output tables/history_text_venn.png
@@ -44,8 +42,8 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 import numpy as np
 
-from TransEHR2.data.cohorts import (has_any_history, has_historical_text,
-                                    has_value_history)
+from TransEHR2.data.cohorts import (has_any_historical_text, has_any_history,
+                                    has_historical_text, has_value_history)
 from TransEHR2.data.preprocessing import load_dataset
 
 
@@ -53,8 +51,8 @@ from TransEHR2.data.preprocessing import load_dataset
 SUMMARY_INDEX = 0
 DIAGNOSIS_INDEX = 1
 
-CIRCLE_COLOURS = ('#4878a8', '#c0653a')
-ANY_COLOUR = '#8a8a8a'
+TEXT_COLOUR = '#4878a8'
+HISTORY_COLOUR = '#8a8a8a'
 ALL_COLOUR = '#b8b8b8'
 
 # A ring thinner than this, in units of the cohort circle's radius, cannot hold a count, so
@@ -104,7 +102,8 @@ def collect_partition(data_dir: str, fold: str, split: str,
             the layout was recorded in metadata.
 
     Returns:
-        Dict of sets keyed 'summary', 'diagnosis', 'any', plus 'all' for every patient seen.
+        Dict of sets keyed 'text', 'summary', 'diagnosis', 'any' and 'readable', plus
+        'all' for every patient seen.
     """
     dataset = load_dataset(os.path.join(data_dir, fold, split),
                            extracted_history_len_steps=extracted_history_len_steps)
@@ -113,11 +112,13 @@ def collect_partition(data_dir: str, fold: str, split: str,
                                       SUMMARY_INDEX)
     has_diagnosis = has_historical_text(dataset.val_masks, dataset.val_text_indicators, hist,
                                         DIAGNOSIS_INDEX)
+    has_text = has_any_historical_text(dataset.val_masks, dataset.val_text_indicators, hist)
     has_any = has_any_history(dataset.val_masks, dataset.event_masks, hist)
     has_readable = has_value_history(dataset.val_masks, hist)
 
     patients = patient_ids(data_dir, fold, split, len(has_any))
     return {
+        'text': set(patients[has_text].tolist()),
         'summary': set(patients[has_summary].tolist()),
         'diagnosis': set(patients[has_diagnosis].tolist()),
         'any': set(patients[has_any].tolist()),
@@ -129,7 +130,8 @@ def collect_partition(data_dir: str, fold: str, split: str,
 def collect_sets(data_dir: str, folds, splits,
                  extracted_history_len_steps=None) -> dict:
     """Union the patient id sets over every requested partition."""
-    totals = {key: set() for key in ('summary', 'diagnosis', 'any', 'readable', 'all')}
+    totals = {key: set()
+              for key in ('text', 'summary', 'diagnosis', 'any', 'readable', 'all')}
     seen = 0
     for fold in folds:
         for split in splits:
@@ -149,80 +151,27 @@ def collect_sets(data_dir: str, folds, splits,
     return totals
 
 
-def lens_area(r1: float, r2: float, d: float) -> float:
-    """Area of the intersection of two circles of radii `r1`, `r2` whose centres are `d` apart."""
-    if d >= r1 + r2:
-        return 0.0
-    if d <= abs(r1 - r2):
-        return math.pi * min(r1, r2) ** 2
-    term1 = r1 ** 2 * math.acos((d ** 2 + r1 ** 2 - r2 ** 2) / (2 * d * r1))
-    term2 = r2 ** 2 * math.acos((d ** 2 + r2 ** 2 - r1 ** 2) / (2 * d * r2))
-    term3 = 0.5 * math.sqrt(
-        (-d + r1 + r2) * (d + r1 - r2) * (d - r1 + r2) * (d + r1 + r2)
-    )
-    return term1 + term2 - term3
-
-
-def solve_distance(r1: float, r2: float, target: float) -> float:
-    """Centre distance giving an intersection of `target` area. Bisection; the area is
-    monotonically decreasing in the distance, so the bracket is the full feasible range."""
-    if target <= 0:
-        return r1 + r2
-    if target >= math.pi * min(r1, r2) ** 2:
-        return abs(r1 - r2)
-    low, high = abs(r1 - r2), r1 + r2
-    for _ in range(80):
-        mid = 0.5 * (low + high)
-        if lens_area(r1, r2, mid) > target:
-            low = mid
-        else:
-            high = mid
-    return 0.5 * (low + high)
-
-
 def layout(counts: dict) -> dict:
-    """Circle radii and centres for the figure, in units of the cohort circle's radius.
+    """Concentric circle radii for the figure, in units of the cohort circle's radius.
 
-    The cohort circle is fixed at radius 1 and every other circle is sized from it by area, so
-    a radius is the square root of that set's share of the cohort. The cohort and history
-    circles are concentric: every patient with history is a patient, so that nesting is exact
-    and needs no solving, and concentric circles leave a ring of even width to label. The two
-    text circles are placed on the x axis at the separation that makes their overlap
-    proportional too, and the pair is then centred.
+    The cohort circle is fixed at radius 1 and the others are sized from it by area, so a
+    radius is the square root of that set's share of the cohort. All three are concentric,
+    which for nested sets is exact and needs no solving: nested counts give nested radii, so
+    the drawing is always to scale and every ring has an even width to label.
 
     Args:
         counts: Region counts from `region_counts`.
 
     Returns:
-        Dict with 'all_r' and 'any_r', the two text circles as (centre_x, radius) under
-        'summary' and 'diagnosis', and 'to_scale' -- False when the text pair had to be shrunk
-        to fit inside the history circle.
+        Dict with 'all_r', 'history_r' and 'text_r'.
     """
-    n_all, n_any = counts['all'], counts['any']
+    n_all = counts['all']
     scale = 1.0 / math.sqrt(n_all) if n_all else 1.0
-    all_r = 1.0
-    any_r = math.sqrt(n_any) * scale
-    r_sum = math.sqrt(counts['summary']) * scale
-    r_diag = math.sqrt(counts['diagnosis']) * scale
-    separation = solve_distance(r_sum, r_diag, math.pi * counts['both'] * scale ** 2)
-
-    x_sum, x_diag = -separation / 2.0, separation / 2.0
-    shift = -0.5 * ((x_sum - r_sum) + (x_diag + r_diag))
-    x_sum += shift
-    x_diag += shift
-
-    # The text pair may not fit inside the history circle even though the sets nest, since
-    # equal areas do not imply a containing arrangement. Shrink the pair together and report
-    # it rather than drawing a circle that spills outside its own superset.
-    reach = max(abs(x_sum) + r_sum, abs(x_diag) + r_diag)
-    to_scale = reach <= any_r
-    if not to_scale and reach > 0:
-        squeeze = 0.97 * any_r / reach
-        x_sum, x_diag = x_sum * squeeze, x_diag * squeeze
-        r_sum, r_diag = r_sum * squeeze, r_diag * squeeze
-
-    return {'all_r': all_r, 'any_r': any_r, 'summary': (x_sum, r_sum),
-            'diagnosis': (x_diag, r_diag), 'to_scale': to_scale}
+    return {
+        'all_r': 1.0,
+        'history_r': math.sqrt(counts['history']) * scale,
+        'text_r': math.sqrt(counts['text']) * scale,
+    }
 
 
 def ring_label(ax, value: int, inner_r: float, outer_r: float, side: int) -> bool:
@@ -261,65 +210,44 @@ def draw(counts: dict, output: str, title: str) -> None:
         output: Destination path; the extension picks the format.
         title: Figure title.
     """
-    n_all, n_any = counts['all'], counts['any']
-    n_sum, n_diag, n_both = counts['summary'], counts['diagnosis'], counts['both']
+    n_all, n_history, n_text = counts['all'], counts['history'], counts['text']
 
     geometry = layout(counts)
-    all_r, r_any = geometry['all_r'], geometry['any_r']
-    (x_sum, r_sum), (x_diag, r_diag) = geometry['summary'], geometry['diagnosis']
-    to_scale = geometry['to_scale']
+    all_r, history_r, text_r = (geometry['all_r'], geometry['history_r'],
+                                geometry['text_r'])
 
     fig, ax = plt.subplots(figsize=(7.0, 7.4))
     cohort = plt.Circle((0, 0), all_r, facecolor=ALL_COLOUR, alpha=0.16,
-                        edgecolor=ANY_COLOUR, linewidth=1.4)
-    history = plt.Circle((0, 0), r_any, facecolor=ANY_COLOUR, alpha=0.20,
-                         edgecolor=ANY_COLOUR, linewidth=1.4)
-    circle_sum = plt.Circle((x_sum, 0), r_sum, facecolor=CIRCLE_COLOURS[0], alpha=0.45,
-                            edgecolor=CIRCLE_COLOURS[0], linewidth=1.4)
-    circle_diag = plt.Circle((x_diag, 0), r_diag, facecolor=CIRCLE_COLOURS[1], alpha=0.45,
-                             edgecolor=CIRCLE_COLOURS[1], linewidth=1.4)
-    for patch in (cohort, history, circle_sum, circle_diag):
+                        edgecolor=HISTORY_COLOUR, linewidth=1.4)
+    history = plt.Circle((0, 0), history_r, facecolor=HISTORY_COLOUR, alpha=0.20,
+                         edgecolor=HISTORY_COLOUR, linewidth=1.4)
+    text = plt.Circle((0, 0), text_r, facecolor=TEXT_COLOUR, alpha=0.45,
+                      edgecolor=TEXT_COLOUR, linewidth=1.4)
+    for patch in (cohort, history, text):
         ax.add_patch(patch)
 
-    # Disjoint region counts, each at the midpoint of its own span along y = 0, so the three
-    # never collide. A region with no patients gets no label.
-    spans = [
-        (counts['summary_only'], x_sum - r_sum, x_diag - r_diag),
-        (n_both, x_diag - r_diag, x_sum + r_sum),
-        (counts['diagnosis_only'], x_sum + r_sum, x_diag + r_diag),
-    ]
-    for value, left, right in spans:
-        if value > 0 and right > left:
-            ax.text(0.5 * (left + right), 0, f'{value:,}',
-                    ha='center', va='center', fontsize=12)
-
-    # The two ring-shaped regions, labelled on opposite sides of the centre. Either can be too
-    # thin for its count -- the no-history ring usually is, most patients having some history
-    # -- and putting them on opposite sides keeps a leader line from the inner ring off the
-    # outer ring's label. The inner boundary of the history-but-no-text ring is taken as the
-    # lowest extent of either text circle, which is at or below where the union actually
-    # crosses x = 0.
-    leader_below = ring_label(ax, counts['any_only'], max(r_sum, r_diag), r_any, -1)
-    leader_above = ring_label(ax, counts['no_history'], r_any, all_r, +1)
+    # The innermost region is a disc, so its count sits at the centre. The two ring-shaped
+    # regions go on opposite sides of it: either can be too thin to hold a count -- the
+    # no-history ring usually is, most patients having some history -- and opposite sides keep
+    # a leader line from one ring off the other ring's label.
+    if n_text > 0:
+        ax.text(0, 0, f'{n_text:,}', ha='center', va='center', fontsize=12)
+    leader_below = ring_label(ax, counts['history_only'], text_r, history_r, -1)
+    leader_above = ring_label(ax, counts['no_history'], history_r, all_r, +1)
 
     handles = [
-        Patch(facecolor=ALL_COLOUR, alpha=0.16, edgecolor=ANY_COLOUR,
+        Patch(facecolor=ALL_COLOUR, alpha=0.16, edgecolor=HISTORY_COLOUR,
               label=f'All patients  ({n_all:,})'),
-        Patch(facecolor=ANY_COLOUR, alpha=0.20, edgecolor=ANY_COLOUR,
-              label=f'Any pre-admission record  ({n_any:,})'),
-        Patch(facecolor=CIRCLE_COLOURS[0], alpha=0.45, edgecolor=CIRCLE_COLOURS[0],
-              label=f'Discharge summary  ({n_sum:,})'),
-        Patch(facecolor=CIRCLE_COLOURS[1], alpha=0.45, edgecolor=CIRCLE_COLOURS[1],
-              label=f'Diagnosis description  ({n_diag:,})'),
+        Patch(facecolor=HISTORY_COLOUR, alpha=0.20, edgecolor=HISTORY_COLOUR,
+              label=f'Any pre-admission record  ({n_history:,})'),
+        Patch(facecolor=TEXT_COLOUR, alpha=0.45, edgecolor=TEXT_COLOUR,
+              label=f'Any pre-admission text record  ({n_text:,})'),
     ]
     ax.legend(handles=handles, loc='upper center', bbox_to_anchor=(0.5, 0.0),
               frameon=False, fontsize=10, handlelength=1.4, borderpad=0.2)
 
-    caption = 'Areas are proportional to patient counts.'
-    if not to_scale:
-        caption = ('The two text circles are scaled to fit; their areas are not proportional '
-                   'to the circles containing them.')
-    fig.text(0.5, 0.02, caption, ha='center', va='bottom', fontsize=9, color='#555555')
+    fig.text(0.5, 0.02, 'Areas are proportional to patient counts.', ha='center',
+             va='bottom', fontsize=9, color='#555555')
 
     ax.set_xlim(-1.15, 1.15)
     ax.set_ylim(-1.30 if leader_below else -1.15, 1.35 if leader_above else 1.15)
@@ -337,34 +265,36 @@ def draw(counts: dict, output: str, title: str) -> None:
 def region_counts(sets: dict) -> dict:
     """Set sizes and the disjoint region counts the figure labels.
 
+    `history` is the value stream, which is what the cohort predicate selects on and what the
+    model reads; the either-stream count is carried as `any` and reported rather than drawn.
+
     Raises:
-        ValueError: If a text set is not contained in the any-record set. Text history is
-            built by intersecting the value stream's observed history with the feature
-            indicator, so containment is structural and a violation means the streams or the
-            id ordering are out of step.
+        ValueError: If the text set is not contained in the history set. Text history is built
+            by intersecting the value stream's observed history with the feature indicators,
+            so containment is structural and a violation means the streams or the id ordering
+            are out of step.
     """
-    summary, diagnosis, any_record, everyone = (
-        sets['summary'], sets['diagnosis'], sets['any'], sets['all'])
-    for name, subset in (('summary', summary), ('diagnosis', diagnosis)):
-        stray = subset - any_record
-        if stray:
-            raise ValueError(
-                f'{len(stray)} patients have pre-admission {name} text but no pre-admission '
-                f'record of any kind. Text history is an intersection with the value stream, '
-                f'so this cannot happen unless the arrays and ids are misaligned.'
-            )
-    both = summary & diagnosis
+    text, history, everyone = sets['text'], sets['readable'], sets['all']
+    stray = text - history
+    if stray:
+        raise ValueError(
+            f'{len(stray)} patients have a pre-admission text record but no pre-admission '
+            f'record the model reads. Text history is an intersection with the value stream, '
+            f'so this cannot happen unless the arrays and ids are misaligned.'
+        )
+    summary, diagnosis = sets['summary'], sets['diagnosis']
     return {
         'all': len(everyone),
-        'any': len(any_record),
+        'history': len(history),
+        'text': len(text),
+        'history_only': len(history - text),
+        'no_history': len(everyone - history),
+        'any': len(sets['any']),
         'summary': len(summary),
         'diagnosis': len(diagnosis),
-        'both': len(both),
+        'both': len(summary & diagnosis),
         'summary_only': len(summary - diagnosis),
         'diagnosis_only': len(diagnosis - summary),
-        'any_only': len(any_record - summary - diagnosis),
-        'no_history': len(everyone - any_record),
-        'readable': len(sets['readable']),
     }
 
 
@@ -373,15 +303,16 @@ def report(counts: dict) -> None:
     total = counts['all'] or 1
     rows = [
         ('Patients', counts['all']),
-        ('Any pre-admission record', counts['any']),
-        ('  readable by the model', counts['readable']),
+        ('Any pre-admission record (the cohort)', counts['history']),
+        ('  either stream, including events', counts['any']),
         ('No pre-admission record', counts['no_history']),
-        ('Discharge summary', counts['summary']),
-        ('Diagnosis description', counts['diagnosis']),
-        ('Both text features', counts['both']),
-        ('Discharge summary only', counts['summary_only']),
-        ('Diagnosis description only', counts['diagnosis_only']),
-        ('History but no text', counts['any_only']),
+        ('Any pre-admission text record (the cohort)', counts['text']),
+        ('History but no text', counts['history_only']),
+        ('  discharge summary', counts['summary']),
+        ('  diagnosis description', counts['diagnosis']),
+        ('  both text features', counts['both']),
+        ('  discharge summary only', counts['summary_only']),
+        ('  diagnosis description only', counts['diagnosis_only']),
     ]
     width = max(len(label) for label, _ in rows)
     print()
@@ -425,8 +356,9 @@ def main(argv=None):
         os.makedirs(os.path.dirname(args.csv) or '.', exist_ok=True)
         with open(args.csv, 'w') as handle:
             handle.write('region,patients\n')
-            for key in ('all', 'any', 'no_history', 'summary', 'diagnosis', 'both',
-                        'summary_only', 'diagnosis_only', 'any_only'):
+            for key in ('all', 'history', 'text', 'history_only', 'no_history', 'any',
+                        'summary', 'diagnosis', 'both', 'summary_only',
+                        'diagnosis_only'):
                 handle.write(f'{key},{counts[key]}\n')
         print(f'Wrote {args.csv}')
 
