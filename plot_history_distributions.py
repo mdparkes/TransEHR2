@@ -111,21 +111,30 @@ def patient_ids(partition_dir: str, n_episodes: int) -> np.ndarray:
     return load_episode_ids(partition_dir, n_episodes) // 1000
 
 
-def check_time_axis(times, masks, hist: int, label: str) -> None:
-    """Assert pre-admission timestamps are negative and in-stay timestamps are not.
+def check_time_axis(times, masks, hist: int, label: str, cutoff_hours: float = 0.0) -> None:
+    """Assert the array regions and the timestamps agree on where the eras divide.
+
+    Every timestep in the history region must be earlier than `-cutoff_hours`, and every
+    timestep in the episode region no earlier than it. With a cutoff of 0 that is the original
+    check: history strictly before admission, the episode region at or after it.
 
     The gap is computed as a distance from zero, so it is wrong by an unbounded amount if the
     axis runs the other way or is offset. An earlier extraction had the axis inverted and every
     number derived from it was void, so this is checked on every run rather than trusted.
+
+    `cutoff_hours` must match the `PREADMISSION_CUTOFF_HOURS` the arrays were extracted with.
+    The extraction does not record it, so it is passed in; a value that is too small makes this
+    raise rather than quietly mislabel an era.
 
     Args:
         times: (n_episodes, max_ts_len) timestamps in hours relative to ICU admission.
         masks: (n_episodes, max_ts_len) nonzero at non-padding timesteps.
         hist: Width of the history region.
         label: Stream name, for the error message.
+        cutoff_hours: Hours before admission at which the episode region opens.
 
     Raises:
-        ValueError: If either region carries timestamps of the wrong sign.
+        ValueError: If either region carries timestamps belonging to the other era.
     """
     t = np.asarray(times, dtype=np.float64)
     observed = np.asarray(masks) > 0
@@ -133,16 +142,21 @@ def check_time_axis(times, masks, hist: int, label: str) -> None:
     before[:, hist:] = False
     after = observed.copy()
     after[:, :hist] = False
+    boundary = -float(cutoff_hours)
 
-    if before.any() and t[before].max() > 0.0:
+    if before.any() and t[before].max() >= boundary:
         raise ValueError(
-            f'{label}: a pre-admission timestep carries timestamp {t[before].max():.2f} > 0. '
-            f'The history region and the sign of the time axis disagree.'
+            f'{label}: a pre-admission timestep carries timestamp {t[before].max():.2f}, '
+            f'which is not earlier than the era boundary at {boundary:.2f} h. Either the '
+            f'time axis is inverted or --extracted-cutoff-hours does not match the '
+            f'PREADMISSION_CUTOFF_HOURS the arrays were extracted with.'
         )
-    if after.any() and t[after].min() < 0.0:
+    if after.any() and t[after].min() < boundary:
         raise ValueError(
-            f'{label}: an in-stay timestep carries timestamp {t[after].min():.2f} < 0. '
-            f'The history region and the sign of the time axis disagree.'
+            f'{label}: an episode-region timestep carries timestamp {t[after].min():.2f}, '
+            f'which is earlier than the era boundary at {boundary:.2f} h. Either the time '
+            f'axis is inverted or --extracted-cutoff-hours is larger than the '
+            f'PREADMISSION_CUTOFF_HOURS the arrays were extracted with.'
         )
 
 
@@ -164,7 +178,7 @@ def latest_history_time(times, masks, hist: int) -> np.ndarray:
 
 
 def collect_partition(data_dir: str, fold: str, split: str, cohort: str,
-                      extracted_history_len_steps=None) -> dict:
+                      extracted_history_len_steps=None, cutoff_hours: float = 0.0) -> dict:
     """Per-episode counts, gaps and cohort flags for one partition.
 
     Args:
@@ -188,8 +202,10 @@ def collect_partition(data_dir: str, fold: str, split: str, cohort: str,
             f'histogram. Check --extracted-history-len-steps.'
         )
 
-    check_time_axis(dataset.val_times, dataset.val_masks, hist, f'{fold}/{split} value')
-    check_time_axis(dataset.event_times, dataset.event_masks, hist, f'{fold}/{split} event')
+    check_time_axis(dataset.val_times, dataset.val_masks, hist, f'{fold}/{split} value',
+                    cutoff_hours)
+    check_time_axis(dataset.event_times, dataset.event_masks, hist,
+                    f'{fold}/{split} event', cutoff_hours)
 
     val_observed = history_observed(dataset.val_masks, hist)
     val_count = val_observed.sum(axis=1).astype(np.int64)
@@ -215,7 +231,7 @@ def collect_partition(data_dir: str, fold: str, split: str, cohort: str,
 
 
 def collect(data_dir: str, folds, splits, cohort: str,
-            extracted_history_len_steps=None) -> dict:
+            extracted_history_len_steps=None, cutoff_hours: float = 0.0) -> dict:
     """Concatenate the per-episode arrays over every requested partition.
 
     Raises:
@@ -231,7 +247,7 @@ def collect(data_dir: str, folds, splits, cohort: str,
                 print(f'  {fold}/{split}: not found, skipping', file=sys.stderr)
                 continue
             part = collect_partition(data_dir, fold, split, cohort,
-                                     extracted_history_len_steps)
+                                     extracted_history_len_steps, cutoff_hours)
             widths.add(part.pop('hist'))
             parts.append(part)
             print(f'  {fold}/{split}: {len(part["val_count"])} episodes, '
@@ -399,6 +415,11 @@ def main(argv=None):
                         help='Figure path; the extension picks the format')
     parser.add_argument('--csv', default=None, help='Also write the bin counts to this CSV')
     parser.add_argument('--title', default='', help='Figure title (default: none)')
+    parser.add_argument('--extracted-cutoff-hours', type=float, default=0.0,
+                        help='Hours before admission at which the episode region opens in '
+                             'the extracted arrays. Must match the extraction\'s '
+                             'PREADMISSION_CUTOFF_HOURS, which the arrays do not record; a '
+                             'mismatch stops the run rather than mislabelling an era.')
     parser.add_argument('--extracted-history-len-steps', type=int, default=None,
                         help='Width of the history region in the extracted arrays. Only needed '
                              'for datasets written before the layout was recorded in metadata.')
@@ -413,7 +434,7 @@ def main(argv=None):
     print(f'Reading {args.data_dir}: folds {" ".join(args.folds)}, '
           f'splits {" ".join(args.splits)}')
     data = collect(args.data_dir, args.folds, args.splits, args.cohort,
-                   args.extracted_history_len_steps)
+                   args.extracted_history_len_steps, args.extracted_cutoff_hours)
 
     n_value = int(data['in_value'].sum())
     n_any = int(data['in_any'].sum())
