@@ -50,7 +50,7 @@ GRID:
   # comparable at it. 0.0006 has since pretrained to a usable encoder under a 40-epoch
   # half-life, so the top of this range is measured rather than assumed.
   PRETRAIN_LEARNING_RATE:
-    values: [0.0002, 0.0006, 0.00006]
+    values: [0.0002, 0.0006, 0.00006, 0.002]
     select_on: pretrain
 
   # Half-lives in epochs, geometrically spaced so all three are equally distinguishable. The
@@ -58,5 +58,5 @@ GRID:
   # Against a run whose best epoch lands between 50 and 110, the rate remaining at epoch 100
   # is 0.65, 0.32 and 0.03 respectively.
   PRETRAIN_LR_HALF_LIFE:
-    values: [160, 60, 20]
+    values: [160, 60, 20, 480]
     select_on: pretrain
