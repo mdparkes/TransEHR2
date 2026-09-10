@@ -1,32 +1,35 @@
 """Probes for the patient-count Euler diagram.
 
-Two things here can be silently wrong. The containment of the text set inside the history set
-is structural, not incidental: text history is built by intersecting the value stream's
-observed history with the feature indicators, so a violation means the arrays and the id lists
-are out of step and every count in the figure is untrustworthy. And the radii have to be
-proportional to the counts by area, which is the claim the caption makes -- a figure whose
-areas are wrong looks entirely plausible.
+Four things here can be silently wrong. The area solver returns a number for any input, so a
+dropped factor produces a plausible-looking figure with the wrong overlap -- an earlier
+revision lost a factor of pi exactly that way. The containments are structural, not incidental:
+text history is built by intersecting the value stream's observed history with the feature
+indicators, so a violation means the arrays and the id lists are out of step and every count is
+untrustworthy. The layout has to keep every circle inside its superset, which area
+proportionality alone does not guarantee -- a pair of equal-area circles can still be arranged
+so one crosses the boundary of the circle containing its set. And the drawn regions have to
+agree with the reported breakdown, since the lens is the both-features set the carry-forward
+analysis runs on.
 
-Concentric circles are what make the layout unconditional: nested counts give nested radii, so
-there is nothing to solve and no arrangement in which a circle escapes its own superset. The
-earlier layout placed two overlapping text circles inside the history circle, which needed an
-area solver and a fit check because equal areas do not imply a containing arrangement. Those
-probes went with the machinery.
+The two text features are not nested in each other, which is why the pair is drawn overlapping
+rather than concentric: their union is the any-text cohort and their intersection is the
+both-features one, so two circles carry four sets.
 """
 
 import math
 
 import pytest
 
-from plot_history_text_venn import MIN_RING_LABEL_GAP, layout, region_counts
+from plot_history_text_venn import (MIN_RING_LABEL_GAP, layout, lens_area, region_counts,
+                                    solve_distance)
 
 
 def _sets(all_n, history_n, text_n, summary_n=None, diagnosis_n=None, any_n=None):
     """Nested patient id sets of the given sizes.
 
-    The two feature sets are built to cover the text set exactly and to overlap in its middle,
-    so `all_text` is genuinely their intersection -- which is what `region_counts` checks, and
-    what an independently chosen `all_text` would violate.
+    The two feature sets cover the text set exactly and overlap in its middle, so `all_text` is
+    genuinely their intersection -- which is what `region_counts` checks, and what an
+    independently chosen `all_text` would violate.
     """
     summary_n = text_n if summary_n is None else summary_n
     diagnosis_n = text_n if diagnosis_n is None else diagnosis_n
@@ -43,6 +46,29 @@ def _sets(all_n, history_n, text_n, summary_n=None, diagnosis_n=None, any_n=None
     }
 
 
+# ------------------------------------------------------------------------------------------
+# The area solver
+# ------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize('r1,r2,fraction', [
+    (1.0, 1.0, 0.5), (1.0, 0.6, 0.3), (0.8, 0.8, 0.9), (1.0, 0.3, 0.05), (0.5, 1.2, 0.75),
+])
+def test_the_solver_recovers_the_overlap_it_was_asked_for(r1, r2, fraction):
+    """A dropped constant here changes the figure without changing anything visibly wrong."""
+    target = fraction * math.pi * min(r1, r2) ** 2
+    distance = solve_distance(r1, r2, target)
+    assert lens_area(r1, r2, distance) == pytest.approx(target, abs=1e-9)
+
+
+def test_disjoint_circles_are_placed_apart_and_contained_ones_together():
+    assert solve_distance(1.0, 0.5, 0.0) == pytest.approx(1.5)
+    assert solve_distance(1.0, 0.5, math.pi * 0.25) == pytest.approx(0.5)
+
+
+# ------------------------------------------------------------------------------------------
+# The regions
+# ------------------------------------------------------------------------------------------
+
 def test_the_regions_partition_the_cohort():
     counts = region_counts(_sets(1000, 700, 400, summary_n=300, diagnosis_n=250))
     assert counts['all_text'] + counts['one_text_only'] == counts['text']
@@ -50,27 +76,13 @@ def test_the_regions_partition_the_cohort():
     assert counts['history'] + counts['no_history'] == counts['all']
 
 
-def test_the_one_feature_ring_is_the_two_single_feature_regions():
-    """With two text features, all_text is their intersection, so the ring is the two
-    exclusive parts. A drawn ring that disagreed with the reported breakdown would be worse
-    than either alone."""
+def test_the_three_drawn_text_regions_partition_the_text_set():
+    """The lens and the two crescents are what the figure labels, so they have to add up."""
     counts = region_counts(_sets(1000, 700, 400, summary_n=300, diagnosis_n=250))
-    assert counts['one_text_only'] == counts['summary_only'] + counts['diagnosis_only']
-
-
-def test_an_all_features_set_outside_a_single_feature_set_is_refused():
-    """The reduction over every feature and the indexed predicates have to agree."""
-    sets = _sets(1000, 700, 400, summary_n=300, diagnosis_n=250)
-    sets['all_text'] = set(sets['text'])
-    with pytest.raises(ValueError, match='misaligned'):
-        region_counts(sets)
-
-
-def test_the_per_feature_counts_still_partition_the_text_set():
-    """Reported rather than drawn, but the table has to add up."""
-    counts = region_counts(_sets(1000, 700, 400, summary_n=300, diagnosis_n=250))
-    assert counts['summary_only'] + counts['both'] == counts['summary']
-    assert counts['diagnosis_only'] + counts['both'] == counts['diagnosis']
+    assert (counts['summary_only'] + counts['all_text']
+            + counts['diagnosis_only']) == counts['text']
+    assert counts['summary_only'] + counts['all_text'] == counts['summary']
+    assert counts['diagnosis_only'] + counts['all_text'] == counts['diagnosis']
 
 
 def test_the_either_stream_count_is_carried_separately():
@@ -88,50 +100,78 @@ def test_text_outside_the_history_set_is_refused():
         region_counts(sets)
 
 
-@pytest.mark.parametrize('all_n,history_n,text_n', [
-    (28780, 23600, 9878),
-    (1000, 999, 998),      # every ring vanishingly thin
-    (1000, 10, 1),         # every ring wide
-    (500, 500, 500),       # the four coincide
+def test_an_all_features_set_outside_a_single_feature_set_is_refused():
+    """The reduction over every feature and the indexed predicates have to agree."""
+    sets = _sets(1000, 700, 400, summary_n=300, diagnosis_n=250)
+    sets['all_text'] = set(sets['text'])
+    with pytest.raises(ValueError, match='misaligned'):
+        region_counts(sets)
+
+
+# ------------------------------------------------------------------------------------------
+# The layout
+# ------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize('all_n,history_n,text_n,summary_n,diagnosis_n', [
+    (28600, 13649, 10400, 9878, 4920),   # the cohort's own proportions
+    (1000, 999, 998, 998, 998),          # every ring thin, the features coincident
+    (1000, 10, 1, 1, 1),                 # every ring wide
+    (1000, 700, 400, 400, 10),           # one feature nearly all of the text set
+    (1000, 700, 400, 200, 200),          # the two features disjoint
 ])
-def test_every_circle_stays_inside_the_one_containing_its_superset(all_n, history_n, text_n):
-    geometry = layout(region_counts(_sets(all_n, history_n, text_n)))
-    assert geometry['all_text_r'] <= geometry['text_r'] + 1e-12
-    assert geometry['text_r'] <= geometry['history_r'] + 1e-12
+def test_every_circle_stays_inside_the_one_containing_its_superset(
+        all_n, history_n, text_n, summary_n, diagnosis_n):
+    counts = region_counts(_sets(all_n, history_n, text_n, summary_n, diagnosis_n))
+    geometry = layout(counts)
+    (x_sum, r_sum), (x_diag, r_diag) = geometry['summary'], geometry['diagnosis']
+    reach = max(abs(x_sum) + r_sum, abs(x_diag) + r_diag)
+    assert reach <= geometry['history_r'] + 1e-9, 'a text circle escapes the history circle'
     assert geometry['history_r'] <= geometry['all_r'] + 1e-12
 
 
-def test_circle_areas_are_proportional_to_the_counts():
-    """The claim the caption makes, and the reason the radii are square roots."""
-    counts = region_counts(_sets(28780, 23600, 9878))
+def test_circle_areas_and_the_overlap_are_proportional_to_the_counts():
+    """The claim the caption makes: the radii are square roots and the lens is solved."""
+    counts = region_counts(_sets(28600, 13649, 10400, 9878, 4920))
     geometry = layout(counts)
+    assert geometry['to_scale']
 
     unit = math.pi * geometry['all_r'] ** 2 / counts['all']
-    for key, radius_key in (('history', 'history_r'), ('text', 'text_r'),
-                            ('all_text', 'all_text_r')):
-        area = math.pi * geometry[radius_key] ** 2
-        assert area == pytest.approx(unit * counts[key], rel=1e-12), (
-            f'{key} circle area is not proportional to its count'
-        )
+    (x_sum, r_sum), (x_diag, r_diag) = geometry['summary'], geometry['diagnosis']
+    assert math.pi * geometry['history_r'] ** 2 == pytest.approx(
+        unit * counts['history'], rel=1e-12)
+    assert math.pi * r_sum ** 2 == pytest.approx(unit * counts['summary'], rel=1e-12)
+    assert math.pi * r_diag ** 2 == pytest.approx(unit * counts['diagnosis'], rel=1e-12)
+
+    overlap = lens_area(r_sum, r_diag, abs(x_diag - x_sum))
+    assert overlap == pytest.approx(unit * counts['all_text'], rel=1e-6)
+
+
+def test_the_cohort_proportions_do_not_need_the_squeeze():
+    """At the real counts the pair fits, so the figure stays proportional and the caption does
+    not have to disclaim it. Worth pinning: the discharge-summary set is most of the history
+    set, which is the case that leaves least room to offset the pair."""
+    geometry = layout(region_counts(_sets(28600, 13649, 10400, 9878, 4920)))
+    assert geometry['to_scale']
+
+
+def test_a_pair_that_cannot_fit_is_shrunk_and_reported():
+    """A text set covering nearly all of its superset leaves no room to offset the pair."""
+    counts = region_counts(_sets(28780, 23600, 23400, 12000, 11600))
+    geometry = layout(counts)
+    assert not geometry['to_scale']
+    (x_sum, r_sum), (x_diag, r_diag) = geometry['summary'], geometry['diagnosis']
+    reach = max(abs(x_sum) + r_sum, abs(x_diag) + r_diag)
+    assert reach <= geometry['history_r'] + 1e-9, 'the squeeze did not bring the pair inside'
 
 
 def test_an_empty_cohort_does_not_divide_by_zero():
     geometry = layout(region_counts(_sets(0, 0, 0)))
-    assert geometry['history_r'] == 0.0 and geometry['text_r'] == 0.0
-    assert geometry['all_text_r'] == 0.0
+    assert geometry['history_r'] == 0.0
+    assert geometry['summary'][1] == 0.0 and geometry['diagnosis'][1] == 0.0
 
 
 def test_a_ring_can_be_too_thin_to_hold_its_count():
-    """Which ring is thin depends on the cohort, and both cases occur.
-
-    Recorded because the leader-line branch is otherwise exercised only by the real data, and
-    a change to MIN_RING_LABEL_GAP would silently take a count off the figure. When most
-    patients have history the outer ring is the thin one; at the current cohort proportions it
-    is the inner ring, the text cohort filling most of the history circle.
-    """
-    outer_thin = layout(region_counts(_sets(28780, 23600, 9878)))
-    assert outer_thin['all_r'] - outer_thin['history_r'] < MIN_RING_LABEL_GAP
-
-    inner_thin = layout(region_counts(_sets(28600, 13649, 10400)))
-    assert inner_thin['history_r'] - inner_thin['text_r'] < MIN_RING_LABEL_GAP
-    assert inner_thin['all_r'] - inner_thin['history_r'] > MIN_RING_LABEL_GAP
+    """Recorded because the leader-line branch is otherwise exercised only by the real data,
+    and a change to MIN_RING_LABEL_GAP would silently take a count off the figure."""
+    geometry = layout(region_counts(_sets(28780, 23600, 9878, 9878, 4920)))
+    assert geometry['all_r'] - geometry['history_r'] < MIN_RING_LABEL_GAP

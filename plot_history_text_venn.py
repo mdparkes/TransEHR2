@@ -55,14 +55,12 @@ from TransEHR2.data.preprocessing import load_dataset
 SUMMARY_INDEX = 0
 DIAGNOSIS_INDEX = 1
 
-TEXT_COLOUR = '#4878a8'
+# The two text features are not nested in each other, so they take contrasting hues; their
+# overlap is the both-features set and reads as the blend.
+SUMMARY_COLOUR = '#4878a8'
+DIAGNOSIS_COLOUR = '#c0653a'
 HISTORY_COLOUR = '#8a8a8a'
 ALL_COLOUR = '#b8b8b8'
-
-# The two text circles share a hue and differ in depth, because one contains the other: a
-# second colour would read as a different category rather than as a subset.
-ANY_TEXT_ALPHA = 0.30
-ALL_TEXT_ALPHA = 0.62
 
 # A ring thinner than this, in units of the cohort circle's radius, cannot hold a count, so
 # the count is placed outside the figure on a leader line instead.
@@ -164,28 +162,85 @@ def collect_sets(data_dir: str, folds, splits,
     return totals
 
 
-def layout(counts: dict) -> dict:
-    """Concentric circle radii for the figure, in units of the cohort circle's radius.
+def lens_area(r1: float, r2: float, d: float) -> float:
+    """Area of the intersection of two circles of radii `r1`, `r2` whose centres are `d` apart."""
+    if d >= r1 + r2:
+        return 0.0
+    if d <= abs(r1 - r2):
+        return math.pi * min(r1, r2) ** 2
+    term1 = r1 ** 2 * math.acos((d ** 2 + r1 ** 2 - r2 ** 2) / (2 * d * r1))
+    term2 = r2 ** 2 * math.acos((d ** 2 + r2 ** 2 - r1 ** 2) / (2 * d * r2))
+    term3 = 0.5 * math.sqrt(
+        (-d + r1 + r2) * (d + r1 - r2) * (d - r1 + r2) * (d + r1 + r2)
+    )
+    return term1 + term2 - term3
 
-    The cohort circle is fixed at radius 1 and the others are sized from it by area, so a
-    radius is the square root of that set's share of the cohort. All three are concentric,
-    which for nested sets is exact and needs no solving: nested counts give nested radii, so
-    the drawing is always to scale and every ring has an even width to label.
+
+def solve_distance(r1: float, r2: float, target: float) -> float:
+    """Centre distance giving an intersection of `target` area. Bisection; the area is
+    monotonically decreasing in the distance, so the bracket is the full feasible range."""
+    if target <= 0:
+        return r1 + r2
+    if target >= math.pi * min(r1, r2) ** 2:
+        return abs(r1 - r2)
+    low, high = abs(r1 - r2), r1 + r2
+    for _ in range(80):
+        mid = 0.5 * (low + high)
+        if lens_area(r1, r2, mid) > target:
+            low = mid
+        else:
+            high = mid
+    return 0.5 * (low + high)
+
+
+def layout(counts: dict) -> dict:
+    """Circle radii and centres for the figure, in units of the cohort circle's radius.
+
+    The cohort circle is fixed at radius 1 and every other circle is sized from it by area, so
+    a radius is the square root of that set's share of the cohort. The cohort and history
+    circles are concentric, their nesting being exact, which leaves a ring of even width to
+    label. The two text circles are placed on the x axis at the separation that makes their
+    overlap proportional too, and the pair is then centred on its own extent -- the extent
+    rather than the separation, because the larger circle can reach past the smaller one and it
+    is the reach that has to fit.
+
+    The text pair may not fit inside the history circle even though the sets nest: equal areas
+    do not imply a containing arrangement, and a set covering most of its superset leaves
+    little room to offset. Then the pair is shrunk together and `to_scale` says so, rather than
+    a circle being drawn outside the superset that contains its set.
 
     Args:
         counts: Region counts from `region_counts`.
 
     Returns:
-        Dict with 'all_r', 'history_r', 'text_r' and 'all_text_r'.
+        Dict with 'all_r' and 'history_r', the two text circles as (centre_x, radius) under
+        'summary' and 'diagnosis', and 'to_scale'.
     """
     n_all = counts['all']
     scale = 1.0 / math.sqrt(n_all) if n_all else 1.0
-    return {
-        'all_r': 1.0,
-        'history_r': math.sqrt(counts['history']) * scale,
-        'text_r': math.sqrt(counts['text']) * scale,
-        'all_text_r': math.sqrt(counts['all_text']) * scale,
-    }
+    all_r = 1.0
+    history_r = math.sqrt(counts['history']) * scale
+    r_sum = math.sqrt(counts['summary']) * scale
+    r_diag = math.sqrt(counts['diagnosis']) * scale
+    separation = solve_distance(r_sum, r_diag,
+                                math.pi * counts['all_text'] * scale ** 2)
+
+    x_sum, x_diag = -separation / 2.0, separation / 2.0
+    left = min(x_sum - r_sum, x_diag - r_diag)
+    right = max(x_sum + r_sum, x_diag + r_diag)
+    shift = -0.5 * (left + right)
+    x_sum += shift
+    x_diag += shift
+
+    reach = max(abs(x_sum) + r_sum, abs(x_diag) + r_diag)
+    to_scale = reach <= history_r
+    if not to_scale and reach > 0:
+        squeeze = 0.97 * history_r / reach
+        x_sum, x_diag = x_sum * squeeze, x_diag * squeeze
+        r_sum, r_diag = r_sum * squeeze, r_diag * squeeze
+
+    return {'all_r': all_r, 'history_r': history_r, 'summary': (x_sum, r_sum),
+            'diagnosis': (x_diag, r_diag), 'to_scale': to_scale}
 
 
 def ring_label(ax, value: int, inner_r: float, outer_r: float, side: int) -> bool:
@@ -224,54 +279,68 @@ def draw(counts: dict, output: str, title: str) -> None:
         output: Destination path; the extension picks the format.
         title: Figure title.
     """
-    n_all, n_history = counts['all'], counts['history']
-    n_text, n_all_text = counts['text'], counts['all_text']
+    n_all, n_history, n_text = counts['all'], counts['history'], counts['text']
+    n_sum, n_diag, n_all_text = counts['summary'], counts['diagnosis'], counts['all_text']
 
     geometry = layout(counts)
     all_r, history_r = geometry['all_r'], geometry['history_r']
-    text_r, all_text_r = geometry['text_r'], geometry['all_text_r']
+    (x_sum, r_sum), (x_diag, r_diag) = geometry['summary'], geometry['diagnosis']
 
-    fig, ax = plt.subplots(figsize=(7.0, 7.4))
+    fig, ax = plt.subplots(figsize=(7.0, 7.6))
     cohort = plt.Circle((0, 0), all_r, facecolor=ALL_COLOUR, alpha=0.16,
                         edgecolor=HISTORY_COLOUR, linewidth=1.4)
     history = plt.Circle((0, 0), history_r, facecolor=HISTORY_COLOUR, alpha=0.20,
                          edgecolor=HISTORY_COLOUR, linewidth=1.4)
-    any_text = plt.Circle((0, 0), text_r, facecolor=TEXT_COLOUR, alpha=ANY_TEXT_ALPHA,
-                          edgecolor=TEXT_COLOUR, linewidth=1.4)
-    all_text = plt.Circle((0, 0), all_text_r, facecolor=TEXT_COLOUR, alpha=ALL_TEXT_ALPHA,
-                          edgecolor=TEXT_COLOUR, linewidth=1.4)
-    for patch in (cohort, history, any_text, all_text):
+    circle_sum = plt.Circle((x_sum, 0), r_sum, facecolor=SUMMARY_COLOUR, alpha=0.42,
+                            edgecolor=SUMMARY_COLOUR, linewidth=1.4)
+    circle_diag = plt.Circle((x_diag, 0), r_diag, facecolor=DIAGNOSIS_COLOUR, alpha=0.42,
+                             edgecolor=DIAGNOSIS_COLOUR, linewidth=1.4)
+    for patch in (cohort, history, circle_sum, circle_diag):
         ax.add_patch(patch)
 
-    # The innermost region is a disc, so its count sits at the centre. The rings alternate
-    # sides going outward, which keeps a leader line from one ring clear of the next one's
-    # label: any ring can be too thin to hold its count, and which one is depends on the
-    # cohort's proportions rather than on anything fixed.
-    if n_all_text > 0:
-        ax.text(0, 0, f'{n_all_text:,}', ha='center', va='center', fontsize=12)
-    leaders = [
-        ring_label(ax, counts['one_text_only'], all_text_r, text_r, +1),
-        ring_label(ax, counts['history_only'], text_r, history_r, -1),
-        ring_label(ax, counts['no_history'], history_r, all_r, +1),
+    # The three text regions, each at the midpoint of its own span along y = 0 so they cannot
+    # collide. The lens is the both-features set, which is what the carry-forward analysis
+    # runs on, so it carries its count in the figure rather than only in the table.
+    spans = [
+        (counts['summary_only'], min(x_sum - r_sum, x_diag - r_diag),
+         max(x_sum - r_sum, x_diag - r_diag)),
+        (n_all_text, max(x_sum - r_sum, x_diag - r_diag),
+         min(x_sum + r_sum, x_diag + r_diag)),
+        (counts['diagnosis_only'], min(x_sum + r_sum, x_diag + r_diag),
+         max(x_sum + r_sum, x_diag + r_diag)),
     ]
-    leader_above = leaders[0] or leaders[2]
-    leader_below = leaders[1]
+    for value, left, right in spans:
+        if value > 0 and right > left:
+            ax.text(0.5 * (left + right), 0, f'{value:,}',
+                    ha='center', va='center', fontsize=11)
+
+    # The two ring-shaped regions, on opposite sides so a leader line from one stays clear of
+    # the other's label. Either can be too thin to hold its count. The inner boundary of the
+    # history-but-no-text ring is taken as the larger circle's reach, which is at or outside
+    # where the union actually crosses x = 0.
+    leader_below = ring_label(ax, counts['history_only'],
+                              max(abs(x_sum) + r_sum, abs(x_diag) + r_diag), history_r, -1)
+    leader_above = ring_label(ax, counts['no_history'], history_r, all_r, +1)
 
     handles = [
         Patch(facecolor=ALL_COLOUR, alpha=0.16, edgecolor=HISTORY_COLOUR,
               label=f'All patients  ({n_all:,})'),
         Patch(facecolor=HISTORY_COLOUR, alpha=0.20, edgecolor=HISTORY_COLOUR,
               label=f'Any pre-admission record  ({n_history:,})'),
-        Patch(facecolor=TEXT_COLOUR, alpha=ANY_TEXT_ALPHA, edgecolor=TEXT_COLOUR,
-              label=f'Any pre-admission text record  ({n_text:,})'),
-        Patch(facecolor=TEXT_COLOUR, alpha=ALL_TEXT_ALPHA, edgecolor=TEXT_COLOUR,
-              label=f'Both text features  ({n_all_text:,})'),
+        Patch(facecolor=SUMMARY_COLOUR, alpha=0.42, edgecolor=SUMMARY_COLOUR,
+              label=f'At least one discharge summary  ({n_sum:,})'),
+        Patch(facecolor=DIAGNOSIS_COLOUR, alpha=0.42, edgecolor=DIAGNOSIS_COLOUR,
+              label=f'At least one discharge diagnosis  ({n_diag:,})'),
     ]
     ax.legend(handles=handles, loc='upper center', bbox_to_anchor=(0.5, 0.0),
               frameon=False, fontsize=10, handlelength=1.4, borderpad=0.2)
 
-    fig.text(0.5, 0.02, 'Areas are proportional to patient counts.', ha='center',
-             va='bottom', fontsize=9, color='#555555')
+    caption = (f'Areas are proportional to patient counts. Either text feature: '
+               f'{n_text:,}. Both: {n_all_text:,}.')
+    if not geometry['to_scale']:
+        caption = ('The two text circles are scaled to fit; their areas are not proportional '
+                   'to the circles containing them.')
+    fig.text(0.5, 0.02, caption, ha='center', va='bottom', fontsize=9, color='#555555')
 
     ax.set_xlim(-1.15, 1.15)
     ax.set_ylim(-1.30 if leader_below else -1.15, 1.35 if leader_above else 1.15)
@@ -279,7 +348,7 @@ def draw(counts: dict, output: str, title: str) -> None:
     ax.axis('off')
     if title:
         ax.set_title(title, fontsize=12)
-    fig.subplots_adjust(bottom=0.22, top=0.96)
+    fig.subplots_adjust(bottom=0.24, top=0.96)
     os.makedirs(os.path.dirname(output) or '.', exist_ok=True)
     fig.savefig(output, dpi=300)
     plt.close(fig)
