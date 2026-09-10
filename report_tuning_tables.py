@@ -38,6 +38,7 @@ Usage:
 
 import argparse
 import fnmatch
+import math
 import os
 import sys
 
@@ -87,7 +88,16 @@ METRIC_HEADINGS = {
 
 ARM_HEADINGS = {
     'additive': 'Temporal Positional Encoding (TPE)',
-    'rope': 'Rotary Position Embedding (RoPE)',
+    'rope': 'RoPE',
+}
+
+# The published tables head the rate axis with the bare quantity, not the stage: the stage is
+# already in the caption, and each table reports one stage.
+GRID_STUB = {
+    'PRETRAIN_LEARNING_RATE': 'Learning Rate',
+    'FINETUNE_LEARNING_RATE': 'Learning Rate',
+    'PRETRAIN_LR_HALF_LIFE': 'Learning rate half-life (exponential decay)',
+    'FINETUNE_LR_HALF_LIFE': 'Learning rate half-life (exponential decay)',
 }
 
 
@@ -181,16 +191,36 @@ def axis_values(runs, key):
     return numeric + other + ([None] if None in values else [])
 
 
+def format_rate(value):
+    """A learning rate in the published form, e.g. 0.0006 as 6x10<sup>-4</sup>.
+
+    The mantissa is rounded before the trailing zeros are stripped, because dividing by a power
+    of ten leaves values like 5.999999999999999 that would otherwise print in full.
+    """
+    if not isinstance(value, (int, float)) or value == 0:
+        return str(value)
+    exponent = math.floor(math.log10(abs(value)))
+    mantissa = round(value / (10.0 ** exponent), 3)
+    # Rounding can carry the mantissa to 10, which belongs in the exponent.
+    if abs(mantissa) >= 10:
+        mantissa, exponent = mantissa / 10.0, exponent + 1
+    text = f'{mantissa:g}'
+    return f'{text}x10<sup>{exponent}</sup>'
+
+
 def format_axis(value, key):
     """Axis label for one hyperparameter value.
 
     A half-life is in epochs and the published tables say so in the column heading, which is
-    also what distinguishes it from a rate at a glance.
+    also what distinguishes it from a rate at a glance. A rate is written as a mantissa and a
+    power of ten, which is the house form.
     """
     if value is None:
         return 'No decay'
+    if key.endswith('LEARNING_RATE'):
+        return format_rate(value)
     label = f'{value:g}' if isinstance(value, (int, float)) else str(value)
-    if key.endswith('HALF_LIFE') and value is not None:
+    if key.endswith('HALF_LIFE'):
         return f'{label} Epochs'
     return label
 
@@ -217,12 +247,13 @@ def build_grid(runs, row_key, col_key, spec, number, caption, precision):
               f'{", ".join(controls)}')
         runs = [(name, data) for name, data in runs if name not in set(controls)]
 
-    rows = axis_values(runs, row_key)
+    rows = list(reversed(axis_values(runs, row_key)))
     cols = axis_values(runs, col_key)
     arms = axis_values(runs, ARM_KEY) or [None]
 
-    table = Table(number, caption, heading(row_key),
+    table = Table(number, caption, GRID_STUB.get(row_key, heading(row_key)),
                   [format_axis(value, col_key) for value in cols])
+    table.add_footnote(f'Columns are the {GRID_STUB.get(col_key, heading(col_key)).lower()}.')
     table.add_footnote(f'Cells are {metric_heading(spec)}. {MISSING} marks a run with no '
                        f'result on disk.')
 

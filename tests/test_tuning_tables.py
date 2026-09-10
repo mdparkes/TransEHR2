@@ -50,7 +50,7 @@ def tree(tmp_path):
 
 
 def cells_of(table):
-    """Map (category, row label) to the row's cells."""
+    """Map (category, row label) to the row's cells, keyed on the stripped label."""
     out, group = {}, ''
     for row in table.rows:
         if row.kind == 'category':
@@ -60,6 +60,11 @@ def cells_of(table):
     return out
 
 
+def rate_label(value):
+    """The stripped form of a rate label, as cells_of keys on it."""
+    return strip_markup(tables.format_rate(value))
+
+
 def test_the_grid_puts_every_value_in_its_own_cell(tree):
     runs = tables.discover(tree, ['phase_*'], 'fold0', 'mortality')
     table = tables.build_grid(runs, 'FINETUNE_LEARNING_RATE', 'FINETUNE_LR_HALF_LIFE',
@@ -67,10 +72,32 @@ def test_the_grid_puts_every_value_in_its_own_cell(tree):
     assert table.columns == ['160 Epochs', 'No decay']
     cells = cells_of(table)
     tpe, rope = (tables.ARM_HEADINGS['additive'], tables.ARM_HEADINGS['rope'])
-    assert cells[(tpe, '1e-05')] == ['0.5000', '0.5001']
-    assert cells[(tpe, '5e-05')] == ['0.5010', '0.5011']
-    assert cells[(rope, '1e-05')] == ['0.5100', '0.5101']
-    assert cells[(rope, '5e-05')] == ['0.5110', '0.5111']
+    low, high = rate_label(1e-05), rate_label(5e-05)
+    assert cells[(tpe, low)] == ['0.5000', '0.5001']
+    assert cells[(tpe, high)] == ['0.5010', '0.5011']
+    assert cells[(rope, low)] == ['0.5100', '0.5101']
+    assert cells[(rope, high)] == ['0.5110', '0.5111']
+
+
+def test_the_rate_axis_descends_and_the_half_life_axis_ascends():
+    """The published tables lead with the largest rate and the shortest half-life."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        root = os.path.join(tmp, 'models')
+        for rate in (6e-05, 0.0002, 0.0006):
+            for half_life in (20, 60, 160):
+                write_run(root, f'phase_{rate}_{half_life}', 'pretrain',
+                          {'POSITION_ENCODING': 'additive',
+                           'PRETRAIN_LEARNING_RATE': rate,
+                           'PRETRAIN_LR_HALF_LIFE': half_life},
+                          'val_losses', {'Optimization_Loss': 5.0})
+        runs = tables.discover(root, ['phase_*'], 'fold0', 'pretrain')
+        table = tables.build_grid(runs, 'PRETRAIN_LEARNING_RATE', 'PRETRAIN_LR_HALF_LIFE',
+                                  'val:Optimization_Loss', 'S4', 'caption', 4)
+    assert table.columns == ['20 Epochs', '60 Epochs', '160 Epochs']
+    labels = [strip_markup(row.label) for row in table.rows if row.kind == 'metric']
+    # strip_markup keeps a superscript visible as [-4] for the plain-text view.
+    assert labels == [rate_label(0.0006), rate_label(0.0002), rate_label(6e-05)]
 
 
 def test_a_flat_schedule_sorts_last_and_is_named(tree):
@@ -85,10 +112,9 @@ def test_the_headings_use_the_house_wording(tree):
     runs = tables.discover(tree, ['phase_*'], 'fold0', 'mortality')
     table = tables.build_grid(runs, 'FINETUNE_LEARNING_RATE', 'FINETUNE_LR_HALF_LIFE',
                               'val:AUPRC', 'S5', 'caption', 4)
-    assert table.stub_head == 'Finetuning Learn Rate'
+    assert table.stub_head == 'Learning Rate'
     labels = [strip_markup(row.label) for row in table.rows if row.kind == 'category']
-    assert labels == ['Temporal Positional Encoding (TPE)',
-                      'Rotary Position Embedding (RoPE)']
+    assert labels == ['Temporal Positional Encoding (TPE)', 'RoPE']
 
 
 def test_repeats_in_one_cell_are_averaged_and_counted(tmp_path):
@@ -102,7 +128,8 @@ def test_repeats_in_one_cell_are_averaged_and_counted(tmp_path):
     runs = tables.discover(root, ['phase_*'], 'fold0', 'mortality')
     table = tables.build_grid(runs, 'FINETUNE_LEARNING_RATE', 'FINETUNE_LR_HALF_LIFE',
                               'val:AUPRC', 'S5', 'caption', 4)
-    assert cells_of(table)[(tables.ARM_HEADINGS['additive'], '5e-05')] == ['0.6100 (n=2)']
+    assert cells_of(table)[(tables.ARM_HEADINGS['additive'],
+                            rate_label(5e-05))] == ['0.6100 (n=2)']
 
 
 def test_a_cell_with_no_run_is_marked_rather_than_blank(tmp_path):
@@ -116,7 +143,8 @@ def test_a_cell_with_no_run_is_marked_rather_than_blank(tmp_path):
     table = tables.build_grid(runs, 'FINETUNE_LEARNING_RATE', 'FINETUNE_LR_HALF_LIFE',
                               'val:AUPRC', 'S5', 'caption', 4)
     cells = cells_of(table)
-    assert tables.MISSING in cells[(tables.ARM_HEADINGS['additive'], '1e-05')]
+    assert tables.MISSING in cells[(tables.ARM_HEADINGS['additive'],
+                                   rate_label(1e-05))]
 
 
 def test_the_flat_layout_gives_one_row_per_run(tree):
@@ -160,7 +188,8 @@ def test_the_grid_excludes_the_control_runs(tmp_path):
     table = tables.build_grid(runs, 'FINETUNE_LEARNING_RATE', 'FINETUNE_LR_HALF_LIFE',
                               'val:AUPRC', 'S5', 'caption', 4)
     # The grid run alone, and no (n=) annotation, so the cell matches 2a's shape.
-    assert cells_of(table)[(tables.ARM_HEADINGS['additive'], '5e-05')] == ['0.6551']
+    assert cells_of(table)[(tables.ARM_HEADINGS['additive'],
+                            rate_label(5e-05))] == ['0.6551']
 
 
 def test_the_flat_layout_keeps_the_control_runs(tmp_path):
