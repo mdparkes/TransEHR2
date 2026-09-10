@@ -143,3 +143,8 @@ RECORD_MASK_RATIO: 0.15
 # value in the grid is at least 100x the old one, which is the correction the in-stay
 # restriction calls for: gaps collapse from ~1e5 h to ~1 h.
 THP_PRED_LOSS_TIME_WT: 0.01
+
+# The population every trial is tuned on. Tuning ran on all patients before the redo,
+# which selects hyperparameters against episodes with no pre-admission record to read --
+# more than half the extraction, and not the contrast any arm is measuring.
+COHORT_SUBSET: any_history
