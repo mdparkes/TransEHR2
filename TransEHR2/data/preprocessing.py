@@ -737,7 +737,8 @@ def _process_single_episode(
     max_episode_len_steps: int,
     max_episode_len_hours: Optional[int],
     min_episode_len_steps: Optional[int],
-    min_episode_len_hours: Optional[int]
+    min_episode_len_hours: Optional[int],
+    preadmission_cutoff_hours: float = 0.0
 ) -> Optional[EpisodeData]:
     """
     Process a single episode into EpisodeData for tensor insertion.
@@ -755,8 +756,12 @@ def _process_single_episode(
             the extracted episode must contain after resampling and
             truncation. Counts value-associated timesteps (merged
             with text timesteps when text features are in use); the
-            event stream is not subject to a minimum.
+            event stream is not subject to a minimum. Measured from
+            admission, not from the era boundary, so pre-admission
+            records inside the episode region cannot satisfy it.
         min_episode_len_hours: Minimum required hours
+        preadmission_cutoff_hours: Hours before admission at which the
+            pre-admission era ends. See `filter_timeseries_records`.
         
     Returns:
         EpisodeData if episode passes filters, None otherwise
@@ -776,6 +781,12 @@ def _process_single_episode(
                 return None
         
         # Pre-filter on minimum timesteps.
+        #
+        # Anchored at admission rather than at the era boundary, which
+        # is what the authoritative check below is anchored at too: an
+        # episode has to carry ICU data to qualify, and a run of
+        # pre-admission records sitting inside the episode region is
+        # not that.
         #
         # This is a cheap early-out on the RAW records, not the
         # authoritative check: the hourly resample below collapses
@@ -817,7 +828,7 @@ def _process_single_episode(
          _max_history_len) = filter_timeseries_records(
             val_data, event_data, text_data,
             max_history_len_steps, max_episode_len_steps,
-            max_episode_len_hours
+            max_episode_len_hours, preadmission_cutoff_hours
         )
         
         # Merge text with value data
@@ -830,16 +841,16 @@ def _process_single_episode(
         
         # Authoritative check on minimum timesteps.
         #
-        # val_data now holds exactly the timesteps that will be
-        # written to disk, history first and then the current stay.
-        # val_history_len is the number of pre-admission timesteps
-        # retained by filter_timeseries_records(); in the text branch
-        # that function filters the merged text+numeric frame and
-        # returns the merged frame's history length, and the merge
-        # above reconstructs that same frame, so the subtraction is
-        # correct in both branches.
+        # val_data now holds exactly the timesteps that will be written
+        # to disk, history first and then the episode region. The count
+        # is taken from admission by timestamp rather than as
+        # len(val_data) - val_history_len, because with a non-zero
+        # cutoff the episode region opens before admission and that
+        # subtraction would let pre-admission records satisfy a minimum
+        # that exists to require ICU data. At a cutoff of 0 the two
+        # agree.
         if min_episode_len_steps is not None:
-            n_current_steps = len(val_data) - val_history_len
+            n_current_steps = int((val_data.index >= pd.Timedelta(0)).sum())
             if n_current_steps < min_episode_len_steps:
                 return None
         
@@ -1131,9 +1142,21 @@ def filter_timeseries_records(
         text_data: Optional[pd.DataFrame] = None,
         max_history_len: int = 0,
         max_episode_len: int = 100,
-        max_episode_len_hours: Optional[int] = None
+        max_episode_len_hours: Optional[int] = None,
+        preadmission_cutoff_hours: float = 0.0
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, int, int, int]:
     """Filter timeseries records by history and episode length constraints.
+
+    Args:
+        numeric_data: Value-associated records, indexed by time relative to ICU admission.
+        event_data: Event-associated records, same index convention.
+        text_data: Text records, or None.
+        max_history_len: Most pre-admission timesteps to retain, keeping the most recent.
+        max_episode_len: Most episode timesteps to retain, keeping the earliest.
+        max_episode_len_hours: Upper edge of the episode window, in hours after admission.
+        preadmission_cutoff_hours: Hours before admission at which the pre-admission era ends.
+            Records from `-preadmission_cutoff_hours` onward belong to the episode region;
+            earlier ones are history. 0 puts the boundary at admission.
 
     Returns:
         Tuple of (numeric_data, event_data, text_data,
@@ -1144,6 +1167,10 @@ def filter_timeseries_records(
         the configured maximum history length (for computing left-pad
         offsets during array insertion).
     """
+
+    # The era boundary, as an offset from admission. Negative for a non-zero cutoff, so the
+    # episode region opens before admission and the history region closes before it.
+    boundary = -pd.Timedelta(hours=float(preadmission_cutoff_hours))
 
     def filter(df):
 
@@ -1157,21 +1184,21 @@ def filter_timeseries_records(
             )
             df = df.loc[selected_records, :]
 
-        # Get indices of up to x records from the current ICU stay
-        # episode, starting from the earliest record
-        episode_record_indices = np.where(
-            df.index >= np.timedelta64(0, 'h')
-        )[0]
+        # Get indices of up to x records from the episode region,
+        # starting from the earliest record. With a non-zero cutoff the
+        # earliest of those sit before admission, so max_episode_len has
+        # to cover the whole region -- if it is smaller than the region
+        # holds, what gets dropped is the ICU stay and not the
+        # pre-admission run.
+        episode_record_indices = np.where(df.index >= boundary)[0]
         episode_len = min(
             len(episode_record_indices), max_episode_len
         )
         episode_record_indices = episode_record_indices[:episode_len]
 
         # Get indices of up to x most recent records that were
-        # collected before the current ICU stay episode
-        historic_record_indices = np.where(
-            df.index < np.timedelta64(0, 'h')
-        )[0]
+        # collected before the episode region opens
+        historic_record_indices = np.where(df.index < boundary)[0]
         history_len = min(
             len(historic_record_indices), max_history_len
         )
@@ -1804,6 +1831,7 @@ def extract_mimic(
     min_episode_len_steps: Optional[int] = 10,
     min_episode_len_hours: Optional[int] = 48,
     max_episode_len_hours: Optional[int] = 48,
+    preadmission_cutoff_hours: float = 0.0,
     n_workers: Optional[int] = None
 ) -> None:
     """
@@ -1959,7 +1987,8 @@ def extract_mimic(
         max_episode_len_steps=max_episode_len_steps,
         max_episode_len_hours=max_episode_len_hours,
         min_episode_len_steps=min_episode_len_steps,
-        min_episode_len_hours=min_episode_len_hours
+        min_episode_len_hours=min_episode_len_hours,
+        preadmission_cutoff_hours=preadmission_cutoff_hours
     )
     
     # Collect results in a first pass to count surviving episodes

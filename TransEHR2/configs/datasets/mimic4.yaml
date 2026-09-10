@@ -101,7 +101,7 @@ STATIC_FEATS:
 #
 # MAX_EPISODE_LEN_STEPS and MAX_HISTORY_LEN_STEPS set the *extraction-time capacity* of the
 # timestep axis: extracted arrays are MAX_HISTORY_LEN_STEPS + MAX_EPISODE_LEN_STEPS wide, with
-# history right-justified in the leading region and in-stay data starting at index
+# history right-justified in the leading region and the episode region starting at index
 # MAX_HISTORY_LEN_STEPS. Changing either value requires re-extracting the data.
 #
 # To train or tune with *shorter* limits, do not touch these. Set HISTORY_LEN_STEPS and/or
@@ -109,8 +109,13 @@ STATIC_FEATS:
 # time, which is equivalent to re-extracting at the shorter limit. Extract once at the largest
 # limits you intend to study, then sweep downwards from the experiment config.
 
-# Maximum number of timesteps per episode (default: 500)
-MAX_EPISODE_LEN_STEPS: 50 
+# Maximum number of timesteps in the episode region.
+#
+# The region spans PREADMISSION_CUTOFF_HOURS before admission to MAX_EPISODE_LEN_HOURS
+# after it, on an hourly grid, so it has to be at least the sum of the two. It is not a
+# limit to economize on: truncation keeps the EARLIEST records of the region, so a value
+# below what the window holds drops the ICU stay and keeps the pre-admission run.
+MAX_EPISODE_LEN_STEPS: 100
 
 # Maximum number of timesteps in patient history (default: 5000)
 MAX_HISTORY_LEN_STEPS: 500
@@ -123,3 +128,14 @@ MIN_EPISODE_LEN_HOURS: 48
 
 # Maximum episode length in hours for inclusion (default: 48)
 MAX_EPISODE_LEN_HOURS: 48
+
+# Hours before ICU admission at which the pre-admission era ends.
+#
+# Records from this many hours before admission onward belong to the episode region;
+# earlier ones are pre-admission history. 0 puts the boundary at admission itself.
+#
+# This is the extraction-time value, and it is the LARGEST cutoff the extracted arrays can
+# answer for. A shorter cutoff can be applied at load time -- the episode region opens
+# contiguously with the history region, so moving the boundary later is exact -- but a
+# longer one cannot, because the history cap was applied at this boundary.
+PREADMISSION_CUTOFF_HOURS: 48

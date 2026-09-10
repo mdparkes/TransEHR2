@@ -130,6 +130,7 @@ if __name__ == "__main__":
     MIN_EPISODE_LEN_STEPS = config.get('MIN_EPISODE_LEN_STEPS', 10)
     MIN_EPISODE_LEN_HOURS = config.get('MIN_EPISODE_LEN_HOURS', 48)
     MAX_EPISODE_LEN_HOURS = config.get('MAX_EPISODE_LEN_HOURS', 48)
+    PREADMISSION_CUTOFF_HOURS = config.get('PREADMISSION_CUTOFF_HOURS', 0)
     
     # Find fold directories
     if args.folds:
@@ -184,6 +185,7 @@ if __name__ == "__main__":
                 min_episode_len_steps=MIN_EPISODE_LEN_STEPS,
                 min_episode_len_hours=MIN_EPISODE_LEN_HOURS,
                 max_episode_len_hours=MAX_EPISODE_LEN_HOURS,
+                preadmission_cutoff_hours=PREADMISSION_CUTOFF_HOURS,
                 n_workers=args.n_workers
             )
     
