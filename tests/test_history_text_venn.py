@@ -21,22 +21,49 @@ import pytest
 from plot_history_text_venn import MIN_RING_LABEL_GAP, layout, region_counts
 
 
-def _sets(all_n, history_n, text_n, summary_n=0, diagnosis_n=0, any_n=None):
-    """Nested patient id sets of the given sizes, with the text features inside the text set."""
+def _sets(all_n, history_n, text_n, summary_n=None, diagnosis_n=None, any_n=None):
+    """Nested patient id sets of the given sizes.
+
+    The two feature sets are built to cover the text set exactly and to overlap in its middle,
+    so `all_text` is genuinely their intersection -- which is what `region_counts` checks, and
+    what an independently chosen `all_text` would violate.
+    """
+    summary_n = text_n if summary_n is None else summary_n
+    diagnosis_n = text_n if diagnosis_n is None else diagnosis_n
+    summary = set(range(summary_n))
+    diagnosis = set(range(text_n - diagnosis_n, text_n))
     return {
         'all': set(range(all_n)),
         'readable': set(range(history_n)),
         'any': set(range(history_n if any_n is None else any_n)),
-        'text': set(range(text_n)),
-        'summary': set(range(summary_n)),
-        'diagnosis': set(range(text_n - diagnosis_n, text_n)),
+        'text': summary | diagnosis,
+        'all_text': summary & diagnosis,
+        'summary': summary,
+        'diagnosis': diagnosis,
     }
 
 
 def test_the_regions_partition_the_cohort():
     counts = region_counts(_sets(1000, 700, 400, summary_n=300, diagnosis_n=250))
+    assert counts['all_text'] + counts['one_text_only'] == counts['text']
     assert counts['text'] + counts['history_only'] == counts['history']
     assert counts['history'] + counts['no_history'] == counts['all']
+
+
+def test_the_one_feature_ring_is_the_two_single_feature_regions():
+    """With two text features, all_text is their intersection, so the ring is the two
+    exclusive parts. A drawn ring that disagreed with the reported breakdown would be worse
+    than either alone."""
+    counts = region_counts(_sets(1000, 700, 400, summary_n=300, diagnosis_n=250))
+    assert counts['one_text_only'] == counts['summary_only'] + counts['diagnosis_only']
+
+
+def test_an_all_features_set_outside_a_single_feature_set_is_refused():
+    """The reduction over every feature and the indexed predicates have to agree."""
+    sets = _sets(1000, 700, 400, summary_n=300, diagnosis_n=250)
+    sets['all_text'] = set(sets['text'])
+    with pytest.raises(ValueError, match='misaligned'):
+        region_counts(sets)
 
 
 def test_the_per_feature_counts_still_partition_the_text_set():
@@ -65,10 +92,11 @@ def test_text_outside_the_history_set_is_refused():
     (28780, 23600, 9878),
     (1000, 999, 998),      # every ring vanishingly thin
     (1000, 10, 1),         # every ring wide
-    (500, 500, 500),       # the three coincide
+    (500, 500, 500),       # the four coincide
 ])
 def test_every_circle_stays_inside_the_one_containing_its_superset(all_n, history_n, text_n):
     geometry = layout(region_counts(_sets(all_n, history_n, text_n)))
+    assert geometry['all_text_r'] <= geometry['text_r'] + 1e-12
     assert geometry['text_r'] <= geometry['history_r'] + 1e-12
     assert geometry['history_r'] <= geometry['all_r'] + 1e-12
 
@@ -79,7 +107,8 @@ def test_circle_areas_are_proportional_to_the_counts():
     geometry = layout(counts)
 
     unit = math.pi * geometry['all_r'] ** 2 / counts['all']
-    for key, radius_key in (('history', 'history_r'), ('text', 'text_r')):
+    for key, radius_key in (('history', 'history_r'), ('text', 'text_r'),
+                            ('all_text', 'all_text_r')):
         area = math.pi * geometry[radius_key] ** 2
         assert area == pytest.approx(unit * counts[key], rel=1e-12), (
             f'{key} circle area is not proportional to its count'
@@ -89,6 +118,7 @@ def test_circle_areas_are_proportional_to_the_counts():
 def test_an_empty_cohort_does_not_divide_by_zero():
     geometry = layout(region_counts(_sets(0, 0, 0)))
     assert geometry['history_r'] == 0.0 and geometry['text_r'] == 0.0
+    assert geometry['all_text_r'] == 0.0
 
 
 def test_a_ring_can_be_too_thin_to_hold_its_count():

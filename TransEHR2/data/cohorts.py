@@ -36,8 +36,13 @@ hold no diagnosis record for an episode whose codes are perfectly available in
 record of *any* text feature. It replaces separate discharge-summary and diagnosis cohorts,
 which split a population too small to divide and asked the same question twice. Because text
 before the cutoff is itself a pre-admission record, `any_text` is a subset of `any_history` by
-construction. The two single-feature predicates remain, for describing the population rather
-than selecting it.
+construction.
+
+`all_text` is the intersection -- every text feature present -- and is a subset of `any_text`
+in turn. It is the population for the carry-forward analysis, which needs the diagnosis list
+to decide whether a label was already named and the summary as the input under test, so an
+episode missing either cannot contribute a comparison. The two single-feature predicates
+remain, for describing the population rather than selecting it.
 """
 
 import os
@@ -52,7 +57,8 @@ DIAGNOSIS_DESCRIPTIONS_INDEX = 1
 
 # Valid values for an experiment's COHORT_SUBSET, and the populations the analysis scripts
 # offer. `any_text` and `any_history` are the two the study runs on.
-COHORTS = ('discharge_summary', 'diagnosis_history', 'any_text', 'any_history')
+COHORTS = ('discharge_summary', 'diagnosis_history', 'all_text', 'any_text',
+           'any_history')
 
 
 def history_observed(masks, max_history_len_steps: int) -> np.ndarray:
@@ -121,6 +127,40 @@ def has_any_historical_text(val_masks, val_text_indicators,
     return (observed & present).any(axis=1)
 
 
+def has_all_historical_text(val_masks, val_text_indicators,
+                            max_history_len_steps: int) -> np.ndarray:
+    """Episodes carrying a pre-admission record of *every* text feature.
+
+    The intersection rather than the union, and a strict subset of `has_any_historical_text`.
+    It is the population for an analysis that needs both kinds of text present -- the
+    carry-forward contrast reads the diagnosis list to decide whether a label was already
+    named, and the summary is what the arm under test reads -- so an episode missing either
+    one cannot contribute a comparison.
+
+    Reduced over whatever text features the extraction holds, so it follows TEXT_FEATS. An
+    extraction with no text features returns all-False rather than the vacuous all-True: no
+    episode carries text there, which is what a caller asking this question means.
+
+    Args:
+        val_masks: (n_episodes, max_ts_len) nonzero at non-padding timesteps.
+        val_text_indicators: (n_episodes, max_ts_len, n_text_feats) presence indicators.
+        max_history_len_steps: Width of the history region in the extracted arrays.
+
+    Returns:
+        (n_episodes,) boolean array.
+    """
+    indicators = np.asarray(val_text_indicators)
+    observed = history_observed(val_masks, max_history_len_steps)
+    n_features = indicators.shape[2]
+    if n_features == 0:
+        return np.zeros(observed.shape[0], dtype=bool)
+    present = np.ones(observed.shape[0], dtype=bool)
+    for feature in range(n_features):
+        recorded = indicators[:, :max_history_len_steps, feature] > 0
+        present &= (observed & recorded).any(axis=1)
+    return present
+
+
 def has_value_history(val_masks, max_history_len_steps: int) -> np.ndarray:
     """Episodes carrying at least one pre-admission record the model can read.
 
@@ -181,6 +221,8 @@ def cohort_mask(arrays, cohort: Optional[str]) -> Optional[np.ndarray]:
     hist = int(field('max_history_len_steps'))
     if cohort == 'any_text':
         return has_any_historical_text(field('val_masks'), field('val_text_indicators'), hist)
+    if cohort == 'all_text':
+        return has_all_historical_text(field('val_masks'), field('val_text_indicators'), hist)
     text_index = {'discharge_summary': DISCHARGE_SUMMARY_INDEX,
                   'diagnosis_history': DIAGNOSIS_DESCRIPTIONS_INDEX}.get(cohort)
     if text_index is not None:
