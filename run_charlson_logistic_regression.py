@@ -5,7 +5,7 @@ A logistic regression on three features -- age at admission, sex, and the Charls
 index of the most recent earlier hospital admission -- fitted per fold on that fold's training
 split and applied to its validation and test splits. The predictions are written in the layout
 `dump_finetuned_predictions.py` uses, so the existing reporter treats this arm as one more
-column and the corrected resampled t test compares it against the in-stay-only model without
+column and the corrected resampled t test compares it against the peri-stay-only model without
 any special case:
 
     python report_results_tables.py --tasks mortality --cohorts charlson
@@ -14,7 +14,7 @@ Cohort and row order
 --------------------
 The cohort is the episode manifest `compute_charlson_index.py --write_cohort` writes: exactly
 those episodes for which all three features exist. Both arms are given that one file -- this
-one here, the in-stay-only control through `COHORT_EPISODES` in its experiment config -- and
+one here, the peri-stay-only control through `COHORT_EPISODES` in its experiment config -- and
 both resolve it through the same `load_dataset(..., cohort_episodes=...)` call, which selects
 rows by patient-episode ID in ascending array order. Row `i` of a prediction CSV is therefore
 the same episode in both arms, which is what the paired test requires.
@@ -65,7 +65,7 @@ from TransEHR2.data.statics import decode_categorical, static_offsets
 
 TASK = 'mortality'
 SPLITS = ('train', 'val', 'test')
-DEFAULT_EXPERIMENT = 'experiment19_charlson_logreg_charlsonsubset_rev'
+DEFAULT_EXPERIMENT = 'experiment29_charlson_logreg_charlsonsubset_rev'
 DEFAULT_CHARLSON_CSV = os.path.join('misc', 'charlson', 'charlson_index.csv')
 DEFAULT_COHORT = os.path.join('misc', 'charlson', 'charlson_cohort.txt')
 
@@ -154,7 +154,7 @@ def load_split(data_dir, fold, split, charlson, offsets, category_map, manifest,
         return None
 
     # The cohort is applied by the loader, so `episode_indices` is exactly the row subset and
-    # order that the in-stay-only control's inference loader produces for this partition.
+    # order that the peri-stay-only control's inference loader produces for this partition.
     # The manifest is what the control arm is also given, so both select the same rows in the
     # same order and the reporter can pair them by position.
     dataset = load_dataset(base, cohort_episodes=manifest,

@@ -50,8 +50,8 @@ from reporting.jmir.tables import Table, build_document, render_text
 from reporting.stats import benjamini_hochberg, corrected_resampled_ttest
 
 DEFAULT_INPUT_DIR = os.path.join('misc', 'stratified_carryforward')
-DEFAULT_REFERENCE = 'experiment10_instay_dischargesubset_rev'
-DEFAULT_TEXT_ARM = 'experiment14_instay_textonly_dischargesubset_rev'
+DEFAULT_REFERENCE = 'experiment20_peristay_textsubset_rev'
+DEFAULT_TEXT_ARM = 'experiment24_peristay_textonly_textsubset_rev'
 POOLED_ROW = 'All diagnoses pooled'
 
 DEFAULT_CAPTION = (

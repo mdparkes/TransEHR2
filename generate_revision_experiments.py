@@ -16,23 +16,22 @@ Usage:
 
 Cohorts. Comparing a model that reads pre-admission history against one that does not is
 diluted by episodes with no history to read, and the paired tests need both arms on the same
-episodes. `discharge_summary` keeps episodes with at least one pre-admission discharge summary;
-`any_history` keeps those with at least one pre-admission value-stream record, which is the
-wider cohort for contrasts the narrower one underpowers.
+episodes. `any_text` keeps episodes with at least one pre-admission record of either text
+feature; `any_history` keeps those with at least one pre-admission value-stream record, which
+is the wider cohort for contrasts the narrower one underpowers.
 
-Experiment 18 takes its cohort as an explicit episode manifest instead, through
-COHORT_EPISODES. It is the in-stay-only control that `run_charlson_logistic_regression.py` is
+Experiment 28 takes its cohort as an explicit episode manifest instead, through
+COHORT_EPISODES. It is the peri-stay-only control that `run_charlson_logistic_regression.py` is
 compared against, and that comparison's cohort is the episodes for which a Charlson index, an
 age and a sex all exist -- which is not a predicate over the extracted arrays. Handing both
 arms the one file `compute_charlson_index.py --write_cohort` writes is what puts them on the
 same episodes. Generate the configs after writing it: the path is recorded here, and
 `run_experiment.py` refuses to start if it is missing.
 
-Text. Only pre-admission text reaches the model: a text feature is a discharge-time artifact
-of an admission, so `collate_tensorized` drops any text record at or after admission rather
-than let a stay's own discharge documentation predict its outcome. A model reading in-stay
-records only therefore has no text available to it, which is why experiments 10 and 15 carry
-none.
+Text. Only pre-admission text reaches the model: text is subject to the same cutoff as every
+other feature, and `collate_tensorized` drops any text record from the era boundary onward.
+A model reading peri-stay records only therefore has no text available to it, which is why
+experiments 20 and 25 carry none.
 """
 
 import argparse
@@ -60,38 +59,44 @@ DROP_KEYS = ('EXPERIMENT_NAME', 'HISTORY_LEN_STEPS', 'USE_TEXT',
 # Written by compute_charlson_index.py --write_cohort; see the note on cohorts above.
 CHARLSON_COHORT = os.path.join('misc', 'charlson', 'charlson_cohort.txt')
 
-# (name, description, cohort, text, historical non-text, historical text, in-stay). A cohort
-# that is not one of the named predicates is taken as a path to an episode manifest.
+# (name, description, cohort, text, historical non-text, historical text, peri-stay). A
+# cohort that is not one of the named predicates is taken as a path to an episode manifest.
+#
+# Numbered from 20. The 10-19 series ran before the pre-admission cutoff and the merged
+# feature set, so its model directories and its results stand as the record of that run
+# rather than being overwritten by this one.
 EXPERIMENTS = [
-    ('experiment10_instay_dischargesubset_rev',
-     'In-Stay Records Only, Patients With At Least 1 Discharge Summary',
-     'discharge_summary', False, False, False, True),
-    ('experiment11_history_text_dischargesubset_rev',
-     'Historical Records Only, Text Features, Patients With At Least 1 Discharge Summary',
-     'discharge_summary', True, True, True, False),
-    ('experiment12_history_instay_notext_dischargesubset_rev',
-     'In-Stay + Historical Records, No Text Features, '
-     'Patients With At Least 1 Discharge Summary',
-     'discharge_summary', False, True, False, True),
-    ('experiment13_history_instay_text_dischargesubset_rev',
-     'In-Stay + Historical Records, Text Features, '
-     'Patients With At Least 1 Discharge Summary',
-     'discharge_summary', True, True, True, True),
-    ('experiment14_instay_textonly_dischargesubset_rev',
-     'In-Stay + Text Features Only, Patients With At Least 1 Discharge Summary',
-     'discharge_summary', True, False, True, True),
-    ('experiment15_instay_historysubset_rev',
-     'In-Stay Records Only, Patients With At Least 1 Historical Record',
+    ('experiment20_peristay_textsubset_rev',
+     'Peri-Stay Records Only, Patients With At Least 1 Pre-Admission Text Record',
+     'any_text', False, False, False, True),
+    ('experiment21_history_text_textsubset_rev',
+     'Historical Records Only, Text Features, '
+     'Patients With At Least 1 Pre-Admission Text Record',
+     'any_text', True, True, True, False),
+    ('experiment22_history_peristay_notext_textsubset_rev',
+     'Peri-Stay + Historical Records, No Text Features, '
+     'Patients With At Least 1 Pre-Admission Text Record',
+     'any_text', False, True, False, True),
+    ('experiment23_history_peristay_text_textsubset_rev',
+     'Peri-Stay + Historical Records, Text Features, '
+     'Patients With At Least 1 Pre-Admission Text Record',
+     'any_text', True, True, True, True),
+    ('experiment24_peristay_textonly_textsubset_rev',
+     'Peri-Stay + Text Features Only, '
+     'Patients With At Least 1 Pre-Admission Text Record',
+     'any_text', True, False, True, True),
+    ('experiment25_peristay_historysubset_rev',
+     'Peri-Stay Records Only, Patients With At Least 1 Historical Record',
      'any_history', False, False, False, True),
-    ('experiment16_history_text_historysubset_rev',
+    ('experiment26_history_text_historysubset_rev',
      'Historical Records Only, Text Features, Patients With At Least 1 Historical Record',
      'any_history', True, True, True, False),
-    ('experiment17_history_instay_text_historysubset_rev',
-     'In-Stay + Historical Records, Text Features, '
+    ('experiment27_history_peristay_text_historysubset_rev',
+     'Peri-Stay + Historical Records, Text Features, '
      'Patients With At Least 1 Historical Record',
      'any_history', True, True, True, True),
-    ('experiment18_instay_charlsonsubset_rev',
-     'In-Stay Records Only, Patients With A Charlson Comorbidity Index',
+    ('experiment28_peristay_charlsonsubset_rev',
+     'Peri-Stay Records Only, Patients With A Charlson Comorbidity Index',
      CHARLSON_COHORT, False, False, False, True),
 ]
 
@@ -137,13 +142,13 @@ def main(argv=None):
 
     width = max(len(name) for name, *_ in EXPERIMENTS)
     print(f"{'experiment':{width}}  {'cohort':17}  {'text':>5}  {'h-nontext':>9}  "
-          f"{'h-text':>6}  {'in-stay':>7}  {'hist steps':>10}")
+          f"{'h-text':>6}  {'peri-stay':>9}  {'hist steps':>10}")
     print('-' * (width + 66))
     for name, description, cohort, use_text, nontext, text, instay in EXPERIMENTS:
         config = build(base, name, cohort, use_text, nontext, text, instay)
         steps = config['HISTORY_LEN_STEPS']
         print(f'{name:{width}}  {cohort:17}  {str(use_text):>5}  {str(nontext):>9}  '
-              f'{str(text):>6}  {str(instay):>7}  '
+              f'{str(text):>6}  {str(instay):>9}  '
               f"{'all' if steps is None else steps:>10}")
         if args.dry_run:
             continue
