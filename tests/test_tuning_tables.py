@@ -326,3 +326,206 @@ def test_the_finetuning_schedule_is_recorded_from_now_on():
         assert key in run_experiment.RECORDED_HYPERPARAMETERS, (
             f'{key} is swept but not recorded, so its runs carry no coordinate'
         )
+
+
+# ------------------------------------------------------------------------------------------
+# The flat layout's structure
+# ------------------------------------------------------------------------------------------
+#
+# The flat table reports the configuration each row was run at, not only what the sweep
+# varied, so a column is kept even when every run shares its value: dropping it would leave
+# the table silent about the settings the phase inherited, which is what makes its rows
+# comparable to another phase's. The run name is not a column, since it identifies a
+# directory rather than a configuration.
+
+FLAT_SPEC = {
+    'GRID': {
+        'CMPNT_MASK_RATIO': {'values': [0.25, 0.5, 0.75]},
+        'RECORD_MASK_RATIO': {'values': [0.15, 0.25, 0.35]},
+        # Listed strongest first, which is the order the table reports and is not ascending.
+        'THP_PRED_LOSS_TIME_WT': {'values': [0.01, 0.001, 0.0001]},
+    }
+}
+
+# (name suffix, component mask, record mask, time weight, AUPRC), the centre first.
+FLAT_TRIALS = (
+    ('centre', 0.25, 0.15, 0.01, 0.5997),
+    ('cmask_0p5', 0.5, 0.15, 0.01, 0.5941),
+    ('cmask_0p75', 0.75, 0.15, 0.01, 0.5938),
+    ('rmask_0p25', 0.25, 0.25, 0.01, 0.6061),
+    ('rmask_0p35', 0.25, 0.35, 0.01, 0.5942),
+    ('timewt_0p001', 0.25, 0.15, 0.001, 0.5878),
+    ('timewt_0p0001', 0.25, 0.15, 0.0001, 0.5919),
+)
+
+
+@pytest.fixture
+def one_at_a_time(tmp_path):
+    """A one-at-a-time sweep on two arms, and the spec that defines its order.
+
+    The arms carry different inherited half-lives, as they do when the phases before this one
+    selected a schedule for each separately.
+    """
+    root = str(tmp_path / 'models')
+    for arm, half_life, offset in (('additive', 160, 0.0), ('rope', 60, -0.04)):
+        for suffix, cmask, rmask, timewt, auprc in FLAT_TRIALS:
+            write_run(root, f'phase2c_{arm}_tuned_{suffix}', 'mortality',
+                      {'POSITION_ENCODING': arm, 'PRETRAIN_LEARNING_RATE': 0.0006,
+                       'PRETRAIN_LR_HALF_LIFE': half_life, 'CMPNT_MASK_RATIO': cmask,
+                       'RECORD_MASK_RATIO': rmask, 'THP_PRED_LOSS_TIME_WT': timewt},
+                      'validation_scores', {'AUPRC': round(auprc + offset, 4), 'AUROC': 0.86})
+    spec_path = tmp_path / 'spec.yaml'
+    with open(spec_path, 'w') as handle:
+        yaml.safe_dump(FLAT_SPEC, handle)
+    return root, str(spec_path)
+
+
+def flat_table(root, spec=None, **kwargs):
+    runs = tables.discover(root, ['phase2c_*'], 'fold0', 'mortality')
+    return tables.build_flat(runs, ['val:AUROC', 'val:AUPRC'], 'S6', 'caption', 4,
+                             order=tables.spec_order(spec), **kwargs)
+
+
+def test_the_arm_is_the_first_column_and_the_run_name_is_not_reported(one_at_a_time):
+    root, spec = one_at_a_time
+    table = flat_table(root, spec)
+    assert strip_markup(table.stub_head).startswith('Temporal Encoding Method')
+    labels = {strip_markup(row.label) for row in table.rows if row.kind == 'metric'}
+    assert labels == {'TPE', 'RoPE'}
+
+
+def test_every_configuration_column_is_reported_even_when_it_does_not_vary(one_at_a_time):
+    root, spec = one_at_a_time
+    table = flat_table(root, spec)
+    assert [strip_markup(column) for column in table.columns] == [
+        'Pretraining Learn Rate',
+        'Pretraining Learn Rate Half-Life (Decay)',
+        'Embedding Component Mask Rate',
+        'Record Mask Ratio[b]',
+        'Transformer Hawkes Process Time Loss Weight',
+        'Validation AUROC',
+        'Validation AUPRC',
+    ]
+    # The pretraining rate is the same in all fourteen runs and is still a column.
+    rates = {strip_markup(row.cells[0]) for row in table.rows if row.kind == 'metric'}
+    assert rates == {strip_markup(tables.format_rate(0.0006))}
+
+
+def test_a_column_no_run_carries_is_dropped(one_at_a_time):
+    """None of these runs sets a finetuning schedule, so those columns are not reported as
+    empty ones."""
+    root, spec = one_at_a_time
+    columns = [strip_markup(column) for column in flat_table(root, spec).columns]
+    assert not any('Finetuning' in column for column in columns)
+
+
+def test_the_footnotes_are_lettered_along_the_header(one_at_a_time):
+    """JMIR letters footnotes left to right, so the stub's marker has to be allocated first."""
+    root, spec = one_at_a_time
+    table = flat_table(root, spec)
+    assert table.stub_head.endswith('<sup>a</sup>')
+    assert table.columns[3].endswith('<sup>b</sup>')
+    assert table.footnotes[0] == tables.ARM_FOOTNOTE
+    assert table.footnotes[1] == tables.COLUMN_FOOTNOTES['RECORD_MASK_RATIO']
+
+
+def test_the_rows_follow_the_spec_rather_than_the_trial_names(one_at_a_time):
+    """Sorting by name puts the time weights in ascending order and interleaves nothing else
+    correctly. The spec is what says 0.001 is reported before 0.0001."""
+    root, spec = one_at_a_time
+    table = flat_table(root, spec)
+    swept = [tuple(strip_markup(cell) for cell in row.cells[2:5])
+             for row in table.rows if row.kind == 'metric']
+    expected = [('0.25', '0.15', '0.01'), ('0.50', '0.15', '0.01'), ('0.75', '0.15', '0.01'),
+                ('0.25', '0.25', '0.01'), ('0.25', '0.35', '0.01'),
+                ('0.25', '0.15', '0.001'), ('0.25', '0.15', '0.0001')]
+    assert swept == expected * 2
+
+
+def test_each_arm_starts_at_its_own_centre(one_at_a_time):
+    """The centre has to be found per arm. Pooled over both, the arm holding the minority
+    half-life has no row matching it, and its centre row sorts to the bottom."""
+    root, spec = one_at_a_time
+    table = flat_table(root, spec)
+    rows = [row for row in table.rows if row.kind == 'metric']
+    first_rope = next(row for row in rows if strip_markup(row.label) == 'RoPE')
+    assert tuple(strip_markup(cell) for cell in first_rope.cells[2:5]) == ('0.25', '0.15',
+                                                                          '0.01')
+
+
+def test_the_arms_are_not_interleaved(one_at_a_time):
+    root, spec = one_at_a_time
+    labels = [strip_markup(row.label) for row in flat_table(root, spec).rows
+              if row.kind == 'metric']
+    assert labels == ['TPE'] * len(FLAT_TRIALS) + ['RoPE'] * len(FLAT_TRIALS)
+
+
+def test_the_best_row_of_each_arm_is_emphasised(one_at_a_time):
+    root, spec = one_at_a_time
+    table = flat_table(root, spec)
+    bold = [tuple(strip_markup(cell) for cell in row.cells[2:5])
+            for row in table.rows if row.kind == 'metric' and '<b>' in row.label]
+    # The record mask block's 0.25 wins in both arms, and both cells and label are emphasised.
+    assert bold == [('0.25', '0.25', '0.01')] * 2
+    emphasised = [row for row in table.rows if '<b>' in row.label]
+    assert all('<b>' in cell for row in emphasised for cell in row.cells)
+
+
+def test_emphasis_can_be_turned_off(one_at_a_time):
+    root, spec = one_at_a_time
+    table = flat_table(root, spec, highlight=False)
+    assert not any('<b>' in row.label for row in table.rows)
+
+
+def test_a_loss_is_best_at_its_minimum(tmp_path):
+    """Bolding the maximum of a loss column would mark the worst run as the selection."""
+    root = str(tmp_path / 'models')
+    for suffix, loss in (('centre', 0.42), ('cmask_0p5', 0.31), ('cmask_0p75', 0.55)):
+        write_run(root, f'phase2c_additive_tuned_{suffix}', 'pretrain',
+                  {'POSITION_ENCODING': 'additive'}, 'val_losses',
+                  {'Optimization_Loss': loss})
+    runs = tables.discover(root, ['phase2c_*'], 'fold0', 'pretrain')
+    table = tables.build_flat(runs, ['val:Optimization_Loss'], 'S6', 'caption', 4)
+    bold = [row.cells[-1] for row in table.rows if '<b>' in row.label]
+    assert bold == ['<b>0.3100</b>']
+
+
+def test_a_masking_ratio_is_written_to_a_common_width():
+    """0.5 beside 0.25 and 0.75 reads as a different quantity unless it is written 0.50."""
+    assert tables.format_axis(0.5, 'CMPNT_MASK_RATIO') == '0.50'
+    assert tables.format_axis(0.15, 'RECORD_MASK_RATIO') == '0.15'
+    # A weight is not a ratio and keeps its own width.
+    assert tables.format_axis(0.0001, 'THP_PRED_LOSS_TIME_WT') == '0.0001'
+
+
+def test_a_setting_only_the_trial_config_holds_is_reported(tmp_path):
+    """A one-at-a-time sweep names only what it varies, so a fixed setting outside
+    RECORDED_HYPERPARAMETERS is in neither the evaluation nor the name."""
+    root = str(tmp_path / 'models')
+    write_run(root, 'phase2c_additive_tuned_centre', 'mortality',
+              {'POSITION_ENCODING': 'additive', 'CMPNT_MASK_RATIO': 0.25},
+              'validation_scores', {'AUPRC': 0.5997})
+    config_dir = tmp_path / 'configs'
+    config_dir.mkdir()
+    with open(config_dir / 'phase2c_additive_tuned_centre.yaml', 'w') as handle:
+        yaml.safe_dump({'EXPERIMENT_NAME': 'phase2c_additive_tuned_centre',
+                        'FINETUNE_LEARNING_RATE': 5e-05,
+                        'FINETUNE_LR_HALF_LIFE': None}, handle)
+
+    runs = tables.discover(root, ['phase2c_*'], 'fold0', 'mortality')
+    configs = tables.config_index(str(config_dir / '**' / '*.yaml'))
+    table = tables.build_flat(runs, ['val:AUPRC'], 'S6', 'caption', 4, configs,
+                              highlight=False)
+    cells = dict(zip([strip_markup(column) for column in table.columns],
+                     table.rows[0].cells))
+    assert cells['Finetuning Learn Rate'] == tables.format_rate(5e-05)
+    assert strip_markup(cells['Finetuning Learn Rate Half-Life (Decay)']) == 'No Decay'
+
+
+def test_the_csv_carries_no_markup(tmp_path, one_at_a_time):
+    """A superscript or an emphasised row must not reach the CSV as tags."""
+    root, spec = one_at_a_time
+    path = str(tmp_path / 'out' / 'table.csv')
+    tables.write_csv(path, flat_table(root, spec))
+    text = open(path).read()
+    assert '<b>' not in text and '<sup>' not in text
