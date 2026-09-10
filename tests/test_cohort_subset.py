@@ -155,3 +155,66 @@ def test_the_diagnosis_cohort_needs_the_feature_to_exist():
     arrays = _text_arrays(3, 2, 1)
     with pytest.raises(ValueError, match='TEXT_FEATS'):
         cohort_mask(arrays, 'diagnosis_history')
+
+
+# ------------------------------------------------------------------------------------------
+# The text cohort the experiments run on
+# ------------------------------------------------------------------------------------------
+
+def test_the_text_cohort_is_the_union_of_the_text_features():
+    """`any_text` replaces the two single-feature cohorts, which split a population too small
+    to divide and asked the same question twice."""
+    history_len = 3
+    arrays = _text_arrays(history_len, 4, 2)
+    arrays['val_masks'][:, history_len - 1] = 1.0
+
+    # Episode 0: summary only. 1: diagnoses only. 2: both. 3: neither.
+    arrays['val_text_indicators'][0, history_len - 1, 0] = 1.0
+    arrays['val_text_indicators'][1, history_len - 1, 1] = 1.0
+    arrays['val_text_indicators'][2, history_len - 1, :] = 1.0
+
+    assert list(cohort_mask(arrays, 'any_text')) == [True, True, True, False]
+    assert list(cohort_indices(arrays, 'any_text')) == [0, 1, 2]
+
+
+def test_the_text_cohort_needs_the_text_before_the_cutoff():
+    """The history region is the pre-admission era, so a record in the episode region is
+    peri-stay text and no arm reads it."""
+    history_len = 3
+    arrays = _text_arrays(history_len, 2, 2)
+    arrays['val_masks'][:, history_len] = 1.0                   # first episode-region timestep
+    arrays['val_text_indicators'][0, history_len, 0] = 1.0
+
+    assert list(cohort_mask(arrays, 'any_text')) == [False, False]
+
+
+def test_the_text_cohort_needs_an_observed_timestep():
+    """An indicator on a padding timestep is not a record."""
+    history_len = 3
+    arrays = _text_arrays(history_len, 2, 2)
+    arrays['val_text_indicators'][0, history_len - 1, 0] = 1.0  # mask left at zero
+
+    assert list(cohort_mask(arrays, 'any_text')) == [False, False]
+
+
+def test_the_text_cohort_is_contained_in_the_history_cohort():
+    """Text before the cutoff is itself a pre-admission record, so the containment holds by
+    construction and the Euler diagram stays nested."""
+    history_len = 3
+    arrays = _text_arrays(history_len, 4, 2)
+    arrays['val_masks'][:, history_len - 1] = 1.0
+    arrays['val_text_indicators'][0, history_len - 1, 0] = 1.0
+    arrays['val_text_indicators'][1, history_len - 1, 1] = 1.0
+
+    text = cohort_mask(arrays, 'any_text')
+    history = cohort_mask(arrays, 'any_history')
+    assert not (text & ~history).any(), 'an episode is in the text cohort but not in history'
+
+
+def test_the_text_cohort_tolerates_an_extraction_with_no_text():
+    """A no-text extraction has an empty cohort rather than an indexing error."""
+    history_len = 3
+    arrays = _text_arrays(history_len, 3, 0)
+    arrays['val_masks'][:, history_len - 1] = 1.0
+
+    assert list(cohort_mask(arrays, 'any_text')) == [False, False, False]

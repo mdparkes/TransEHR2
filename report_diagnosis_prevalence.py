@@ -33,8 +33,7 @@ import sys
 import numpy as np
 import pandas as pd
 
-from TransEHR2.data.cohorts import (DIAGNOSIS_DESCRIPTIONS_INDEX, DISCHARGE_SUMMARY_INDEX,
-                                    has_historical_text, has_value_history)
+from TransEHR2.data.cohorts import has_any_historical_text, has_value_history
 from TransEHR2.data.preprocessing import load_dataset, load_episode_ids
 from reporting.jmir.tables import Table, build_document, render_text
 
@@ -47,8 +46,8 @@ DEFAULT_CAPTION = 'Diagnosis labels'
 def episode_cohorts(dataset) -> dict:
     """Boolean membership arrays for every reported cohort.
 
-    The predicates live here rather than in `TransEHR2.data.cohorts` for the text cohort only,
-    which is the union of the two text predicates that module still carries separately.
+    The cohorts are the two the experiments run on: any pre-admission record, and any
+    pre-admission text record.
 
     Args:
         dataset: A loaded `MixedDataset`.
@@ -57,15 +56,12 @@ def episode_cohorts(dataset) -> dict:
         Dict of cohort key to (n_episodes,) boolean array.
     """
     hist = dataset.max_history_len_steps
-    summary = has_historical_text(dataset.val_masks, dataset.val_text_indicators, hist,
-                                  DISCHARGE_SUMMARY_INDEX)
-    diagnosis = has_historical_text(dataset.val_masks, dataset.val_text_indicators, hist,
-                                    DIAGNOSIS_DESCRIPTIONS_INDEX)
     n = np.asarray(dataset.val_masks).shape[0]
     return {
         'all': np.ones(n, dtype=bool),
         'history': has_value_history(dataset.val_masks, hist),
-        'text': summary | diagnosis,
+        'text': has_any_historical_text(dataset.val_masks,
+                                        dataset.val_text_indicators, hist),
     }
 
 
