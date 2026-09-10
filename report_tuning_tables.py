@@ -290,7 +290,7 @@ def format_axis(value, key):
     power of ten, which is the house form.
     """
     if value is None:
-        return 'No decay'
+        return 'No Decay'
     if key.endswith('LEARNING_RATE'):
         return format_rate(value)
     label = f'{value:g}' if isinstance(value, (int, float)) else str(value)
@@ -379,7 +379,7 @@ def build_flat(runs, specs, number, caption, precision):
         for key in keys:
             value = hyperparameter(data, key, name)
             if value is None:
-                cells.append('No decay' if key.endswith('HALF_LIFE') else MISSING)
+                cells.append('No Decay' if key.endswith('HALF_LIFE') else MISSING)
             elif key == ARM_KEY:
                 cells.append(ARM_HEADINGS.get(value, render(value)))
             else:

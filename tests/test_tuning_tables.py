@@ -70,7 +70,7 @@ def test_the_grid_puts_every_value_in_its_own_cell(tree):
     runs = tables.discover(tree, ['phase_*'], 'fold0', 'mortality')
     table = tables.build_grid(runs, 'FINETUNE_LEARNING_RATE', 'FINETUNE_LR_HALF_LIFE',
                               'val:AUPRC', 'S5', 'caption', 4)
-    assert table.columns == ['160 Epochs', 'No decay']
+    assert table.columns == ['160 Epochs', 'No Decay']
     cells = cells_of(table)
     tpe, rope = (tables.ARM_HEADINGS['additive'], tables.ARM_HEADINGS['rope'])
     low, high = rate_label(1e-05), rate_label(5e-05)
@@ -106,7 +106,7 @@ def test_a_flat_schedule_sorts_last_and_is_named(tree):
     table = tables.build_grid(runs, 'FINETUNE_LEARNING_RATE', 'FINETUNE_LR_HALF_LIFE',
                               'val:AUPRC', 'S5', 'caption', 4)
     # None is the limit of the decay axis, not a missing value, so it belongs at the end.
-    assert table.columns[-1] == 'No decay'
+    assert table.columns[-1] == 'No Decay'
 
 
 def test_the_headings_use_the_house_wording(tree):
@@ -223,39 +223,43 @@ def write_unrecorded_run(root, arm, rate, half_life, auprc):
     return name
 
 
+# The finetuning grid's own axes: four rates, four half-lives and a flat schedule.
+UNRECORDED_RATES = (5e-05, 2.2e-05, 1e-05, 4.5e-06)
+UNRECORDED_HALF_LIVES = (160.0, 60.0, 20.0, 480.0, None)
+
+
+def unrecorded_value(arm, rate_index, half_life_index):
+    """A cell's metric, with its coordinates encoded so a misplaced cell is detectable."""
+    return round(0.5 + 0.1 * (arm == 'rope') + 0.01 * rate_index
+                 + 0.001 * half_life_index, 4)
+
+
 @pytest.fixture
 def unrecorded_tree(tmp_path):
-    """The finetuning grid's shape: two arms x four rates x (three half-lives + flat)."""
     root = str(tmp_path / 'models')
     for arm in ('additive', 'rope'):
         for i, rate in enumerate(UNRECORDED_RATES):
             for j, half_life in enumerate(UNRECORDED_HALF_LIVES):
-                # Coordinates encoded in the value, so a misplaced cell is detectable.
-                value = 0.5 + 0.1 * (arm == 'rope') + 0.01 * i + 0.001 * j
-                write_unrecorded_run(root, arm, rate, half_life, round(value, 4))
+                write_unrecorded_run(root, arm, rate, half_life,
+                                     unrecorded_value(arm, i, j))
     return root
-
-
-UNRECORDED_RATES = (5e-05, 2.2e-05, 1e-05, 5e-06)
-UNRECORDED_HALF_LIVES = (160.0, 60.0, 20.0, None)
 
 
 def test_the_grid_resolves_a_sweep_the_runs_did_not_record(unrecorded_tree):
     runs = tables.discover(unrecorded_tree, ['phase2b_*'], 'fold0', 'mortality')
-    assert len(runs) == 32
+    assert len(runs) == len(UNRECORDED_RATES) * len(UNRECORDED_HALF_LIVES) * 2 == 40
     table = tables.build_grid(runs, 'FINETUNE_LEARNING_RATE', 'FINETUNE_LR_HALF_LIFE',
-                              'val:AUPRC', 'S5', 'caption', 4)
-    assert table.columns == ['20 Epochs', '60 Epochs', '160 Epochs', 'No decay']
+                              'val:AUPRC', 'S5', 'caption', 3)
+    assert table.columns == ['20 Epochs', '60 Epochs', '160 Epochs', '480 Epochs', 'No Decay']
 
+    # The column order is the half-life ascending with the flat schedule last, which is not
+    # the order the tree was written in, so each cell is looked up by its own coordinates.
+    order = [UNRECORDED_HALF_LIVES.index(v) for v in (20.0, 60.0, 160.0, 480.0, None)]
     cells = cells_of(table)
     for arm in ('additive', 'rope'):
         for i, rate in enumerate(UNRECORDED_RATES):
-            base = 0.5 + 0.1 * (arm == 'rope') + 0.01 * i
-            # Column order is the half-life ascending, so the fixture's order 160/60/20/flat
-            # reverses for the first three and the flat schedule stays last.
             assert cells[(tables.ARM_HEADINGS[arm], rate_label(rate))] == [
-                f'{base + 0.002:.4f}', f'{base + 0.001:.4f}',
-                f'{base:.4f}', f'{base + 0.003:.4f}',
+                f'{unrecorded_value(arm, i, j):.3f}' for j in order
             ]
 
 
