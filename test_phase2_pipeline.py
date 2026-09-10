@@ -14,9 +14,12 @@ What it checks, in the order it checks it:
 
 2. **Data and the frequency ladder.** Loads the tuning fold and measures the largest temporal
    span the value and event encoders actually see, then checks the configured ladder bounds
-   against it. ``VALUE_LADDER_P_MAX: 8.05e+6`` follows from a Δ_max of 127,829 h measured on
-   the extracted arrays, so the check fails whenever a re-extraction moves that span and the
-   bound has not been re-derived.
+   against it. The value encoder reads both eras, so its span is the whole stored axis and
+   ``VALUE_LADDER_P_MAX`` follows from that. The event stream is measured from the era boundary
+   onward, because ``collate_tensorized`` slices the history region away before the Hawkes
+   process sees it -- measuring the stored array instead reports the pre-admission span and
+   recommends a P_MAX orders of magnitude too slow. Either bound fails the check when a
+   re-extraction moves its span and the bound has not been re-derived.
 
 3. **Memory.** Runs two batches of pretraining at the real batch size for each encoding arm and
    reports peak VRAM. Single-GPU packing is a premise of the entire phase, not a measurement,
@@ -317,6 +320,14 @@ def run_stage_data(args, report, base_config):
                           f'may predate that change.')
 
     # --------------------------------------------------- the ladder, against the real gaps
+    #
+    # The event stream is measured from the era boundary onward, because that is the only part
+    # of it the Hawkes process is given: `collate_tensorized` slices the history region away so
+    # that tensor index 0 is the first episode-region record for every episode. Measuring the
+    # stored array instead reports the full pre-admission span and recommends a P_MAX three
+    # orders of magnitude too slow, spanning the ladder over a range the encoder never sees.
+    # The value encoder does read both eras, so its span is the whole stored axis.
+    history_width = int(metadata.get('max_history_len_steps') or 0)
     for stream, times_name, masks_name, p_min_key, p_max_key in (
             ('value', 'val_times', 'val_masks', 'VALUE_LADDER_P_MIN', 'VALUE_LADDER_P_MAX'),
             ('event', 'event_times', 'event_masks', 'EVENT_LADDER_P_MIN', 'EVENT_LADDER_P_MAX'),
@@ -330,9 +341,14 @@ def run_stage_data(args, report, base_config):
 
         times = np.load(times_path, mmap_mode='r')
         masks = np.load(masks_path, mmap_mode='r')
+        read_from = history_width if stream == 'event' else 0
+        if read_from and read_from < times.shape[1]:
+            times, masks = times[:, read_from:], masks[:, read_from:]
         measured = measure_spans(times, masks, chunk=args.span_chunk)
         report.record('data', f'{stream} timestamps are readable', True,
-                      f'{times.shape[0]} episodes x {times.shape[1]} timesteps')
+                      f'{times.shape[0]} episodes x {times.shape[1]} timesteps'
+                      + (f' (from index {read_from}, as the encoder sees it)'
+                         if read_from else ''))
         report.note(
             f"{stream} stream: max span {measured['max_span']:,.1f} h, "
             f"median span {measured['median_span']:,.1f} h, "

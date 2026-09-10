@@ -40,6 +40,18 @@ EXPECTED_EMPTY = frozenset({'Troponin I'})
 # run, which is a different statement from a feature being absent from the extraction.
 TEXT_CATEGORIES = ('text_ind', 'text_emb')
 
+# Features present in the extraction whose VALUES are zero because the standardization's
+# 5th-95th percentile range was degenerate. Capillary refill rate is coded 0 with 4%
+# abnormal and Troponin T reports over 90% of results at its detection limit, so both
+# percentiles coincide and `standardize_feats` zeroed the feature. `feature_scale` fixes
+# that, but it applies only at extraction time and the current arrays predate it; carrying
+# the values was judged not to be worth a re-extraction. Their indicators are present, so
+# this applies to the value categories alone -- an absent indicator is a different fault
+# and still fails. Empty this set after any extraction that regenerates the statistics.
+EXPECTED_ZEROED = frozenset({'Capillary refill rate', 'Troponin T'})
+
+VALUE_CATEGORIES = tuple(f'{stream}_val' for stream in VALUE_TYPES)
+
 
 def check_split(split_path, feature_names):
     """Check a single data split for non-zero indicators/values.
@@ -152,8 +164,11 @@ def report(split_name, verified, feature_names, n_batches, n_samples,
         missing_indices = set(range(n_total)) - verified[key]
 
         missing_names = [names[i] for i in sorted(missing_indices)]
-        unexpected = [name for name in missing_names if name not in EXPECTED_EMPTY]
-        expected = [name for name in missing_names if name in EXPECTED_EMPTY]
+        tolerated = set(EXPECTED_EMPTY)
+        if key in VALUE_CATEGORIES:
+            tolerated |= set(EXPECTED_ZEROED)
+        unexpected = [name for name in missing_names if name not in tolerated]
+        expected = [name for name in missing_names if name in tolerated]
 
         pending = key in TEXT_CATEGORIES and not text_embed_dim
         if pending:
@@ -171,7 +186,9 @@ def report(split_name, verified, feature_names, n_batches, n_samples,
         else:
             print(f"  PASS  {label}: {n_verified}/{n_total}")
         for name in expected:
-            print(f"         - {name} (expected empty, see EXPECTED_EMPTY)")
+            reason = ("expected empty, see EXPECTED_EMPTY" if name in EXPECTED_EMPTY
+                      else "values zeroed by standardization, see EXPECTED_ZEROED")
+            print(f"         - {name} ({reason})")
 
     if all_passed:
         print(f"\n  All features in {split_name} passed.")
