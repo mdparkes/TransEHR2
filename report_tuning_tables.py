@@ -7,6 +7,12 @@ list from `generate_finetune_grid.py` with no manifest at all. `report_tuning_re
 a manifest and ranks one hyperparameter at a time, which covers neither the factorial phase nor
 the grid phase.
 
+What a run records is `RECORDED_HYPERPARAMETERS` in run_experiment.py, a fixed list. A sweep
+over anything outside it produces evaluations that do not say which cell they came from, and
+every run then collapses into a single cell of the grid. `NAME_TOKENS` closes that for the
+hyperparameters `generate_finetune_grid.py` writes into the cell name, so a table can still be
+built from runs finished before the list was extended.
+
 Two layouts, because the tables come in two shapes:
 
     grid    one cell per (row value, column value), one block per encoding arm. This is the
@@ -40,6 +46,7 @@ import argparse
 import fnmatch
 import math
 import os
+import re
 import sys
 
 import yaml
@@ -173,9 +180,76 @@ def check_metrics(runs, specs):
         )
 
 
-def hyperparameter(data, key):
-    """One recorded hyperparameter of a run, or None."""
-    return (data.get('hyperparameters') or {}).get(key)
+# The token `generate_finetune_grid.token` writes a value into the cell name as, for the
+# hyperparameters a run's evaluation may not record. Tokens hold no underscore, so each runs to
+# the next separator.
+NAME_TOKENS = {
+    'PRETRAIN_LEARNING_RATE': 'lr',
+    'PRETRAIN_LR_HALF_LIFE': 'hl',
+    'FINETUNE_LEARNING_RATE': 'lr',
+    'FINETUNE_LR_HALF_LIFE': 'hl',
+}
+
+
+def decode_token(text):
+    """The value a name token encodes, or None for a flat schedule.
+
+    `token` replaces '.' with 'p' and '-' with 'm' to keep the name filename-safe, so 5e-05
+    becomes '5em05'.
+
+    Args:
+        text: The token, without its prefix.
+
+    Returns:
+        The value as a float, or None if the token names a flat schedule.
+
+    Raises:
+        ValueError: If the token is neither, which keeps an unrelated name that happens to
+            contain the prefix from being read as a value.
+    """
+    if text.lower() in ('flat', 'none'):
+        return None
+    return float(text.replace('p', '.').replace('m', '-'))
+
+
+def from_name(name, key):
+    """One hyperparameter's value read out of an experiment name.
+
+    Args:
+        name: The EXPERIMENT_NAME of the run.
+        key: The hyperparameter to recover.
+
+    Returns:
+        The value, or None if the name carries no token for this key.
+    """
+    prefix = NAME_TOKENS.get(key)
+    if prefix is None:
+        return None
+    match = re.search(rf'_{prefix}([^_]+)', name)
+    if match is None:
+        return None
+    try:
+        return decode_token(match.group(1))
+    except ValueError:
+        return None
+
+
+def hyperparameter(data, key, name=None):
+    """One hyperparameter of a run, from its evaluation or else from its name.
+
+    Args:
+        data: The run's parsed evaluation YAML.
+        key: The hyperparameter to read.
+        name: The run's EXPERIMENT_NAME, consulted only when the evaluation does not carry the
+            key at all. A key recorded as None is a flat schedule, not a missing value.
+
+    Returns:
+        The value, or None.
+    """
+    recorded = data.get('hyperparameters') or {}
+    if key in recorded:
+        return recorded[key]
+    return from_name(name, key) if name is not None else None
 
 
 def axis_values(runs, key):
@@ -184,7 +258,7 @@ def axis_values(runs, key):
     Numerically where they are numbers, so a rate axis reads in order. None sorts last, being
     the flat schedule -- the limit of the decay axis rather than a missing value.
     """
-    values = {hyperparameter(data, key) for _, data in runs}
+    values = {hyperparameter(data, key, name) for name, data in runs}
     numeric = sorted(v for v in values if isinstance(v, (int, float)))
     other = sorted((str(v) for v in values if v is not None
                     and not isinstance(v, (int, float))))
@@ -241,7 +315,8 @@ def build_grid(runs, row_key, col_key, spec, number, caption, precision):
         The assembled `Table`.
     """
     controls = [name for name, data in runs
-                if any(hyperparameter(data, key) is not None for key in CONTROL_MARKERS)]
+                if any(hyperparameter(data, key, name) is not None
+                       for key in CONTROL_MARKERS)]
     if controls:
         print(f'  excluding {len(controls)} control run(s) from the grid: '
               f'{", ".join(controls)}')
@@ -263,10 +338,10 @@ def build_grid(runs, row_key, col_key, spec, number, caption, precision):
         for row_value in rows:
             cells = []
             for col_value in cols:
-                matches = [data for _, data in runs
-                           if hyperparameter(data, ARM_KEY) == arm
-                           and hyperparameter(data, row_key) == row_value
-                           and hyperparameter(data, col_key) == col_value]
+                matches = [data for name, data in runs
+                           if hyperparameter(data, ARM_KEY, name) == arm
+                           and hyperparameter(data, row_key, name) == row_value
+                           and hyperparameter(data, col_key, name) == col_value]
                 values = [metric_value(data, spec) for data in matches]
                 values = [value for value in values if value is not None]
                 if not values:
@@ -302,7 +377,7 @@ def build_flat(runs, specs, number, caption, precision):
     for name, data in runs:
         cells = []
         for key in keys:
-            value = hyperparameter(data, key)
+            value = hyperparameter(data, key, name)
             if value is None:
                 cells.append('No decay' if key.endswith('HALF_LIFE') else MISSING)
             elif key == ARM_KEY:

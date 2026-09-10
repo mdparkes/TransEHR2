@@ -18,6 +18,7 @@ import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import generate_finetune_grid as grid
 import report_tuning_tables as tables
 from reporting.jmir.tables import strip_markup
 
@@ -203,3 +204,121 @@ def test_the_flat_layout_keeps_the_control_runs(tmp_path):
     runs = tables.discover(root, ['phase_*'], 'fold0', 'mortality')
     table = tables.build_flat(runs, ['val:AUPRC'], 'S6', 'caption', 4)
     assert len([row for row in table.rows if row.kind == 'metric']) == 2
+
+
+# ------------------------------------------------------------------------------------------
+# Hyperparameters a run did not record
+# ------------------------------------------------------------------------------------------
+#
+# `RECORDED_HYPERPARAMETERS` in run_experiment.py is a fixed list. A sweep over a key outside
+# it writes evaluations that carry no coordinate, so every run answers None on both axes and
+# the whole sweep renders as one cell -- a table that looks finished and reports two numbers.
+# The cell name still carries the coordinates, because the generator writes them there.
+
+def write_unrecorded_run(root, arm, rate, half_life, auprc):
+    """One cell whose evaluation names the arm only, as the finetuning grid's runs did."""
+    name = f'phase2b_{arm}_lr{grid.token(rate)}_hl{grid.token(half_life)}'
+    write_run(root, name, 'mortality', {'POSITION_ENCODING': arm},
+              'validation_scores', {'AUPRC': auprc, 'AUROC': 0.8})
+    return name
+
+
+@pytest.fixture
+def unrecorded_tree(tmp_path):
+    """The finetuning grid's shape: two arms x four rates x (three half-lives + flat)."""
+    root = str(tmp_path / 'models')
+    for arm in ('additive', 'rope'):
+        for i, rate in enumerate(UNRECORDED_RATES):
+            for j, half_life in enumerate(UNRECORDED_HALF_LIVES):
+                # Coordinates encoded in the value, so a misplaced cell is detectable.
+                value = 0.5 + 0.1 * (arm == 'rope') + 0.01 * i + 0.001 * j
+                write_unrecorded_run(root, arm, rate, half_life, round(value, 4))
+    return root
+
+
+UNRECORDED_RATES = (5e-05, 2.2e-05, 1e-05, 5e-06)
+UNRECORDED_HALF_LIVES = (160.0, 60.0, 20.0, None)
+
+
+def test_the_grid_resolves_a_sweep_the_runs_did_not_record(unrecorded_tree):
+    runs = tables.discover(unrecorded_tree, ['phase2b_*'], 'fold0', 'mortality')
+    assert len(runs) == 32
+    table = tables.build_grid(runs, 'FINETUNE_LEARNING_RATE', 'FINETUNE_LR_HALF_LIFE',
+                              'val:AUPRC', 'S5', 'caption', 4)
+    assert table.columns == ['20 Epochs', '60 Epochs', '160 Epochs', 'No decay']
+
+    cells = cells_of(table)
+    for arm in ('additive', 'rope'):
+        for i, rate in enumerate(UNRECORDED_RATES):
+            base = 0.5 + 0.1 * (arm == 'rope') + 0.01 * i
+            # Column order is the half-life ascending, so the fixture's order 160/60/20/flat
+            # reverses for the first three and the flat schedule stays last.
+            assert cells[(tables.ARM_HEADINGS[arm], rate_label(rate))] == [
+                f'{base + 0.002:.4f}', f'{base + 0.001:.4f}',
+                f'{base:.4f}', f'{base + 0.003:.4f}',
+            ]
+
+
+def test_a_sweep_the_runs_did_not_record_still_drops_its_controls(tmp_path):
+    """A control carries no rate token, so nothing recovers a coordinate for it either. It
+    must be excluded rather than landing in the cell both axes read as None."""
+    root = str(tmp_path / 'models')
+    write_unrecorded_run(root, 'additive', 5e-05, None, 0.6551)
+    write_run(root, 'phase2b_additive_random', 'mortality',
+              {'POSITION_ENCODING': 'additive', 'FINETUNE_ENCODER_INIT': 'random'},
+              'validation_scores', {'AUPRC': 0.5613})
+    write_run(root, 'phase2b_additive_frozen', 'mortality',
+              {'POSITION_ENCODING': 'additive', 'FINETUNE_FREEZE_ENCODER': True},
+              'validation_scores', {'AUPRC': 0.6083})
+
+    runs = tables.discover(root, ['phase2b_*'], 'fold0', 'mortality')
+    assert len(runs) == 3
+    table = tables.build_grid(runs, 'FINETUNE_LEARNING_RATE', 'FINETUNE_LR_HALF_LIFE',
+                              'val:AUPRC', 'S5', 'caption', 4)
+    assert cells_of(table)[(tables.ARM_HEADINGS['additive'],
+                            rate_label(5e-05))] == ['0.6551']
+
+
+@pytest.mark.parametrize('value', [5e-05, 2.2e-05, 1e-05, 5e-06, 0.0006, 0.002,
+                                   480.0, 160.0, 60.0, 20.0, 329.0, None])
+def test_the_decoder_round_trips_the_token_the_generator_writes(value):
+    """The two halves are in different modules, so a change to either would otherwise put
+    every cell of the next grid in the wrong place without failing anything."""
+    assert tables.decode_token(grid.token(value)) == value
+
+
+def test_a_recorded_value_is_preferred_to_the_name(tmp_path):
+    """The name is a fallback, not a second source: a run that records the key is the
+    authority on what it ran, and a relinked or edited cell can disagree with its name."""
+    data = {'hyperparameters': {'FINETUNE_LEARNING_RATE': 1e-05}}
+    assert tables.hyperparameter(data, 'FINETUNE_LEARNING_RATE',
+                                 'phase2b_additive_lr5em05_hl160') == 1e-05
+
+
+def test_a_recorded_flat_schedule_is_not_read_as_a_missing_value(tmp_path):
+    """None is the flat schedule and a recorded one has to stay flat, or a run that recorded
+    no decay would be pulled into whatever cell its name names."""
+    data = {'hyperparameters': {'FINETUNE_LR_HALF_LIFE': None}}
+    assert tables.hyperparameter(data, 'FINETUNE_LR_HALF_LIFE',
+                                 'phase2b_additive_lr5em05_hl160') is None
+
+
+@pytest.mark.parametrize('name', ['phase2b_additive_random', 'phase2d_additive_seed3',
+                                  'phase2b_additive_lrflat_hlflat'])
+def test_a_name_carrying_no_rate_yields_no_rate(name):
+    assert tables.from_name(name, 'FINETUNE_LEARNING_RATE') is None
+
+
+def test_only_the_keys_the_generator_names_are_read_from_the_name():
+    """Anything else in a name is not a value, so a mask ratio must not be invented from it."""
+    assert tables.from_name('phase2c_additive_lr5em05_hl160', 'CMPNT_MASK_RATIO') is None
+
+
+def test_the_finetuning_schedule_is_recorded_from_now_on():
+    """The name fallback exists for the runs already on disk. Leaving the keys off the
+    recorded list would keep every later grid dependent on a naming convention."""
+    import run_experiment
+    for key in ('FINETUNE_LEARNING_RATE', 'FINETUNE_LR_HALF_LIFE'):
+        assert key in run_experiment.RECORDED_HYPERPARAMETERS, (
+            f'{key} is swept but not recorded, so its runs carry no coordinate'
+        )
