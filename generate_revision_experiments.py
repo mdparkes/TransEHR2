@@ -51,13 +51,29 @@ OUTPUT_DIR = os.path.join(REPO, 'TransEHR2', 'configs', 'experiments')
 # seeds included: all eight experiments share one seed pair, so a contrast between them is
 # paired on initialisation and batch order as well as on fold and episode, and each run
 # reproduces.
-DROP_KEYS = ('EXPERIMENT_NAME', 'HISTORY_LEN_STEPS', 'USE_TEXT',
+DROP_KEYS = ('EXPERIMENT_NAME', 'HISTORY_LEN_STEPS', 'PRETRAIN_TOTAL_EPOCH',
+             'USE_TEXT',
              'USE_HISTORICAL_NONTEXT_RECORDS', 'USE_HISTORICAL_TEXT_RECORDS',
              'USE_INSTAY_RECORDS', 'COHORT_SUBSET', 'COHORT_EPISODES',
              'USE_HISTORICAL_RECORDS')
 
 # Written by compute_charlson_index.py --write_cohort; see the note on cohorts above.
 CHARLSON_COHORT = os.path.join('misc', 'charlson', 'charlson_cohort.txt')
+
+# Epoch budgets for the reported runs, set here rather than inherited from the tuned base.
+#
+# A tuning budget and a final-run budget are different quantities. 200 epochs is enough to
+# rank hyperparameters -- it asks which of them reach a good place quickest, at an allowance
+# every trial shares -- but a reported model that is still improving when its budget runs out
+# is truncated rather than converged, and the result would be what the budget bought instead
+# of what the architecture did. The value encoder now carries 41 features rather than 10, and
+# pretraining reaches 200 epochs without a 40-epoch stretch of no improvement, so the budget
+# is raised for the runs that are reported.
+#
+# Early stopping still governs when a run actually ends: EARLY_STOPPING_PATIENCE is 40 epochs
+# without a validation improvement, so a converged run stops well inside this and pays nothing
+# for the larger allowance.
+PRETRAIN_TOTAL_EPOCH = 500
 
 # (name, description, cohort, text, historical non-text, historical text, peri-stay). A
 # cohort that is not one of the named predicates is taken as a path to an episode manifest.
@@ -119,6 +135,7 @@ def build(base: dict, name: str, cohort: str, use_text: bool, historical_nontext
     # masking 500 padded timesteps per episode. A run that keeps text must keep the region:
     # only pre-admission text reaches the model, so cropping the region removes all of it.
     config['HISTORY_LEN_STEPS'] = 0 if not (historical_nontext or historical_text) else None
+    config['PRETRAIN_TOTAL_EPOCH'] = PRETRAIN_TOTAL_EPOCH
     return config
 
 
