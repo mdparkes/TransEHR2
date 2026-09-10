@@ -53,6 +53,12 @@ DEFAULT_TABLES_DIR = 'tables'
 # The hyperparameter that names the encoding arm, which the grid layout blocks on.
 ARM_KEY = 'POSITION_ENCODING'
 
+# A run carrying one of these is a control, not a point in the rate-by-half-life plane: it sits
+# at the reference cell's rate and schedule but replaces or freezes the encoder. Left in, it
+# would be averaged into that cell alongside the grid run that belongs there. The flat layout
+# keeps them, since there the controls are rows of their own.
+CONTROL_MARKERS = ('FINETUNE_ENCODER_INIT', 'FINETUNE_FREEZE_ENCODER')
+
 # Printed for a cell whose run produced no result, so a hole is visible rather than looking
 # like a value of zero.
 MISSING = '--'
@@ -204,6 +210,13 @@ def build_grid(runs, row_key, col_key, spec, number, caption, precision):
     Returns:
         The assembled `Table`.
     """
+    controls = [name for name, data in runs
+                if any(hyperparameter(data, key) is not None for key in CONTROL_MARKERS)]
+    if controls:
+        print(f'  excluding {len(controls)} control run(s) from the grid: '
+              f'{", ".join(controls)}')
+        runs = [(name, data) for name, data in runs if name not in set(controls)]
+
     rows = axis_values(runs, row_key)
     cols = axis_values(runs, col_key)
     arms = axis_values(runs, ARM_KEY) or [None]

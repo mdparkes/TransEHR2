@@ -138,3 +138,39 @@ def test_no_matching_run_is_refused(tmp_path):
     os.makedirs(root)
     with pytest.raises(SystemExit, match='No evaluation found'):
         tables.discover(root, ['nothing_*'], 'fold0', 'mortality')
+
+
+def test_the_grid_excludes_the_control_runs(tmp_path):
+    """A control sits at the reference cell's rate and schedule but replaces or freezes the
+    encoder, so leaving it in averages it into the grid point that belongs there."""
+    root = str(tmp_path / 'models')
+    shared = {'POSITION_ENCODING': 'additive', 'FINETUNE_LEARNING_RATE': 5e-05,
+              'FINETUNE_LR_HALF_LIFE': None}
+    write_run(root, 'phase_lr5em05_hlflat', 'mortality', shared,
+              'validation_scores', {'AUPRC': 0.6551})
+    write_run(root, 'phase_ctl_random', 'mortality',
+              dict(shared, FINETUNE_ENCODER_INIT='random'),
+              'validation_scores', {'AUPRC': 0.5613})
+    write_run(root, 'phase_ctl_frozen', 'mortality',
+              dict(shared, FINETUNE_FREEZE_ENCODER=True),
+              'validation_scores', {'AUPRC': 0.6083})
+
+    runs = tables.discover(root, ['phase_*'], 'fold0', 'mortality')
+    assert len(runs) == 3
+    table = tables.build_grid(runs, 'FINETUNE_LEARNING_RATE', 'FINETUNE_LR_HALF_LIFE',
+                              'val:AUPRC', 'S5', 'caption', 4)
+    # The grid run alone, and no (n=) annotation, so the cell matches 2a's shape.
+    assert cells_of(table)[(tables.ARM_HEADINGS['additive'], '5e-05')] == ['0.6551']
+
+
+def test_the_flat_layout_keeps_the_control_runs(tmp_path):
+    root = str(tmp_path / 'models')
+    shared = {'POSITION_ENCODING': 'additive', 'FINETUNE_LEARNING_RATE': 5e-05}
+    write_run(root, 'phase_lr5em05_hlflat', 'mortality', shared,
+              'validation_scores', {'AUPRC': 0.6551})
+    write_run(root, 'phase_ctl_random', 'mortality',
+              dict(shared, FINETUNE_ENCODER_INIT='random'),
+              'validation_scores', {'AUPRC': 0.5613})
+    runs = tables.discover(root, ['phase_*'], 'fold0', 'mortality')
+    table = tables.build_flat(runs, ['val:AUPRC'], 'S6', 'caption', 4)
+    assert len([row for row in table.rows if row.kind == 'metric']) == 2
