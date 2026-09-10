@@ -271,13 +271,15 @@ def ring_label(ax, value: int, inner_r: float, outer_r: float, side: int) -> boo
     return True
 
 
-def draw(counts: dict, output: str, title: str) -> None:
+def draw(counts: dict, output: str, title: str, dpi: int = 300) -> None:
     """Render the Euler diagram and write it to `output`.
 
     Args:
         counts: Region counts from `region_counts`.
         output: Destination path; the extension picks the format.
         title: Figure title.
+        dpi: Raster resolution. Ignored for a vector format. 300 is the usual journal
+            minimum for a raster figure; 600 is worth it for line art, which this is.
     """
     n_all, n_history, n_text = counts['all'], counts['history'], counts['text']
     n_sum, n_diag, n_all_text = counts['summary'], counts['diagnosis'], counts['all_text']
@@ -350,7 +352,7 @@ def draw(counts: dict, output: str, title: str) -> None:
         ax.set_title(title, fontsize=12)
     fig.subplots_adjust(bottom=0.24, top=0.96)
     os.makedirs(os.path.dirname(output) or '.', exist_ok=True)
-    fig.savefig(output, dpi=300)
+    fig.savefig(output, dpi=dpi)
     plt.close(fig)
     print(f'Wrote {output}')
 
@@ -446,6 +448,10 @@ def main(argv=None):
                         help='Figure path; the extension picks the format')
     parser.add_argument('--csv', default=None, help='Also write the counts to this CSV')
     parser.add_argument('--title', default='', help='Figure title (default: none)')
+    parser.add_argument('--dpi', type=int, default=300,
+                        help='Raster resolution, ignored for a vector format. 300 '
+                             'is the usual journal minimum; 600 is worth it for '
+                             'line art (default: 300)')
     parser.add_argument('--extracted-history-len-steps', type=int, default=None,
                         help='Width of the history region in the extracted arrays. Only needed '
                              'for datasets written before the layout was recorded in metadata.')
@@ -471,7 +477,7 @@ def main(argv=None):
         print(f'Wrote {args.csv}')
 
     if not args.no_figure:
-        draw(counts, args.output, args.title)
+        draw(counts, args.output, args.title, args.dpi)
     return 0
 
 
