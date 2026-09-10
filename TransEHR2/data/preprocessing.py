@@ -1764,6 +1764,39 @@ def load_dataset(
     )
 
 
+def feature_scale(norms: np.ndarray) -> float:
+    """A non-degenerate scale for one numeric feature's observed magnitudes.
+
+    The 5th-95th percentile range is the estimator of record: robust, and wide enough that a
+    typical value standardizes to order one. It collapses to zero for a feature whose
+    distribution is concentrated enough that both percentiles land on the same value, which is
+    ordinary for a laboratory result reported at a detection limit, or for an assessment coded
+    0 and abnormal in a few percent of cases. Dividing by that zero is what the caller's guard
+    prevents, but zeroing the feature in its place discards every value it holds and leaves the
+    occurrence indicator behind -- which is exactly the state a feature is moved onto the value
+    stream to escape.
+
+    So the range widens until it is non-degenerate, and only a feature that is genuinely
+    constant is given no scale at all. Widening in this order matters: the outermost
+    percentiles are tried before the full span, because for a heavy-tailed feature the span is
+    set by the largest outlier and would compress every typical value to near zero.
+
+    Args:
+        norms: (n_observed,) magnitudes of one feature's observed values.
+
+    Returns:
+        A positive scale, or 0.0 when the feature takes one value throughout.
+    """
+    if norms.size == 0:
+        return 0.0
+    for low, high in ((5, 95), (1, 99)):
+        lower, upper = np.percentile(norms, [low, high])
+        if upper > lower:
+            return float(upper - lower)
+    span = float(norms.max() - norms.min())
+    return span if span > 0.0 else 0.0
+
+
 def standardize_feats(
     arrays: Dict[str, Union[np.ndarray, List[np.ndarray]]],
     dims: TensorDimensions,
@@ -1800,33 +1833,40 @@ def standardize_feats(
         means = data['means']
         p5 = data['p5']
         p95 = data['p95']
+        # `scale` is what the values are actually divided by. Statistics written before it was
+        # recorded fall back to the range it replaced, so an existing npz keeps its meaning.
+        scale = data['scale'] if 'scale' in data.files else (p95 - p5)
     else:
         means = np.zeros(n_feats, dtype=np.float32)
         p5 = np.zeros(n_feats, dtype=np.float32)
         p95 = np.zeros(n_feats, dtype=np.float32)
-        
+        scale = np.zeros(n_feats, dtype=np.float32)
+
         indicators = arrays['val_numeric_indicators']
-        
+
         for f in range(n_feats):
             values = arrays['val_numeric_values'][f]
             mask = indicators[:, :, f] == 1.0
-            
+
             if mask.any():
                 observed = values[mask]
                 means[f] = observed.mean()
                 norms = np.linalg.norm(observed, ord=2, axis=-1)
                 p5[f] = np.percentile(norms, 5)
                 p95[f] = np.percentile(norms, 95)
-        
+                scale[f] = feature_scale(norms)
+
         if save_path is not None:
-            np.savez(save_path, means=means, p5=p5, p95=p95)
-    
+            np.savez(save_path, means=means, p5=p5, p95=p95, scale=scale)
+
     for f in range(n_feats):
-        if p5[f] == p95[f]:
+        # A zero scale means the feature is constant wherever it is observed, so it carries no
+        # information beyond its own occurrence and the indicator already says that.
+        if scale[f] == 0:
             arrays['val_numeric_values'][f][:] = 0
         else:
             arrays['val_numeric_values'][f] -= means[f]
-            arrays['val_numeric_values'][f] /= (p95[f] - p5[f])
+            arrays['val_numeric_values'][f] /= scale[f]
 
 
 def get_text_counts_from_dataset_vectorized(dataset) -> np.ndarray:
