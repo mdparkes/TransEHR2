@@ -45,7 +45,11 @@ VALUE_LADDER_P_MIN: 2.0
 VALUE_LADDER_P_MAX: 8.05e+6  # 63 x 127,829 h. yaml 1.1 needs the sign, or this parses as a
                              # string, and a string reaches the ladder builder as a bad bound
 EVENT_LADDER_P_MIN: 2.0
-EVENT_LADDER_P_MAX: 3000.0
+EVENT_LADDER_P_MAX: 6048.0  # 63 x 96 h, the peri-stay window: PREADMISSION_CUTOFF_HOURS
+                            # before admission through MAX_EPISODE_LEN_HOURS after it. The
+                            # event stream is sliced at the era boundary before the Hawkes
+                            # process reads it, so the span it must represent is that
+                            # window and not the stored history.
 
 GENERATOR_ENCODER_D_MODEL: 256
 GENERATOR_ENCODER_N_HEADS: 2

@@ -46,7 +46,10 @@ THP_D_K = 128
 # moves with a re-extraction; P_max has to be re-derived when it does.
 VALUE_GAP_MAX = 127_829.0
 VALUE_P_MIN, VALUE_P_MAX = 2.0, 8.05e6
-EVENT_P_MIN, EVENT_P_MAX = 2.0, 3000.0
+# 63 x 96 h: the peri-stay window the event stream is sliced down to, not the stored
+# history. See the note on the value bounds above -- this one moves with
+# PREADMISSION_CUTOFF_HOURS and MAX_EPISODE_LEN_HOURS rather than with a measurement.
+EVENT_P_MIN, EVENT_P_MAX = 2.0, 6048.0
 
 # Small shapes for the end-to-end probes.
 N_FEATURES = 6
@@ -157,7 +160,7 @@ def test_informative_band_counts_match_the_plan():
     print(f'  informative bands per scale: value {value_count}, event {event_count}')
 
     assert 27 <= value_count <= 31, f'value ladder gives {value_count} bands per scale, expected ~29'
-    assert 57 <= event_count <= 62, f'event ladder gives {event_count} bands per scale, expected ~59'
+    assert 52 <= event_count <= 58, f'event ladder gives {event_count} bands per scale, expected ~55'
     assert event_count > value_count, (
         'the narrower event range must buy resolution -- that is the whole point of giving the '
         'event stream its own ladder post fix 03'

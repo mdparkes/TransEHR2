@@ -69,16 +69,17 @@ GRID:
 #
 # NOTE ON DIRECTION. The revision plan proposes this the other way round -- run a *narrowed*
 # event ladder against a shared one -- but that is stale. The narrowed event ladder already
-# landed: every config carries EVENT_LADDER_P_MAX = 3000 (~63 x 48 h) against the value
+# landed: every config carries EVENT_LADDER_P_MAX = 6048 (~63 x 96 h) against the value
 # stream's 8.05e6, and TransEHR2/test_rope_encoding.py asserts the resulting band counts. The
 # differentiated ladder is the default, so the missing half of the comparison is the shared
 # one, and that is what this trial runs.
 #
-# What it tests: after fix 03 the event encoder sees only in-stay records, so its gaps span
-# 1-48 h while the value encoder still spans five orders of magnitude. Matching the ladder to
-# the narrower range buys ~59 informative bands per scale against ~29 under the value ladder,
-# a 2x gain in effective temporal resolution. That is a prediction, not a measurement, and
-# this is the run that measures it.
+# What it tests: after fix 03 the event encoder sees only the peri-stay region, so its gaps
+# span at most 96 h -- PREADMISSION_CUTOFF_HOURS before admission through
+# MAX_EPISODE_LEN_HOURS after it -- while the value encoder still spans five orders of
+# magnitude. Matching the ladder to the narrower range buys ~55 informative bands per scale
+# against ~29 under the value ladder, a 1.9x gain in effective temporal resolution. That is
+# a prediction, not a measurement, and this is the run that measures it.
 #
 # Why it is free: the sweep is 6 wide in each of two stages against an 8-wide node, so a
 # seventh trial fills an idle slot in each. Fourteen runs instead of twelve, same two stages,
