@@ -51,13 +51,14 @@ def check_split(split_path, feature_names):
     # The batch the model actually reads: the event stream sliced at the era boundary and the
     # text guard applied. history_len_steps must be the real width -- passing 0 means "no
     # history region", which makes the guard drop every text record and report text as
-    # missing everywhere.
+    # missing everywhere. history_len_steps is the post-crop length, matching the contract
+    # the production loaders use.
     loader = DataLoader(
         dataset,
         batch_size=BATCH_SIZE,
         shuffle=False,
         collate_fn=partial(collate_tensorized,
-                           history_len_steps=dataset.max_history_len_steps),
+                           history_len_steps=dataset.history_len_steps),
         num_workers=0,
     )
 
