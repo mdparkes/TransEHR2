@@ -213,6 +213,31 @@ def run_stage_environment(args, report):
                       False, f"{type(error).__name__}: {error}")
 
 
+def _bands_per_scale(n_bands, p_min, p_max, gap=10.0):
+    """Informative bands per decade of gap for a ladder over [p_min, p_max].
+
+    A band says something usable about a gap when 0.1 <= gap / lambda <= pi. The count is what
+    changes when a bound moves, and it is the quantity a bound should be chosen on: the number
+    of bands is fixed, so widening the span in either direction thins the whole range.
+
+    Args:
+        n_bands: Ladder width, which the additive encoder builds as d_model // 2.
+        p_min: Shortest band period, in hours.
+        p_max: Longest band period, in hours.
+        gap: Representative gap to count against, in hours.
+
+    Returns:
+        Band count, or -1 if the ladder cannot be built.
+    """
+    try:
+        from TransEHR2.layers import build_frequency_ladder
+        lambdas = build_frequency_ladder(int(n_bands), float(p_min), float(p_max))
+        ratios = gap / lambdas.numpy()
+        return int(((ratios >= 0.1) & (ratios <= np.pi)).sum())
+    except Exception:
+        return -1
+
+
 def measure_spans(times, masks, chunk=4096):
     """Measure the largest temporal span within an episode, over valid timesteps only.
 
@@ -328,6 +353,14 @@ def run_stage_data(args, report, base_config):
     # orders of magnitude too slow, spanning the ladder over a range the encoder never sees.
     # The value encoder does read both eras, so its span is the whole stored axis.
     history_width = int(metadata.get('max_history_len_steps') or 0)
+    # The additive encoder builds the ladder d_model // 2 wide (see build_frequency_ladder's
+    # caller in TransEHR2/layers.py), each stream from its own encoder's d_model. The RoPE arm
+    # partitions per head instead, so these counts describe the additive arm; the note they
+    # feed is about the direction of a trade-off rather than an exact per-arm figure.
+    ladder_width = {
+        'value': int(base_config.get('GENERATOR_ENCODER_D_MODEL', 256)) // 2,
+        'event': int(base_config.get('THP_ENCODER_D_MODEL', 256)) // 2,
+    }
     for stream, times_name, masks_name, p_min_key, p_max_key in (
             ('value', 'val_times', 'val_masks', 'VALUE_LADDER_P_MIN', 'VALUE_LADDER_P_MAX'),
             ('event', 'event_times', 'event_masks', 'EVENT_LADDER_P_MIN', 'EVENT_LADDER_P_MAX'),
@@ -385,18 +418,27 @@ def run_stage_data(args, report, base_config):
                 f"above and update the base config before generating the sweep."
             )
 
-        # P_MIN = 2 x the finest resolution. Below that the fastest band aliases.
+        # P_MIN against the finest observed step, reported with what closing the gap would
+        # cost. The band count is fixed, so lowering P_MIN widens the span and takes bands
+        # away from the whole informative range -- and the closest pair of records in this
+        # data is a text note beside its own hour bucket, or two results from one draw, which
+        # are contemporaneous and have nothing to resolve. So this is a measurement to read
+        # and not a bound to satisfy; it is a note rather than a warning for that reason.
         if measured['min_step_gap']:
             required_p_min = 2.0 * measured['min_step_gap']
             if float(p_min) <= required_p_min * 1.5:
-                report.record('data', f'{p_min_key} is at or below the Nyquist bound', True,
+                report.record('data', f'{p_min_key} resolves the finest observed step', True,
                               f"configured {float(p_min):g} h against 2 x "
                               f"{measured['min_step_gap']:g} h = {required_p_min:g} h")
             else:
-                report.record('data', f'{p_min_key} is at or below the Nyquist bound', None,
-                              f"configured {float(p_min):g} h exceeds 2 x the finest observed "
-                              f"step of {measured['min_step_gap']:g} h, so the fastest band "
-                              f"cannot resolve the closest pair of records.")
+                report.note(
+                    f"{p_min_key} {float(p_min):g} h is coarser than 2 x the finest observed "
+                    f"step ({measured['min_step_gap']:g} h): "
+                    f"{_bands_per_scale(ladder_width[stream], p_min, p_max)} informative "
+                    f"bands per scale as configured against "
+                    f"{_bands_per_scale(ladder_width[stream], required_p_min, p_max)} at "
+                    f"that bound, so meeting it would cost resolution rather than buy it"
+                )
 
 
 def parse_peak_memory(text):
