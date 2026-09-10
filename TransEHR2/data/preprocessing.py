@@ -936,6 +936,46 @@ def compute_static_feat_dims(var_properties, static_feats, max_token_length):
     return dims
 
 
+# The value stream's feature types, in the order `_get_tensor_dimensions` allocates their
+# indicator tensors. A type outside this tuple occupies no tensor.
+VALUE_TYPES = ('numeric', 'categorical', 'ordinal', 'multilabel')
+
+
+def partition_valued_feats(valued_feats: List[str], var_properties: dict) -> dict:
+    """Group value-associated features by type, in indicator column order.
+
+    Extraction writes one indicator tensor per type and preserves the config order within each
+    type, so a column's meaning is recoverable only by repeating that grouping. `VALUED_FEATS`
+    is not itself grouped by type, so slicing it at the per-type counts attaches the wrong name
+    to every column past the first type boundary.
+
+    Args:
+        valued_feats: Feature names in config order.
+        var_properties: The parsed variable properties, keyed by feature name.
+
+    Returns:
+        Dict mapping each of `VALUE_TYPES` to its feature names, in column order.
+
+    Raises:
+        ValueError: If a feature is undeclared, or carries a type that occupies no indicator
+            tensor -- either of which would otherwise misname a column silently.
+    """
+    grouped = {value_type: [] for value_type in VALUE_TYPES}
+    for name in valued_feats:
+        if name not in var_properties:
+            raise ValueError(
+                f'{name} is named as a valued feature but not in the variable properties, so '
+                f'the indicator column it occupies cannot be identified.'
+            )
+        value_type = var_properties[name]['type']
+        if value_type not in grouped:
+            raise ValueError(
+                f'{name} has type {value_type!r}, which occupies no value indicator tensor.'
+            )
+        grouped[value_type].append(name)
+    return grouped
+
+
 def _get_tensor_dimensions(
     var_properties_path: str,
     valued_feats: List[str],
