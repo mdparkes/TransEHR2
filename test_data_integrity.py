@@ -34,6 +34,12 @@ BATCH_SIZE = 100
 # failing, so that a real gap still stands out.
 EXPECTED_EMPTY = frozenset({'Troponin I'})
 
+# Text reaches a batch only through its embeddings: `collate_tensorized` takes the text
+# feature count from len(val_text_embeddings), so with none on disk the batch carries no
+# text block and neither text category can be verified. That is embed_text.py not having
+# run, which is a different statement from a feature being absent from the extraction.
+TEXT_CATEGORIES = ('text_ind', 'text_emb')
+
 
 def check_split(split_path, feature_names):
     """Check a single data split for non-zero indicators/values.
@@ -112,16 +118,21 @@ def check_split(split_path, feature_names):
         if sum(len(seen) for seen in verified.values()) >= total_expected:
             break
 
-    return verified, n_batches, len(dataset)
+    return verified, n_batches, len(dataset), int(dataset.text_embed_dim or 0)
 
 
-def report(split_name, verified, feature_names, n_batches, n_samples):
+def report(split_name, verified, feature_names, n_batches, n_samples,
+           text_embed_dim=0):
     """Print a report for a single split."""
     print(f"\n{'='*60}")
     print(f"  {split_name.upper()} split  ({n_samples} samples, {n_batches} batches)")
     print(f"{'='*60}")
 
     all_passed = True
+    if not text_embed_dim and feature_names['text']:
+        print('  Text embeddings are absent, so the text categories are pending rather '
+              'than failing.')
+        print('  Run embed_text.py on a GPU node and repeat this check.')
 
     categories = []
     for stream in VALUE_TYPES:
@@ -143,6 +154,11 @@ def report(split_name, verified, feature_names, n_batches, n_samples):
         missing_names = [names[i] for i in sorted(missing_indices)]
         unexpected = [name for name in missing_names if name not in EXPECTED_EMPTY]
         expected = [name for name in missing_names if name in EXPECTED_EMPTY]
+
+        pending = key in TEXT_CATEGORIES and not text_embed_dim
+        if pending:
+            print(f"  PEND  {label}: not verifiable until embed_text.py has run")
+            continue
 
         if unexpected:
             all_passed = False
@@ -228,8 +244,10 @@ def main():
                 print(f"\nERROR: {split} directory not found at {split_path}")
                 sys.exit(1)
 
-        verified, n_batches, n_samples = check_split(split_path, feature_names)
-        passed = report(split, verified, feature_names, n_batches, n_samples)
+        verified, n_batches, n_samples, text_embed_dim = check_split(
+            split_path, feature_names)
+        passed = report(split, verified, feature_names, n_batches, n_samples,
+                        text_embed_dim)
         if not passed:
             overall_pass = False
 
