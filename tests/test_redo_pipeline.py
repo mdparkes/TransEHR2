@@ -192,12 +192,56 @@ def test_the_download_lands_in_the_repository_it_is_run_from(coordinator):
     """The absolute path on SDRE is not the absolute path on the laptop, so only the source
     side may be absolute; an absolute destination would write the cluster's tree locally."""
     block = coordinator[coordinator.index('print_rsync() {'):coordinator.index('EOF\n}')]
-    for line in block.splitlines():
-        if 'rsync -avz' in line:
-            destination = line.split()[-1]
-            assert destination.startswith('./'), (
-                f'destination {destination!r} is not relative to the local repository'
+    # Continuations first: a wrapped rsync ends its line with a backslash, not its destination.
+    joined = re.sub(r'\\+\s*\n\s*', ' ', block)
+    invocations = [line for line in joined.splitlines() if 'rsync -avz' in line]
+    assert invocations, 'the download block runs no rsync'
+    for line in invocations:
+        destination = line.split()[-1]
+        assert destination.startswith('./'), (
+            f'destination {destination!r} is not relative to the local repository'
+        )
+
+
+# Every reporter defaults to a relative ./models, which is not the tree the training wrote to:
+# the experiment configs carry an absolute MODEL_DIR. A reporter pointed at the wrong tree finds
+# no experiment directories and reports empty columns rather than failing.
+@pytest.mark.parametrize('script,flag', [
+    ('report_results_tables.py', '--model-dir'),
+    ('stratify_predictions_by_history.py', '--model-dir'),
+    ('run_charlson_logistic_regression.py', '--model_dir'),
+])
+def test_every_reporter_is_pointed_at_the_tree_the_runs_wrote_to(report_job, script, flag):
+    body = commands(report_job)
+    for block in body.split('stage '):
+        if script in block:
+            assert f'{flag} "${{MODEL_DIR}}"' in block, (
+                f'{script} is invoked without {flag}, so it reads its own default'
             )
+
+
+def test_the_report_job_stops_when_the_model_tree_is_absent(report_job):
+    """Reported as an error rather than as nine empty tables."""
+    assert '! -d "${MODEL_DIR}"' in report_job
+
+
+def test_the_charlson_paths_are_named_rather_than_defaulted(coordinator):
+    """compute_charlson_index writes to its own default when --write_cohort is bare, which
+    agrees with CHARLSON_DIR only by coincidence; experiment 28 reads the path this names."""
+    assert '--write_cohort "${CHARLSON_EPISODES}"' in coordinator
+    assert '--output "${CHARLSON_CSV}"' in coordinator
+
+
+def test_the_download_takes_the_predictions_from_the_model_tree(coordinator):
+    """dump_finetuned_predictions writes under {model_dir}/{experiment}/{fold}/{task}/, not to
+    a directory of its own, and that tree also holds every checkpoint -- so the download has to
+    name the tree and filter it rather than pulling a predictions directory that does not
+    exist."""
+    block = coordinator[coordinator.index('print_rsync() {'):coordinator.index('EOF\n}')]
+    assert '${MODEL_DIR}/' in block
+    assert "--include='*_finetuned_output.csv'" in block
+    assert "--exclude='*'" in block, 'without a trailing exclude the filter pulls the weights'
+    assert 'misc/predictions' not in block
 
 
 def test_the_download_names_the_account_as_well_as_the_host(coordinator):
@@ -215,8 +259,8 @@ def test_the_download_covers_what_the_reporting_reads(coordinator):
     """The point of the second block is rerunning the reporting on the laptop, which needs the
     inputs and not just the finished tables."""
     block = coordinator[coordinator.index('print_rsync() {'):coordinator.index('EOF\n}')]
-    for directory in ('tables', 'misc/predictions', 'misc/stratified_carryforward',
-                      'misc/historic_diagnoses'):
+    for directory in ('tables', 'misc/stratified_carryforward',
+                      'misc/historic_diagnoses', 'charlson'):
         assert directory in block, f'{directory} is not in the download command'
 
 
