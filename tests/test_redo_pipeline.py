@@ -153,6 +153,27 @@ def test_the_figure_is_built_on_the_cohort_the_tables_report(report_job):
     assert '--cohort any_text' in line, f'no cohort named: {line.strip()}'
 
 
+def test_the_audit_is_restricted_to_the_evaluated_cohort(report_job):
+    """audit_historic_diagnoses defaults to every extracted episode. Supplementary Table 7 and
+    Table 5 both rest on it, and both report rates for the population the models were evaluated
+    on -- unrestricted, the audit answers a question about a population no result covers."""
+    body = commands(report_job)
+    block = next(b for b in body.split('stage ') if 'audit_historic_diagnoses.py' in b)
+    assert '--cohort any_text' in block, f'the audit names no cohort: {block.strip()[:120]}'
+
+
+def test_the_audit_and_the_text_experiments_share_a_cohort(report_job):
+    """The audit's population has to be the one the arms it describes were trained on, or the
+    named-versus-unnamed rates it reports are computed over different stays than the model
+    scores they are compared with."""
+    from generate_redo_configs import EXPERIMENTS
+    text_arms = {entry[2] for entry in EXPERIMENTS if entry[0] in (20, 24)}
+    assert text_arms == {'any_text'}
+    body = commands(report_job)
+    block = next(b for b in body.split('stage ') if 'audit_historic_diagnoses.py' in b)
+    assert f'--cohort {text_arms.pop()}' in block
+
+
 def test_the_inputs_are_built_before_the_tables_that_read_them(report_job):
     """Each of these writes what the table after it reads, and running them the other way
     round produces a table from the previous run's inputs rather than an error."""
