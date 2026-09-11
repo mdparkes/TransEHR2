@@ -35,32 +35,34 @@ ARMS:
 ALIASES:
   HISTORY_LEN_STEPS: hist
 
-# History reaches only the value encoder, so `val_history` alone is the binding count, and that
-# distribution is too bimodal for evenly spaced step counts to say anything: 33.5% of episodes
-# carry no value history at all and 76.4% are settled by a cap of 5. The arms are therefore
-# spaced by history *record mass* rather than by step count, at roughly even quintiles:
+# History reaches only the value encoder, so the value stream alone is the binding count, and
+# that distribution is far too skewed for evenly spaced step counts to say anything: most
+# episodes are settled by a very short cap, which would leave the last arm carrying nearly all
+# of the records removed and every arm above it differing from its neighbour by almost nothing.
+# The arms are therefore spaced by history *record mass* rather than by step count, at roughly
+# even quintiles.
 #
-#     500 -> 225   225 episodes,  4.8%,  25% of record mass dropped
-#     225 -> 100   450 episodes,  9.6%,  51%
-#     100 ->  40   749 episodes, 16.0%,  74%
-#      40 ->   5 1,109 episodes, 23.6%,  94%
-#       5 ->   0 3,123 episodes, 66.5%, 100%
+# The lengths are measured, not chosen. `choose_history_cutpoints.py` sums the observed
+# value-stream timesteps inside the most recent L steps of the history region over this spec's
+# cohort and fold, and returns the L at which that total crosses each equal share. Re-run it
+# and repaste the block whenever the extraction changes -- the value feature set and the
+# pre-admission boundary both move the curve, so the cutpoints do not survive a re-extraction.
 #
 # 500 is the extraction capacity (MAX_HISTORY_LEN_STEPS in the dataset config), so it is
-# censoring rather than a natural maximum -- 1.9% of episodes sit at the cap with unknown true
+# censoring rather than a natural maximum: the episodes sitting at the cap have an unknown true
 # history length. It is the centre here because it is the no-crop condition.
 #
 # 0 is a genuine arm rather than a degenerate one: `history_len_steps=0` resolves to a crop
-# window starting at MAX_HISTORY_LEN_STEPS, which keeps the in-stay episode intact and removes
-# pre-admission history alone.
+# window starting at MAX_HISTORY_LEN_STEPS, which keeps the peri-stay episode intact and
+# removes pre-admission history alone.
 #
 # Report every arm on the subset it actually affects rather than on the full cohort, where the
-# differences dilute to nothing. The 225 arm is weak on episode count but completes the
-# dose-response curve, which is what a reviewer reads.
+# differences dilute to nothing. The longest crop is weak on episode count but completes the
+# dose-response curve.
 GRID:
 
   HISTORY_LEN_STEPS:
-    values: [500, 225, 100, 40, 5, 0]
+    values: [500, 261, 140, 70, 26, 0]
     select_on: mortality
 
 # ------------------------------------------------------------------------------------------
