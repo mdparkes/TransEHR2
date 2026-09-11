@@ -144,6 +144,15 @@ def test_every_writer_the_redo_needs_is_invoked(report_job, script):
     assert os.path.exists(os.path.join(REPO, script)), f'{script} is invoked but absent'
 
 
+def test_the_figure_is_built_on_the_cohort_the_tables_report(report_job):
+    """plot_history_distributions defaults to any_history. The figure accompanies the tables
+    computed on the text cohort, and the default would produce a figure about a different
+    population with nothing in the output saying so."""
+    body = commands(report_job)
+    line = next(l for l in body.splitlines() if 'plot_history_distributions.py' in l)
+    assert '--cohort any_text' in line, f'no cohort named: {line.strip()}'
+
+
 def test_the_inputs_are_built_before_the_tables_that_read_them(report_job):
     """Each of these writes what the table after it reads, and running them the other way
     round produces a table from the previous run's inputs rather than an error."""
