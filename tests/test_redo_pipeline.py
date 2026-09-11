@@ -153,13 +153,23 @@ def test_the_figure_is_built_on_the_cohort_the_tables_report(report_job):
     assert '--cohort any_text' in line, f'no cohort named: {line.strip()}'
 
 
+def audit_cohort(report_job):
+    """The cohort the report job audits, from the variable every stage takes it from."""
+    match = re.search(r'AUDIT_COHORT="\$\{AUDIT_COHORT:-(\w+)\}"', report_job)
+    assert match, 'the report job names no audit cohort'
+    return match.group(1)
+
+
 def test_the_audit_is_restricted_to_the_evaluated_cohort(report_job):
     """audit_historic_diagnoses defaults to every extracted episode. Supplementary Table 7 and
     Table 5 both rest on it, and both report rates for the population the models were evaluated
     on -- unrestricted, the audit answers a question about a population no result covers."""
     body = commands(report_job)
     block = next(b for b in body.split('stage ') if 'audit_historic_diagnoses.py' in b)
-    assert '--cohort any_text' in block, f'the audit names no cohort: {block.strip()[:120]}'
+    assert '--cohort "${AUDIT_COHORT}"' in block, (
+        f'the audit names no cohort: {block.strip()[:120]}'
+    )
+    assert audit_cohort(report_job) == 'any_text'
 
 
 def test_the_audit_is_not_restricted_to_the_set_it_audits(report_job):
@@ -174,11 +184,56 @@ def test_the_audit_is_not_restricted_to_the_set_it_audits(report_job):
     """
     body = commands(report_job)
     block = next(b for b in body.split('stage ') if 'audit_historic_diagnoses.py' in b)
-    assert '--cohort diagnosis_history' not in block
-    assert '--cohort discharge_summary' not in block, (
+    assert audit_cohort(report_job) != 'diagnosis_history'
+    assert audit_cohort(report_job) != 'discharge_summary', (
         'the discharge-summary cohort is the previous design, whose model cohort excluded '
         'episodes holding diagnoses but no summary'
     )
+
+
+def test_the_audit_writes_where_the_writer_reads(report_job):
+    """audit_historic_diagnoses --output_dir defaults to the working directory, and
+    report_historic_diagnosis_audit composes its input as {root}/{cohort}/{mode}. Left to
+    their defaults the two name different directories, and the writer renders whatever audit
+    happens to be under the old cohort's name instead of failing."""
+    body = commands(report_job)
+    audit = next(b for b in body.split('stage ') if 'audit_historic_diagnoses.py' in b)
+    writer = next(b for b in body.split('stage ') if 'report_historic_diagnosis_audit.py' in b)
+    assert '--output_dir "${AUDIT_DIR}"' in audit
+    assert '--audit-root "${AUDIT_ROOT}"' in writer
+    assert '--cohort "${AUDIT_COHORT}"' in audit and '--cohort "${AUDIT_COHORT}"' in writer
+    assert '--mode "${AUDIT_MODE}"' in writer
+    # The composed path has to be built from those same three parts.
+    assert 'AUDIT_DIR="${AUDIT_ROOT}/${AUDIT_COHORT}/${AUDIT_MODE}"' in report_job
+
+
+def test_the_writer_does_not_fall_back_to_the_previous_cohort(report_job):
+    """report_historic_diagnosis_audit --cohort defaults to discharge_summary, which is the
+    previous design's cohort and also selects the directory it reads."""
+    writer = next(b for b in commands(report_job).split('stage ')
+                  if 'report_historic_diagnosis_audit.py' in b)
+    assert 'discharge_summary' not in writer
+
+
+def test_the_audit_writes_the_input_the_carry_forward_needs(report_job):
+    """The per-episode CSV is written only with --write_per_episode, and the stratification
+    reads exactly that file. Without the flag the audit still succeeds and Table 5 has no
+    input at all."""
+    body = commands(report_job)
+    audit = next(b for b in body.split('stage ') if 'audit_historic_diagnoses.py' in b)
+    assert '--write_per_episode' in audit
+    strat = next(b for b in body.split('stage ') if 'stratify_predictions_by_history.py' in b)
+    assert 'historic_diagnosis_audit_per_episode.csv' in strat
+
+
+def test_the_stratification_does_not_use_its_default_audit_path(report_job):
+    """Its default omits the cohort segment the writer's layout carries, so it would read an
+    audit from a differently shaped tree."""
+    from stratify_predictions_by_history import DEFAULT_AUDIT_CSV
+    assert 'any_text' not in DEFAULT_AUDIT_CSV
+    strat = next(b for b in commands(report_job).split('stage ')
+                 if 'stratify_predictions_by_history.py' in b)
+    assert '--audit-csv "${AUDIT_DIR}/' in strat
 
 
 def test_the_audit_and_the_text_experiments_share_a_cohort(report_job):
@@ -188,9 +243,7 @@ def test_the_audit_and_the_text_experiments_share_a_cohort(report_job):
     from generate_redo_configs import EXPERIMENTS
     text_arms = {entry[2] for entry in EXPERIMENTS if entry[0] in (20, 24)}
     assert text_arms == {'any_text'}
-    body = commands(report_job)
-    block = next(b for b in body.split('stage ') if 'audit_historic_diagnoses.py' in b)
-    assert f'--cohort {text_arms.pop()}' in block
+    assert audit_cohort(report_job) == text_arms.pop()
 
 
 def test_the_inputs_are_built_before_the_tables_that_read_them(report_job):
@@ -300,7 +353,7 @@ def test_the_download_covers_what_the_reporting_reads(coordinator):
     inputs and not just the finished tables."""
     block = coordinator[coordinator.index('print_rsync() {'):coordinator.index('EOF\n}')]
     for directory in ('tables', 'misc/stratified_carryforward',
-                      'misc/historic_diagnoses', 'charlson'):
+                      'misc/historic_diagnosis_audit', 'charlson'):
         assert directory in block, f'{directory} is not in the download command'
 
 
