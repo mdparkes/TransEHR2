@@ -200,6 +200,17 @@ def test_the_download_lands_in_the_repository_it_is_run_from(coordinator):
             )
 
 
+def test_the_download_names_the_account_as_well_as_the_host(coordinator):
+    """A bare hostname resolves to whatever user the laptop's ssh config defaults to, which is
+    not necessarily the account the files belong to."""
+    match = re.search(r'SDRE_HOST="\$\{SDRE_HOST:-([^}]+)\}"', coordinator)
+    assert match, 'run_redo.sh names no SDRE host'
+    assert '@' in match.group(1), f'{match.group(1)!r} names a host but no account'
+
+    block = coordinator[coordinator.index('print_rsync() {'):coordinator.index('EOF\n}')]
+    assert 'sdre:' not in block, 'the host is spelled out rather than taken from SDRE_HOST'
+
+
 def test_the_download_covers_what_the_reporting_reads(coordinator):
     """The point of the second block is rerunning the reporting on the laptop, which needs the
     inputs and not just the finished tables."""
