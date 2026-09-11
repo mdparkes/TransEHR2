@@ -54,10 +54,20 @@ from TransEHR2.data.preprocessing import load_dataset, load_episode_ids
 
 
 # Figure caption per cohort, completing "n = {N} ...".
+#
+# The figure says "historical" where the code says pre-admission: they are the same records,
+# those older than PREADMISSION_CUTOFF_HOURS before admission, and the figure's footer gives
+# that bound in hours. Every name in `TransEHR2.data.cohorts.COHORTS` needs an entry --
+# tests/test_history_distributions.py holds them in step, since a cohort without one raises
+# only when the figure is drawn, which is after the arrays have been read.
 CAPTIONS = {
-    'any_history': 'episodes with at least one pre-admission value record',
-    'discharge_summary': 'episodes with at least one pre-admission discharge summary',
-    'diagnosis_history': 'episodes with at least one pre-admission diagnosis description',
+    'any_history': 'episodes with at least one historical value record',
+    'discharge_summary': 'episodes with at least one historical discharge summary',
+    'diagnosis_history': 'episodes with at least one historical diagnosis description',
+    'any_text': ('episodes with at least one historical discharge summary or discharge '
+                 'diagnosis'),
+    'all_text': ('episodes with both a historical discharge summary and a historical '
+                 'discharge diagnosis'),
 }
 
 COUNT_COLOUR = '#4878a8'
@@ -81,12 +91,11 @@ COUNT_BINS = [
 
 # (label, lower, upper) in hours, half-open [lower, upper). Months are 730 h, years 8760 h.
 GAP_BINS = [
-    ('<1 h', 0.0, 1.0),
-    ('1-6 h', 1.0, 6.0),
-    ('6-24 h', 6.0, 24.0),
-    # 24-48 h is split off from the first day-scale bin so the boundary a minimum-gap
-    # definition of "pre-admission" would sit at is visible rather than pooled.
-    ('24-48 h', 24.0, 48.0),
+    # Every historical record is older than PREADMISSION_CUTOFF_HOURS, so this bin cannot hold
+    # anything and is kept for exactly that reason: a bar here would mean a peri-stay record
+    # reached the history region. Splitting it finer would spend four bars showing the same
+    # emptiness.
+    ('0-48 h', 0.0, 48.0),
     ('2-7 d', 48.0, 168.0),
     ('1-4 wk', 168.0, 672.0),
     ('1-6 mo', 672.0, 4380.0),
@@ -309,13 +318,25 @@ def bin_counts(values: np.ndarray, bins) -> list:
 
 
 def draw(count_rows, gap_rows, n_episodes: int, caption: str, output: str,
-         title: str) -> None:
-    """Draw the two panels side by side and write the figure."""
+         title: str, cutoff_hours: float = 0.0) -> None:
+    """Draw the two panels side by side and write the figure.
+
+    Args:
+        count_rows: (label, episodes) per record-count bin.
+        gap_rows: (label, episodes) per gap bin.
+        n_episodes: Cohort size, for the footer.
+        caption: Cohort description, completing "n = {N} ...".
+        output: Path to write.
+        title: Figure title, or empty for none.
+        cutoff_hours: The boundary the extraction placed between historical and peri-stay
+            records. Stated in the footer, since "historical" is otherwise undefined on the
+            figure and the bound is a setting rather than a convention.
+    """
     fig, axes = plt.subplots(1, 2, figsize=(13.0, 4.6))
 
     for ax, rows, colour, xlabel in (
-        (axes[0], count_rows, COUNT_COLOUR, 'Pre-admission records (value stream)'),
-        (axes[1], gap_rows, GAP_COLOUR, 'Most recent pre-admission record to ICU admission'),
+        (axes[0], count_rows, COUNT_COLOUR, 'Historical records'),
+        (axes[1], gap_rows, GAP_COLOUR, 'Most recent historical record to ICU admission'),
     ):
         labels = [label for label, _ in rows]
         heights = [value for _, value in rows]
@@ -338,7 +359,11 @@ def draw(count_rows, gap_rows, n_episodes: int, caption: str, output: str,
 
     if title:
         fig.suptitle(title)
-    fig.text(0.5, -0.02, f'n = {n_episodes:,} {caption}',
+    footer = f'n = {n_episodes:,} {caption}'
+    if cutoff_hours > 0:
+        footer += (f'. Historical records are those collected more than '
+                   f'{cutoff_hours:g} hours before ICU admission')
+    fig.text(0.5, -0.02, footer,
              ha='center', fontsize=9, color='#555555')
     fig.tight_layout()
     os.makedirs(os.path.dirname(output) or '.', exist_ok=True)
@@ -399,13 +424,15 @@ def main(argv=None):
                              'double counts, and the run stops if it detects that.')
     parser.add_argument('--splits', nargs='+', default=['train', 'val', 'test'],
                         help='Partitions within each fold (default: train val test)')
-    parser.add_argument('--cohort', choices=list(COHORTS), default='any_history',
-                        help='Population, from TransEHR2.data.cohorts. "any_history" is the '
+    parser.add_argument('--cohort', choices=list(COHORTS), default='any_text',
+                        help='Population, from TransEHR2.data.cohorts. The default is the '
+                             'cohort the text-arm experiments run on, so the figure describes '
+                             'the population its tables report. "any_history" is the '
                              'value-history set -- it resolves to has_value_history, not to '
-                             'has_any_history, because the models read no pre-admission '
-                             'event. "discharge_summary" and "diagnosis_history" narrow it to '
-                             'episodes carrying at least one pre-admission record of that '
-                             'text feature.')
+                             'has_any_history, because the models read no historical event. '
+                             '"discharge_summary" and "diagnosis_history" narrow it to '
+                             'episodes carrying at least one historical record of that text '
+                             'feature.')
     parser.add_argument('--gap_stream', choices=('value', 'any'), default='value',
                         help='Which stream supplies the most recent pre-admission record. '
                              '"value" is what the models read and matches the population. '
@@ -492,7 +519,7 @@ def main(argv=None):
 
     if not args.no_figure:
         draw(count_rows, gap_rows, n, CAPTIONS[args.cohort], args.output,
-             args.title)
+             args.title, args.extracted_cutoff_hours)
     return 0
 
 
