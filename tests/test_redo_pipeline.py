@@ -162,6 +162,25 @@ def test_the_audit_is_restricted_to_the_evaluated_cohort(report_job):
     assert '--cohort any_text' in block, f'the audit names no cohort: {block.strip()[:120]}'
 
 
+def test_the_audit_is_not_restricted_to_the_set_it_audits(report_job):
+    """diagnosis_history names the audited set exactly, which makes it the tempting flag, and
+    it is the wrong one.
+
+    The audit restricts to the episodes carrying a retained pre-admission diagnosis record on
+    its own, and that filter is the same predicate diagnosis_history is. Passing it changes no
+    audited episode and no number in the table body -- it only collapses the population
+    footnote from "<audited> of <model cohort>" to "<n> of <n>", losing how much of the
+    evaluated cohort could have contributed a carried-forward label.
+    """
+    body = commands(report_job)
+    block = next(b for b in body.split('stage ') if 'audit_historic_diagnoses.py' in b)
+    assert '--cohort diagnosis_history' not in block
+    assert '--cohort discharge_summary' not in block, (
+        'the discharge-summary cohort is the previous design, whose model cohort excluded '
+        'episodes holding diagnoses but no summary'
+    )
+
+
 def test_the_audit_and_the_text_experiments_share_a_cohort(report_job):
     """The audit's population has to be the one the arms it describes were trained on, or the
     named-versus-unnamed rates it reports are computed over different stays than the model
