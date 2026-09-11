@@ -45,13 +45,17 @@ import sys
 import numpy as np
 import pandas as pd
 
+from generate_redo_configs import experiment_name
 from reporting.jmir.formatting import fmt_cell, fmt_number, fmt_p_value
 from reporting.jmir.tables import Table, build_document, render_text
 from reporting.stats import benjamini_hochberg, corrected_resampled_ttest
 
 DEFAULT_INPUT_DIR = os.path.join('misc', 'stratified_carryforward')
-DEFAULT_REFERENCE = 'experiment20_peristay_textsubset_rev'
-DEFAULT_TEXT_ARM = 'experiment24_peristay_textonly_textsubset_rev'
+
+# The peri-stay-only reference and the arm that adds historical text to it. Named by number
+# rather than spelled out, so the experiment configs stay the one place a name is decided.
+DEFAULT_REFERENCE = experiment_name(20)
+DEFAULT_TEXT_ARM = experiment_name(24)
 POOLED_ROW = 'All diagnoses pooled'
 
 DEFAULT_CAPTION = (
