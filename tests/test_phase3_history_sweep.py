@@ -27,9 +27,16 @@ PHASE3_SPEC = os.path.join(REPO, 'TransEHR2', 'configs', 'experiments', 'tuning'
 PHASE3_BASE = os.path.join(REPO, 'TransEHR2', 'configs', 'experiments', 'tuning',
                            'phase3_base.yaml')
 
-# What the plan's history arms are, in order. The first is the extraction capacity and is the
-# no-crop centre; the last removes pre-admission history while leaving the in-stay episode.
-HISTORY_ARMS = [500, 225, 100, 40, 5, 0]
+def history_arms():
+    """The sweep's history arms, read from the spec rather than restated.
+
+    The lengths are measured by `choose_history_cutpoints.py` and move whenever the extraction
+    does, so a literal list here would pin a stale grid and fail on every re-measurement
+    without saying anything about the sweep. What is worth asserting is that what reaches disk
+    is what the spec asked for, and that the axis still has the shape the sweep depends on.
+    """
+    spec = yaml.safe_load(open(PHASE3_SPEC))
+    return list(spec['GRID']['HISTORY_LEN_STEPS']['values'])
 
 
 def _write_spec(root, **overrides):
@@ -79,7 +86,7 @@ def test_sweep_is_six_history_arms_plus_one_ablation(sweep):
     assert len(extra_trials(manifest)) == 1
 
 
-def test_every_history_arm_from_the_plan_is_present(sweep):
+def test_every_history_arm_from_the_spec_is_present(sweep):
     manifest = sweep['manifest']
     ran = {}
     for trial in manifest['trials']:
@@ -87,9 +94,23 @@ def test_every_history_arm_from_the_plan_is_present(sweep):
             continue
         config = yaml.safe_load(open(trial['config']))
         ran[config['HISTORY_LEN_STEPS']] = trial['name']
-    assert sorted(ran, key=lambda v: -v) == HISTORY_ARMS, (
-        f'history arms on disk are {sorted(ran)}, expected {HISTORY_ARMS}'
+    arms = history_arms()
+    assert sorted(ran, key=lambda v: -v) == arms, (
+        f'history arms on disk are {sorted(ran, key=lambda v: -v)}, spec asks for {arms}'
     )
+
+
+def test_the_axis_descends_from_the_extraction_capacity_to_no_history():
+    """The endpoints carry the sweep's meaning: the first arm is the no-crop condition and the
+    last removes pre-admission history while leaving the peri-stay episode. A re-measurement
+    that lost either would change what the sweep reports without changing how it runs."""
+    arms = history_arms()
+    dataset = yaml.safe_load(open(os.path.join(
+        REPO, 'TransEHR2', 'configs', 'datasets', 'mimic4.yaml')))
+    assert arms[0] == dataset['MAX_HISTORY_LEN_STEPS']
+    assert arms[-1] == 0
+    assert arms == sorted(arms, reverse=True)
+    assert len(set(arms)) == len(arms), f'a length is repeated: {arms}'
 
 
 def test_the_zero_arm_is_a_real_crop_not_an_unset_value(sweep):
@@ -167,8 +188,14 @@ def test_ablation_cannot_win_a_ranking_even_with_the_best_score(sweep):
     root = os.path.join(sweep['root'], 'isolation')
     manifest['model_dir'] = root
 
+    # A middle grid arm, picked from the manifest rather than named, so the probe survives a
+    # re-measurement of the cutpoints.
+    grid = [t for t in manifest['trials'] if not t.get('is_extra')]
+    winner = grid[len(grid) // 2]
+    winning_value = yaml.safe_load(open(winner['config']))['HISTORY_LEN_STEPS']
+
     scores = {t['name']: 0.40 for t in manifest['trials']}
-    scores[next(t['name'] for t in manifest['trials'] if t['name'].endswith('hist_100'))] = 0.55
+    scores[winner['name']] = 0.55
     scores[extra_trials(manifest)[0]['name']] = 0.99
 
     for name, score in scores.items():
@@ -178,7 +205,7 @@ def test_ablation_cannot_win_a_ranking_even_with_the_best_score(sweep):
                   open(os.path.join(directory, 'evaluation_mortality.yaml'), 'w'))
 
     ranking = rank_hyperparameter(manifest, 'tuned', 'HISTORY_LEN_STEPS')
-    assert ranking['best'].grid_value == 100, (
+    assert ranking['best'].grid_value == winning_value, (
         f"selection returned {ranking['best'].grid_value}; the ablation leaked into the grid"
     )
     assert 0.99 not in [r.value for r in ranking['results']]

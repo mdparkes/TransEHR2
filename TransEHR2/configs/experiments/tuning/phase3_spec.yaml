@@ -48,6 +48,22 @@ ALIASES:
 # and repaste the block whenever the extraction changes -- the value feature set and the
 # pre-admission boundary both move the curve, so the cutpoints do not survive a re-extraction.
 #
+# Measured on fold0 over any_history: 1,132,754 records, 41,146 of them carrying text.
+#
+#     arm    records retained   share   dropped by this step
+#     500           1,132,754   1.000   --
+#     261             905,870   0.800   226,884   0.200
+#     140             678,761   0.599   227,109   0.200
+#      70             451,799   0.399   226,962   0.200
+#      26             225,495   0.199   226,304   0.200
+#       0                   0   0.000   225,495   0.199
+#
+# Text records do not fall at the same rate -- 0.916 of them survive the first crop against
+# 0.800 of all records, and half remain at the shortest arm -- because a text record sits at a
+# recent timestep more often than a value record does. An arm therefore removes proportionally
+# more non-text history than text history, which is worth stating before the sweep's curve is
+# read as a statement about text.
+#
 # 500 is the extraction capacity (MAX_HISTORY_LEN_STEPS in the dataset config), so it is
 # censoring rather than a natural maximum: the episodes sitting at the cap have an unknown true
 # history length. It is the centre here because it is the no-crop condition.
