@@ -32,12 +32,6 @@ Method
 5. Intersect each episode's positive labels with the phenotype groups recovered
    from its historical diagnosis text.
 
-Note that the audit is strict about category names by default: ICD-9 codes
-reach their phenotype through HCUP CCS 2015 and ICD-10 codes through HCUP CCSR
-2024, and the two vocabularies name one benchmark category differently
-("Congestive heart failure; nonhypertensive" vs. "Heart failure"). Pass
---merge_synonymous_phenotypes to count those as the same phenotype.
-
 Outputs (written to --output_dir)
 ---------------------------------
 * `historic_diagnosis_audit_summary.csv`   -- overall label- and episode-level counts
@@ -82,15 +76,6 @@ from TransEHR2.data.preprocessing import load_episode_ids
 
 TEXT_FEATURE = 'Diagnosis Descriptions'
 TASK_PREFIX = 'phenotyping'
-
-# ICD-9 codes reach their phenotype through HCUP CCS 2015 and ICD-10 codes
-# through HCUP CCSR 2024. The two vocabularies name one benchmark category
-# differently, so a heart failure diagnosis coded in ICD-9 will not match a
-# heart failure label derived from an ICD-10 code unless the two names are
-# treated as equivalent. Enable that with --merge_synonymous_phenotypes.
-PHENOTYPE_SYNONYMS = [
-    {'Congestive heart failure; nonhypertensive', 'Heart failure'},
-]
 
 
 # ---------------------------------------------------------------------------
@@ -504,21 +489,11 @@ def run_audit(episodes, code_to_groups, n_workers, retained,
 # ---------------------------------------------------------------------------
 # Tabulation
 # ---------------------------------------------------------------------------
-
-def expand_synonyms(groups):
-    """Add the equivalent names of any phenotype in `groups` (see PHENOTYPE_SYNONYMS)."""
-    expanded = set(groups)
-    for synonyms in PHENOTYPE_SYNONYMS:
-        if expanded & synonyms:
-            expanded |= synonyms
-    return expanded
-
-
 def pct(numerator, denominator):
     return float('nan') if denominator == 0 else 100.0 * numerator / denominator
 
 
-def tabulate(results, labels, phenotype_names, merge_synonyms=False):
+def tabulate(results, labels, phenotype_names):
     """Cross the historical diagnosis groups with the phenotype labels.
 
     Returns:
@@ -542,8 +517,6 @@ def tabulate(results, labels, phenotype_names, merge_synonyms=False):
             continue
 
         history = row['historical_groups']
-        if merge_synonyms:
-            history = expand_synonyms(history)
         has_history = row['n_historical_dx_records'] > 0
         matched = positives & history
 
@@ -656,12 +629,10 @@ def tabulate(results, labels, phenotype_names, merge_synonyms=False):
     return per_episode_df, by_phenotype_df, summary_df
 
 
-def print_report(summary_df, by_phenotype_df, merge_synonyms=False):
+def print_report(summary_df, by_phenotype_df):
     print(f"\n{'='*78}")
     print("Historical diagnosis text vs. last-stay phenotype labels")
     print(f"{'='*78}\n")
-    if merge_synonyms:
-        print("  (ICD-9/ICD-10 synonymous phenotype names merged for matching)\n")
     for metric, value in summary_df.itertuples(index=False):
         if isinstance(value, bool) or isinstance(value, str):
             print(f"  {metric:<56s} {value:>12s}")
@@ -729,12 +700,6 @@ def main():
         help="Restrict the audit to an explicit episode manifest (one patient-episode ID "
              "per line), as compute_charlson_index.py --write_cohort writes. Combines with "
              "--cohort: an episode must then satisfy both."
-    )
-    parser.add_argument(
-        '--merge_synonymous_phenotypes', action='store_true',
-        help="Treat benchmark categories that HCUP CCS 2015 and CCSR 2024 name "
-             "differently as equivalent when matching (see PHENOTYPE_SYNONYMS). "
-             "Off by default, which reports the strict name-for-name overlap."
     )
     parser.add_argument(
         '--write_per_episode', action='store_true',
@@ -819,7 +784,7 @@ def main():
                         cutoff_hours)
 
     per_episode_df, by_phenotype_df, summary_df = tabulate(
-        results, labels, phenotype_names, args.merge_synonymous_phenotypes
+        results, labels, phenotype_names
     )
 
     restriction = args.cohort or ''
@@ -846,7 +811,7 @@ def main():
         per_episode_df.to_csv(episode_path, index=False)
         written.append(episode_path)
 
-    print_report(summary_df, by_phenotype_df, args.merge_synonymous_phenotypes)
+    print_report(summary_df, by_phenotype_df)
     print("Wrote:")
     for path in written:
         print(f"  {path}")
