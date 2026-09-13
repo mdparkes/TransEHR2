@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
-"""Histogram the pre-admission record count and the gap to ICU admission.
+"""Histogram the historical record count, the spacing of those records, and their recency.
 
-Two panels over the episodes carrying at least one pre-admission value-associated record --
-the `readable` set of `plot_history_text_venn.py`, and `has_value_history` in
-`TransEHR2.data.cohorts`. Episodes are indexed to a patient's last ICU stay, one episode per
-patient, so the population is the same object counted either way.
+Three panels over one cohort's episodes -- `--cohort`, defaulting to the population the text
+arm reports on. Episodes are indexed to a patient's last ICU stay, one episode per patient, so
+the population is the same object counted every way.
 
-    count  value-stream pre-admission records per episode
-    gap    hours from the most recent pre-admission value record to ICU admission (t = 0)
+    count     value-stream pre-admission records per episode
+    interval  hours between consecutive pre-admission value records
+    gap       hours from the most recent pre-admission value record to ICU admission (t = 0)
+
+The outer panels count episodes and the middle one counts intervals, of which an episode
+contributes one fewer than it holds records. An episode carrying a single record therefore
+appears in the outer panels and not the middle one, and a densely sampled episode weighs on the
+middle panel in proportion to its record count -- so the pooled interval distribution is not the
+distribution a typical episode sees. The report prints the per-episode median alongside it,
+which is the same quantity without that weighting.
 
 Both the population and the count are value-stream only, because that is the whole of the
 history the models read: `collate_tensorized` slices the history region off the event stream
@@ -21,14 +28,19 @@ the count is right-censored. The final bin is therefore left-closed at that widt
 as an inequality: the mass sitting exactly at the cap is censored, not a mode. No bin above the
 cap is drawn, and a count exceeding it is an error rather than a tail.
 
+The same censoring reaches the interval panel, and not symmetrically: what a capped episode
+loses is its oldest records, so the intervals it no longer contributes are the old ones. Its
+retained window is the recent, denser part of its history, which shortens the pooled
+distribution rather than trimming it evenly.
+
 Bins are unequal in width and the bars are not, so heights are counts and the panels are not
-density plots. Both distributions span four to five orders of magnitude, which no equal-width
+density plots. The distributions span four to five orders of magnitude, which no equal-width
 binning resolves.
 
 History is located by position, not by timestamp -- `[0, max_history_len_steps)`,
 right-justified -- which is what `HISTORY_LEN_STEPS` crops and so agrees with what the model
-can read. The timestamps are then only used for the gap, and their sign convention is checked
-rather than assumed.
+can read. The timestamps are then only used for the interval and gap panels, and their sign
+convention is checked rather than assumed.
 
 Usage:
     python plot_history_distributions.py --data_dir data/ \\
@@ -45,7 +57,7 @@ import sys
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from matplotlib.ticker import MaxNLocator
+from matplotlib.ticker import MaxNLocator, StrMethodFormatter
 import numpy as np
 
 from TransEHR2.data.cohorts import (COHORTS, cohort_mask, has_any_history,
@@ -71,6 +83,7 @@ CAPTIONS = {
 }
 
 COUNT_COLOUR = '#4878a8'
+INTERVAL_COLOUR = '#7a6a9a'
 GAP_COLOUR = '#c0653a'
 
 # (label, lower, upper) with integer bounds inclusive. There is no zero bin: the population is
@@ -87,6 +100,26 @@ COUNT_BINS = [
     ('101-250', 101, 250),
     ('251-499', 251, 499),
     (None, 500, None),
+]
+
+# (label, lower, upper) in hours, half-open [lower, upper), on the same month and year
+# conventions as GAP_BINS. The first bin is open at the bottom rather than starting at some
+# positive floor: two records sharing a timestamp give an interval of exactly zero, and that is
+# a real observation about how the history is recorded, not a value to discard.
+#
+# Sub-day resolution is spent here and not on the gap axis because that is where the structure
+# is. Consecutive records within one prior admission sit hours apart, while consecutive
+# admissions sit months or years apart, so the distribution is bimodal across a range no single
+# scale covers.
+INTERVAL_BINS = [
+    ('<1 h', 0.0, 1.0),
+    ('1-6 h', 1.0, 6.0),
+    ('6-24 h', 6.0, 24.0),
+    ('1-7 d', 24.0, 168.0),
+    ('1-4 wk', 168.0, 672.0),
+    ('1-6 mo', 672.0, 4380.0),
+    ('6-12 mo', 4380.0, 8760.0),
+    ('>1 y', 8760.0, float('inf')),
 ]
 
 # (label, lower, upper) in hours, half-open [lower, upper). Months are 730 h, years 8760 h.
@@ -186,6 +219,54 @@ def latest_history_time(times, masks, hist: int) -> np.ndarray:
                     np.nan)
 
 
+def history_intervals(times, masks, hist: int):
+    """Hours between consecutive pre-admission records, pooled and per episode.
+
+    An episode holding k pre-admission records contributes k - 1 intervals, so one holding a
+    single record contributes none. The pooled array is therefore over intervals and not over
+    episodes; the per-episode median is returned with it so the report can give the same
+    quantity without the weighting that pooling applies.
+
+    Records are ordered by timestamp before differencing rather than taken in column order. The
+    history block is written right-justified and contiguous, so the two orders coincide, but
+    sorting makes an interval a property of the timestamps instead of resting on the layout --
+    and it is what makes every interval non-negative by construction.
+
+    Args:
+        times: (n_episodes, max_ts_len) timestamps in hours relative to ICU admission.
+        masks: (n_episodes, max_ts_len) nonzero at non-padding timesteps.
+        hist: Width of the history region.
+
+    Returns:
+        (intervals, episode, median). `intervals` is a 1-D array of interval lengths in hours,
+        `episode` the row each one came from, and `median` an (n_episodes,) array that is NaN
+        where the episode holds fewer than two pre-admission records.
+    """
+    observed = history_observed(masks, hist)
+    ordered = np.where(observed, np.asarray(times, dtype=np.float64)[:, :hist], np.inf)
+    ordered.sort(axis=1)
+
+    # Sorting ascending sends the padding to the right-hand end, so a finite entry is always
+    # preceded by a finite one and a finite right-hand neighbour is the whole test for whether
+    # a difference spans two real records. Differencing one padding entry against the next is
+    # inf - inf, which is discarded by that test and raises the invalid flag on the way.
+    with np.errstate(invalid='ignore'):
+        deltas = np.diff(ordered, axis=1)
+    valid = np.isfinite(ordered[:, 1:])
+
+    intervals = deltas[valid]
+    episode = np.nonzero(valid)[0]
+
+    # deltas is finished with as a pooled array, so the per-episode pass masks it in place
+    # rather than taking a second copy of an array this size.
+    deltas[~valid] = np.nan
+    median = np.full(ordered.shape[0], np.nan)
+    rows = valid.any(axis=1)
+    if rows.any():
+        median[rows] = np.nanmedian(deltas[rows], axis=1)
+    return intervals, episode, median
+
+
 def collect_partition(data_dir: str, fold: str, split: str, cohort: str,
                       extracted_history_len_steps=None, cutoff_hours: float = 0.0) -> dict:
     """Per-episode counts, gaps and cohort flags for one partition.
@@ -199,7 +280,8 @@ def collect_partition(data_dir: str, fold: str, split: str, cohort: str,
             the layout was recorded in metadata.
 
     Returns:
-        Dict of (n_episodes,) arrays plus the history width the partition was read at.
+        Dict of (n_episodes,) arrays, the interval arrays -- which are one entry per interval
+        and carry the row each came from -- and the history width the partition was read at.
     """
     partition_dir = os.path.join(data_dir, fold, split)
     dataset = load_dataset(partition_dir,
@@ -226,12 +308,17 @@ def collect_partition(data_dir: str, fold: str, split: str, cohort: str,
 
     val_latest = latest_history_time(dataset.val_times, dataset.val_masks, hist)
     event_latest = latest_history_time(dataset.event_times, dataset.event_masks, hist)
+    intervals, interval_episode, median_interval = history_intervals(
+        dataset.val_times, dataset.val_masks, hist)
 
     return {
         'patient': patient_ids(partition_dir, len(val_count)),
         'val_count': val_count,
         'val_latest': val_latest,
         'event_latest': event_latest,
+        'median_interval': median_interval,
+        'intervals': intervals,
+        'interval_episode': interval_episode,
         'in_cohort': cohort_mask(dataset, cohort),
         'in_value': has_value_history(dataset.val_masks, hist),
         'in_any': has_any_history(dataset.val_masks, dataset.event_masks, hist),
@@ -249,6 +336,7 @@ def collect(data_dir: str, folds, splits, cohort: str,
     """
     parts = []
     widths = set()
+    episodes = 0
     for fold in folds:
         for split in splits:
             path = os.path.join(data_dir, fold, split)
@@ -258,6 +346,11 @@ def collect(data_dir: str, folds, splits, cohort: str,
             part = collect_partition(data_dir, fold, split, cohort,
                                      extracted_history_len_steps, cutoff_hours)
             widths.add(part.pop('hist'))
+            # The interval arrays index their own partition's rows. Concatenating the
+            # per-episode arrays renumbers those rows, so the index is carried forward with
+            # them -- otherwise selecting a cohort would take intervals from the wrong episodes.
+            part['interval_episode'] = part['interval_episode'] + episodes
+            episodes += len(part['val_count'])
             parts.append(part)
             print(f'  {fold}/{split}: {len(part["val_count"])} episodes, '
                   f'{int(part["in_cohort"].sum())} in the cohort')
@@ -317,12 +410,18 @@ def bin_counts(values: np.ndarray, bins) -> list:
     return out
 
 
-def draw(count_rows, gap_rows, n_episodes: int, caption: str, output: str,
+def draw(count_rows, interval_rows, gap_rows, n_episodes: int, caption: str, output: str,
          title: str, cutoff_hours: float = 0.0) -> None:
-    """Draw the two panels side by side and write the figure.
+    """Draw the three panels side by side and write the figure.
+
+    The panels run volume, spacing, recency. The recency panel stays rightmost because it is
+    the one measured against ICU admission, and the two panels that are measured against each
+    other sit together.
 
     Args:
         count_rows: (label, episodes) per record-count bin.
+        interval_rows: (label, intervals) per inter-record interval bin. Counted in intervals,
+            not episodes, which is why this panel carries its own y label.
         gap_rows: (label, episodes) per gap bin.
         n_episodes: Cohort size, for the footer.
         caption: Cohort description, completing "n = {N} ...".
@@ -332,11 +431,14 @@ def draw(count_rows, gap_rows, n_episodes: int, caption: str, output: str,
             records. Stated in the footer, since "historical" is otherwise undefined on the
             figure and the bound is a setting rather than a convention.
     """
-    fig, axes = plt.subplots(1, 2, figsize=(13.0, 4.6))
+    fig, axes = plt.subplots(1, 3, figsize=(17.0, 4.6))
 
-    for ax, rows, colour, xlabel in (
-        (axes[0], count_rows, COUNT_COLOUR, 'Historical records'),
-        (axes[1], gap_rows, GAP_COLOUR, 'Most recent historical record to ICU admission'),
+    for ax, rows, colour, xlabel, ylabel in (
+        (axes[0], count_rows, COUNT_COLOUR, 'Historical records', 'Episodes'),
+        (axes[1], interval_rows, INTERVAL_COLOUR,
+         'Between consecutive historical records', 'Intervals'),
+        (axes[2], gap_rows, GAP_COLOUR,
+         'Most recent historical record to ICU admission', 'Episodes'),
     ):
         labels = [label for label, _ in rows]
         heights = [value for _, value in rows]
@@ -345,8 +447,12 @@ def draw(count_rows, gap_rows, n_episodes: int, caption: str, output: str,
         ax.set_xticks(positions)
         ax.set_xticklabels(labels, rotation=45, ha='right')
         ax.set_xlabel(xlabel)
-        ax.set_ylabel('Episodes')
+        ax.set_ylabel(ylabel)
         ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+        # The interval panel runs into the hundreds of thousands while the other two stay in
+        # the thousands. Separating the ticks keeps them readable and matches the bar labels,
+        # which carry separators already.
+        ax.yaxis.set_major_formatter(StrMethodFormatter('{x:,.0f}'))
         ax.spines[['top', 'right']].set_visible(False)
         ax.grid(axis='y', color='#dcdcdc', linewidth=0.6)
         ax.set_axisbelow(True)
@@ -359,10 +465,14 @@ def draw(count_rows, gap_rows, n_episodes: int, caption: str, output: str,
 
     if title:
         fig.suptitle(title)
+    # Two lines rather than one: the population and the middle panel's denominator are separate
+    # statements, and at this width the combined sentence runs past the figure.
     footer = f'n = {n_episodes:,} {caption}'
     if cutoff_hours > 0:
         footer += (f'. Historical records are those collected more than '
                    f'{cutoff_hours:g} hours before ICU admission')
+    footer += ('\nThe middle panel counts intervals rather than episodes: an episode '
+               'contributes one fewer interval than it holds records')
     fig.text(0.5, -0.02, footer,
              ha='center', fontsize=9, color='#555555')
     fig.tight_layout()
@@ -371,12 +481,13 @@ def draw(count_rows, gap_rows, n_episodes: int, caption: str, output: str,
     print(f'Wrote {output}')
 
 
-def report(data: dict, count_rows, gap_rows, gap_values: np.ndarray,
-           cohort: str, n_value: int, n_any: int) -> None:
-    """Print the population, the two binnings and the quantiles behind them.
+def report(data: dict, count_rows, interval_rows, gap_rows, intervals: np.ndarray,
+           gap_values: np.ndarray, cohort: str, n_value: int, n_any: int) -> None:
+    """Print the population, the three binnings and the quantiles behind them.
 
-    The two panels have different denominators whenever `--gap_stream any` reaches past the value
-    stream, so each set of shares is taken against its own panel's total.
+    The panels have different denominators -- the middle one counts intervals, and the gap panel
+    reaches past the value stream whenever `--gap_stream any` is given -- so each set of shares
+    is taken against its own panel's total.
     """
     n = len(data['val_count'])
     n_gap = len(gap_values)
@@ -403,6 +514,24 @@ def report(data: dict, count_rows, gap_rows, gap_values: np.ndarray,
         print(f'  {label:>{width}}  {value:>8,}  {100.0 * value / n:>5.1f}%')
 
     print()
+    print('Hours between consecutive pre-admission records')
+    single = int(np.count_nonzero(counts < 2))
+    print(f'  intervals                                    : {len(intervals):,}')
+    print(f'  episodes contributing none (one record only) : {single:,}')
+    quantiles = np.percentile(intervals, [25, 50, 75, 90, 99])
+    print('  p25 {:.2f}, median {:.2f}, p75 {:.2f}, p90 {:.1f}, p99 {:.1f}, max {:.1f}'.format(
+        *quantiles, float(intervals.max())))
+    # The pooled quantiles above weight an episode by how many records it holds. These do not,
+    # and the two separate by however much the dense episodes carry.
+    medians = data['median_interval']
+    medians = medians[~np.isnan(medians)]
+    print('  per-episode median: p25 {:.2f}, median {:.2f}, p75 {:.2f}'.format(
+        *np.percentile(medians, [25, 50, 75])))
+    width = max(len(label) for label, _ in interval_rows)
+    for label, value in interval_rows:
+        print(f'  {label:>{width}}  {value:>8,}  {100.0 * value / len(intervals):>5.1f}%')
+
+    print()
     print('Hours from the most recent pre-admission record to ICU admission')
     quantiles = np.percentile(gap_values, [25, 50, 75, 90, 99])
     print('  p25 {:.1f}, median {:.1f}, p75 {:.1f}, p90 {:.1f}, p99 {:.1f}, max {:.1f}'.format(
@@ -415,7 +544,8 @@ def report(data: dict, count_rows, gap_rows, gap_values: np.ndarray,
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description='Histogram pre-admission record counts and the gap to ICU admission'
+        description='Histogram pre-admission record counts, their spacing, and the gap '
+                    'to ICU admission'
     )
     parser.add_argument('--data_dir', default='data',
                         help='Directory holding the fold subdirectories (default: data)')
@@ -463,9 +593,16 @@ def main(argv=None):
     data = collect(args.data_dir, args.folds, args.splits, args.cohort,
                    args.extracted_history_len_steps, args.extracted_cutoff_hours)
 
+    # The interval arrays hold one entry per interval rather than per episode, so they are
+    # taken out before the per-episode cohort filter and selected through the episode each one
+    # came from.
+    all_intervals = data.pop('intervals')
+    interval_episode = data.pop('interval_episode')
+
     n_value = int(data['in_value'].sum())
     n_any = int(data['in_any'].sum())
     keep = data['in_cohort']
+    intervals = all_intervals[keep[interval_episode]]
     data = {key: (value[keep] if isinstance(value, np.ndarray) else value)
             for key, value in data.items()}
     n = int(keep.sum())
@@ -498,27 +635,41 @@ def main(argv=None):
         raise SystemExit(f'a gap came out negative ({gap_values.min():.2f} h), so the most '
                          f'recent history record sits at or after admission.')
 
+    if intervals.size == 0:
+        raise SystemExit(
+            'no episode in the cohort holds two pre-admission records, so the interval panel '
+            'would be empty. Check the history width the arrays were extracted at.'
+        )
+
     count_rows = bin_counts(data['val_count'], count_bins(data['hist']))
+    interval_rows = bin_counts(intervals, INTERVAL_BINS)
     gap_rows = bin_counts(gap_values, GAP_BINS)
-    report(data, count_rows, gap_rows, gap_values, args.cohort, n_value, n_any)
+    report(data, count_rows, interval_rows, gap_rows, intervals, gap_values, args.cohort,
+           n_value, n_any)
 
     if sum(value for _, value in count_rows) != n:
         raise SystemExit('the count bins do not cover every episode.')
+    if sum(value for _, value in interval_rows) != len(intervals):
+        raise SystemExit('the interval bins do not cover every interval.')
     if sum(value for _, value in gap_rows) != len(gap_values):
         raise SystemExit('the gap bins do not cover every measurable gap.')
 
     if args.csv:
         os.makedirs(os.path.dirname(args.csv) or '.', exist_ok=True)
         with open(args.csv, 'w') as handle:
-            handle.write('panel,bin,episodes\n')
+            # The unit is the panel's own: episodes for the two outer panels, intervals for
+            # the middle one, which is why the column is not named for either.
+            handle.write('panel,bin,count\n')
             for label, value in count_rows:
                 handle.write(f'value_history_records,{label},{value}\n')
+            for label, value in interval_rows:
+                handle.write(f'interval_hours,{label},{value}\n')
             for label, value in gap_rows:
                 handle.write(f'gap_hours,{label},{value}\n')
         print(f'Wrote {args.csv}')
 
     if not args.no_figure:
-        draw(count_rows, gap_rows, n, CAPTIONS[args.cohort], args.output,
+        draw(count_rows, interval_rows, gap_rows, n, CAPTIONS[args.cohort], args.output,
              args.title, args.extracted_cutoff_hours)
     return 0
 
