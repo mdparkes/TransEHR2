@@ -12,10 +12,10 @@ describes the episodes that survived extraction -- the same population the model
 and evaluated on. The listfiles supply only the column order, which is the order the label
 matrix was written in.
 
-The two heart failure categories are reported separately. ICD-9 codes reach their phenotype
-through HCUP CCS 2015 and ICD-10 codes through HCUP CCSR 2024, and the two vocabularies name
-that category differently; the label matrix carries both names as distinct columns and the
-models predict them as distinct labels, so pooling them here would describe a different task.
+ICD-9 codes reach their phenotype through HCUP CCS 2015 and ICD-10 codes through HCUP CCSR
+2024. The two vocabularies name some categories differently, so CCSR category names are
+aligned to their CCS counterparts when the definitions are built; each phenotype is one
+column of the label matrix regardless of the coding era of the stay.
 
 Usage:
     python report_diagnosis_prevalence.py --data_dir data/
