@@ -487,3 +487,118 @@ def test_text_rendering_uses_short_column_labels(capsys):
     out = capsys.readouterr().out
     assert 'Expt 3 = A very long column heading indeed' in out
     assert max(len(line) for line in out.splitlines()) < 80
+
+
+# ------------------------------------------------------------------
+# Aligning the folds
+#
+# Every per-fold quantity is indexed by position: the paired test pairs by
+# position, and the statistics CSV heads its per-fold columns with the control's
+# fold names. The guard that used to stand here compared fold counts, so two
+# experiments holding the same number of different folds went through and were
+# compared fold by fold against the wrong folds, with nothing in the output to
+# say so.
+# ------------------------------------------------------------------
+
+from reporting.cli import restrict_to_common_folds
+from reporting.evaluation import ExperimentResult
+
+
+def result(number, folds, auroc=None, with_thresholds=True):
+    """An ExperimentResult carrying one metric, one value per fold."""
+    values = list(auroc) if auroc is not None else [0.8 + 0.01 * i
+                                                    for i in range(len(folds))]
+    return ExperimentResult(
+        number, f'experiment{number}_stub', list(folds),
+        {'auroc': values},
+        {fold: np.array([0.5]) for fold in folds} if with_thresholds else None,
+        ['label'],
+    )
+
+
+def test_experiments_agreeing_on_their_folds_are_left_alone():
+    """The normal case. Restricting must not perturb a complete run."""
+    results = {20: result(20, ['fold1', 'fold2', 'fold3']),
+               21: result(21, ['fold1', 'fold2', 'fold3'])}
+    assert restrict_to_common_folds(results) is results
+
+
+def test_the_same_number_of_different_folds_is_reduced_rather_than_paired():
+    """What the old count check let through: five values against five values,
+    three of which belong to other folds."""
+    control = result(20, ['fold1', 'fold2', 'fold3', 'fold4'])
+    arm = result(21, ['fold1', 'fold2', 'fold4', 'fold6'])
+    assert len(control.folds) == len(arm.folds)
+
+    restricted = restrict_to_common_folds({20: control, 21: arm})
+    assert restricted[20].folds == ['fold1', 'fold2', 'fold4']
+    assert restricted[21].folds == ['fold1', 'fold2', 'fold4']
+
+
+def test_the_values_that_survive_are_the_ones_belonging_to_those_folds():
+    """Reducing the fold list without reindexing the values would keep the
+    mispairing and hide it behind a correct-looking header."""
+    control = result(20, ['fold1', 'fold2', 'fold3'], auroc=[0.81, 0.82, 0.83])
+    arm = result(21, ['fold1', 'fold3', 'fold5'], auroc=[0.91, 0.93, 0.95])
+
+    restricted = restrict_to_common_folds({20: control, 21: arm})
+    assert list(restricted[20].values('auroc')) == pytest.approx([0.81, 0.83])
+    assert list(restricted[21].values('auroc')) == pytest.approx([0.91, 0.93])
+
+
+def test_the_thresholds_follow_the_folds_they_belong_to():
+    arm = ExperimentResult(
+        21, 'experiment21_stub', ['fold1', 'fold2', 'fold3'],
+        {'auroc': [0.9, 0.9, 0.9]},
+        {'fold1': np.array([0.1]), 'fold2': np.array([0.2]),
+         'fold3': np.array([0.3])},
+        ['label'],
+    )
+    restricted = restrict_to_common_folds(
+        {20: result(20, ['fold1', 'fold3']), 21: arm})[21]
+    assert sorted(restricted.thresholds) == ['fold1', 'fold3']
+    assert restricted.thresholds['fold3'] == pytest.approx([0.3])
+
+
+def test_a_regression_task_carries_no_thresholds_to_restrict():
+    """length_of_stay sets thresholds to None, which must survive the trip."""
+    results = {20: result(20, ['fold1', 'fold2'], with_thresholds=False),
+               21: result(21, ['fold1'], with_thresholds=False)}
+    assert restrict_to_common_folds(results)[20].thresholds is None
+
+
+def test_restriction_puts_an_arm_ahead_of_its_control_on_every_shared_fold():
+    """The whole point, end to end: an arm uniformly better than the control
+    must not come out of the pairing looking mixed."""
+    control = result(20, ['fold1', 'fold2', 'fold3', 'fold4', 'fold5'],
+                     auroc=[0.831, 0.833, 0.828, 0.840, 0.836])
+    arm = result(21, ['fold1', 'fold2', 'fold4', 'fold5', 'fold6'],
+                 auroc=[0.835, 0.837, 0.844, 0.840, 0.838])
+
+    positional = corrected_resampled_ttest(arm.values('auroc'),
+                                           control.values('auroc'))
+    restricted = restrict_to_common_folds({20: control, 21: arm})
+    aligned = corrected_resampled_ttest(restricted[21].values('auroc'),
+                                        restricted[20].values('auroc'))
+
+    differences = restricted[21].values('auroc') - restricted[20].values('auroc')
+    assert np.all(differences > 0), 'the fixture must favour the arm everywhere'
+    assert positional.p_value > aligned.p_value
+    assert aligned.mean_difference == pytest.approx(0.004)
+
+
+def test_folds_are_ordered_numerically_rather_than_lexically():
+    """fold10 sorts before fold2 as a string, and the order is what the pairing
+    and the CSV's per-fold columns both rest on."""
+    results = {20: result(20, ['fold2', 'fold10']),
+               21: result(21, ['fold10', 'fold2'])}
+    restricted = restrict_to_common_folds(results)
+    assert restricted[20].folds == ['fold2', 'fold10']
+    assert restricted[21].folds == ['fold2', 'fold10']
+
+
+def test_sharing_no_fold_is_refused():
+    results = {20: result(20, ['fold1', 'fold2']),
+               21: result(21, ['fold3', 'fold4'])}
+    with pytest.raises(SystemExit):
+        restrict_to_common_folds(results)

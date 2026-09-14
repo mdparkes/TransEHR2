@@ -499,6 +499,33 @@ class ExperimentResult:
         self.thresholds = thresholds
         self.label_names = label_names
 
+    def restricted_to(self, folds):
+        """This result over a subset of its folds, in the given order.
+
+        Every per-fold quantity is indexed by position in ``self.folds``, so
+        reducing two experiments to a common set of folds is what makes their
+        columns describe the same thing -- the paired test most of all, which
+        pairs by position and cannot see that it is pairing fold 4 with fold 3.
+
+        Args:
+            folds: Fold names to keep, in the order they should appear. Every
+                one must be a fold this result holds.
+
+        Returns:
+            A new :class:`ExperimentResult`.
+
+        Raises:
+            KeyError: If a requested fold is not one of this result's.
+        """
+        position = {fold: index for index, fold in enumerate(self.folds)}
+        keep = [position[fold] for fold in folds]
+        metrics = {key: [values[index] for index in keep]
+                   for key, values in self.metrics.items()}
+        thresholds = (None if self.thresholds is None
+                      else {fold: self.thresholds[fold] for fold in folds})
+        return ExperimentResult(self.number, self.name, list(folds), metrics,
+                                thresholds, self.label_names)
+
     def values(self, metric):
         """Return the per-fold values of one metric as an array.
 

@@ -421,6 +421,58 @@ def compare_experiments(results, order, control, metric_specs, fdr_scope):
     return comparisons
 
 
+def restrict_to_common_folds(results):
+    """Reduce every experiment to the folds all of them share.
+
+    Each experiment discovers its own folds, so one whose fold failed carries a
+    shorter list than the rest. Every per-fold quantity downstream is indexed by
+    position: the paired test pairs by position, and the per-fold columns of the
+    statistics CSV are headed with the control's fold names. Two experiments
+    holding the same number of different folds therefore produce a comparison
+    between mismatched folds, with nothing in the output to say so.
+
+    Restricting to the intersection is a no-op when every experiment ran every
+    fold, which is the case this is normally in. It matters when it is not, and
+    the report job runs on whatever has finished by design.
+
+    Args:
+        results: Mapping from experiment number to
+            :class:`~reporting.evaluation.ExperimentResult`.
+
+    Returns:
+        The mapping, with every result over the same folds in the same order.
+        The input mapping is returned unchanged when they already agree.
+
+    Raises:
+        SystemExit: If the experiments share no fold.
+    """
+    fold_sets = {number: list(result.folds) for number, result in results.items()}
+    shared = set.intersection(*(set(folds) for folds in fold_sets.values()))
+    common = sorted(shared, key=lambda name: int(name[4:]))
+
+    if not common:
+        detail = '; '.join(f'{number}: {", ".join(folds) or "none"}'
+                           for number, folds in sorted(fold_sets.items()))
+        raise SystemExit(
+            f'The experiments share no fold, so there is nothing to compare '
+            f'them on ({detail}).'
+        )
+
+    if all(folds == common for folds in fold_sets.values()):
+        return results
+
+    for number, folds in sorted(fold_sets.items()):
+        dropped = [fold for fold in folds if fold not in shared]
+        if dropped:
+            print(f'  experiment {number}: dropping {", ".join(dropped)}, '
+                  f'not present in every experiment', file=sys.stderr)
+    print(f'  every comparison is over {", ".join(common)} '
+          f'({len(common)} folds)', file=sys.stderr)
+
+    return {number: result.restricted_to(common)
+            for number, result in results.items()}
+
+
 # ------------------------------------------------------------------
 # Table assembly
 # ------------------------------------------------------------------
@@ -793,14 +845,7 @@ def run(args, task, specs, threshold_note_builder=None):
         except (FileNotFoundError, ValueError) as exc:
             raise SystemExit(f'experiment {number}: {exc}')
 
-    fold_counts = {n: len(r.folds) for n, r in results.items()}
-    if len(set(fold_counts.values())) > 1:
-        detail = ', '.join(f'{n}: {c}' for n, c in fold_counts.items())
-        raise SystemExit(
-            f'The corrected resampled t test compares models across the '
-            f'same folds, but the fold counts differ ({detail}). Pass '
-            f'--folds to restrict every experiment to a common set.'
-        )
+    results = restrict_to_common_folds(results)
 
     threshold_note = (threshold_note_builder(args, results)
                       if threshold_note_builder else None)
