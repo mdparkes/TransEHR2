@@ -21,6 +21,13 @@ k = 5 the multiplier is 1/5 + 1/4 = 0.45, against 1/5 = 0.2 for the
 uncorrected paired test, so the standard error is inflated by a factor
 of 1.5.
 
+The same argument applies to the mean of one model's per-fold scores,
+which is an average over the same overlapping training sets, so
+``corrected_standard_error`` applies the identical inflation there. That
+is what the reported standard errors are: an uncorrected sd / sqrt(k)
+beside a corrected P value describes a narrower interval than the test
+it sits next to.
+
 Reference:
     Nadeau C, Bengio Y. Inference for the generalization error. Machine
     Learning 2003;52(3):239-281. doi:10.1023/A:1024068626366
@@ -164,21 +171,40 @@ def benjamini_hochberg(p_values):
     return adjusted
 
 
-def standard_error_of_mean(values):
-    """Compute the standard error of the mean across folds.
+def corrected_standard_error(values, n_train_test_ratio=None):
+    """Standard error of a mean over overlapping cross-validation folds.
+
+    The same inflation the corrected resampled t test applies, taken on one
+    model's per-fold values rather than on a difference. Nadeau and Bengio's
+    correction is a statement about averaging over splits whose training sets
+    overlap, not about differences in particular: the folds' sample variance
+    understates the variance of their mean whatever statistic is averaged.
+
+        se = sqrt((1 / k + n_test / n_train) * var(values, ddof=1))
+
+    Against the uncorrected ``sd / sqrt(k)`` this is larger by a factor of
+    sqrt(1 + k / (k - 1)), which is 1.5 at k = 5.
 
     Args:
         values: Per-fold metric values, possibly containing NaN.
+        n_train_test_ratio: The value of n_test / n_train. When ``None``,
+            the fixed adjustment 1 / (k - 1) is used, with k the number of
+            values that are not NaN.
 
     Returns:
-        The standard error of the mean, or NaN if fewer than two values
-        are available.
+        The corrected standard error, or NaN if fewer than two values are
+        available.
     """
     v = np.asarray(values, dtype=np.float64)
     v = v[~np.isnan(v)]
-    if v.size < 2:
+    k = v.size
+    if k < 2:
         return float('nan')
-    return float(np.std(v, ddof=1) / math.sqrt(v.size))
+    if n_train_test_ratio is None:
+        n_train_test_ratio = 1.0 / (k - 1)
+    return float(math.sqrt((1.0 / k + n_train_test_ratio)
+                           * np.var(v, ddof=1)))
+
 
 
 def mean_of_folds(values):

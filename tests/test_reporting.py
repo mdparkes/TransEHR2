@@ -34,7 +34,7 @@ from reporting.jmir.formatting import (
 from reporting.stats import (
     benjamini_hochberg,
     corrected_resampled_ttest,
-    standard_error_of_mean,
+    corrected_standard_error,
 )
 from reporting.jmir.tables import (
     Table,
@@ -201,10 +201,48 @@ def test_bh_passes_nan_through_and_excludes_it_from_the_family():
     assert adjusted[0] == pytest.approx(0.02)
 
 
-def test_sem_uses_the_sample_standard_deviation():
+def test_the_reported_se_is_the_corrected_one():
+    """What goes in a table cell. sd/sqrt(k) describes a narrower interval than
+    the test printed beside it, which is what made a larger effect at the same
+    SE look like an error when its P came out larger."""
     values = [0.86, 0.85, 0.85, 0.84, 0.84]
-    expected = np.std(values, ddof=1) / math.sqrt(5)
-    assert standard_error_of_mean(values) == pytest.approx(expected)
+    k = len(values)
+    expected = math.sqrt((1 / k + 1 / (k - 1)) * np.var(values, ddof=1))
+    assert corrected_standard_error(values) == pytest.approx(expected)
+
+
+def test_the_correction_inflates_the_se_by_one_and_a_half_at_five_folds():
+    values = [0.86, 0.85, 0.85, 0.84, 0.84]
+    uncorrected = np.std(values, ddof=1) / math.sqrt(len(values))
+    assert corrected_standard_error(values) / uncorrected == pytest.approx(1.5)
+
+
+def test_the_se_and_the_test_agree_on_the_ratio_they_were_given():
+    """Both take the ratio from the caller, so a cell's SE and its P cannot be
+    computed on different assumptions about the design."""
+    a = [0.84, 0.83, 0.85, 0.82, 0.83]
+    d = np.array(a) - np.array([0.80, 0.81, 0.79, 0.80, 0.80])
+    se = corrected_standard_error(d, n_train_test_ratio=1 / 4)
+    test = corrected_resampled_ttest(a, [0.80, 0.81, 0.79, 0.80, 0.80],
+                                     n_train_test_ratio=1 / 4)
+    assert test.statistic == pytest.approx(np.mean(d) / se)
+
+
+def test_an_explicit_ratio_overrides_the_fold_count():
+    values = [0.86, 0.85, 0.85, 0.84, 0.84]
+    assert corrected_standard_error(values, n_train_test_ratio=1 / 4) == \
+        pytest.approx(corrected_standard_error(values))
+    assert corrected_standard_error(values, n_train_test_ratio=1 / 2) > \
+        corrected_standard_error(values)
+
+
+def test_the_corrected_se_drops_nan_and_needs_two_values():
+    assert corrected_standard_error([0.8, float('nan'), 0.9]) == \
+        pytest.approx(corrected_standard_error([0.8, 0.9]))
+    assert math.isnan(corrected_standard_error([0.8]))
+    assert math.isnan(corrected_standard_error([]))
+
+
 
 
 # ------------------------------------------------------------------
@@ -602,3 +640,54 @@ def test_sharing_no_fold_is_refused():
                21: result(21, ['fold3', 'fold4'])}
     with pytest.raises(SystemExit):
         restrict_to_common_folds(results)
+
+
+# ------------------------------------------------------------------
+# The ratio comes from the design, not from what survived
+#
+# n_test / n_train describes how the data were split, so it is 1/4 for 5-fold
+# cross-validation whether the report averages over five folds or three. Deriving
+# it from the surviving count makes a partial report conservative for a reason
+# that has nothing to do with the data.
+# ------------------------------------------------------------------
+
+from reporting.cli import _p_value_footnote, compare_experiments, MetricSpec
+
+
+class _Args:
+    fdr_scope = 'none'
+    show_raw_p = False
+
+
+def test_the_cell_se_is_the_corrected_one():
+    results = {20: result(20, ['fold1', 'fold2', 'fold3', 'fold4', 'fold5'],
+                          auroc=[0.830, 0.831, 0.829, 0.832, 0.828]),
+               21: result(21, ['fold1', 'fold2', 'fold3', 'fold4', 'fold5'],
+                          auroc=[0.835, 0.837, 0.833, 0.838, 0.834])}
+    spec = MetricSpec('auroc', 'AUROC')
+    comparisons = compare_experiments(results, [20, 21], 20, [spec], 'none',
+                                      1 / 4)
+    for number in (20, 21):
+        assert comparisons[('auroc', number)].se == pytest.approx(
+            corrected_standard_error(results[number].values('auroc'), 1 / 4))
+
+
+def test_a_reduced_fold_set_keeps_the_design_ratio():
+    """Three folds averaged, but each model still trained on 4/5 of the data."""
+    a = [0.835, 0.837, 0.833]
+    b = [0.830, 0.831, 0.829]
+    design = corrected_resampled_ttest(a, b, n_train_test_ratio=1 / 4)
+    from_survivors = corrected_resampled_ttest(a, b)      # would use 1/2
+    assert design.df == from_survivors.df == 2
+    assert abs(design.statistic) > abs(from_survivors.statistic)
+    assert design.p_value < from_survivors.p_value
+
+
+def test_the_footnote_names_the_design_fold_count():
+    """The df comes from the folds averaged and the ratio from the design, and
+    a footnote that conflated them would describe a test nobody ran."""
+    text = _p_value_footnote(_Args(), 3, 5, 'Peri-stay only')
+    assert '2 <i>df</i>' in text
+    # Matched loosely: the typography around the minus sign is thin spaces.
+    assert '1/(5' in text and '5-fold cross-validation' in text
+    assert '1/(3' not in text and '3-fold cross-validation' not in text

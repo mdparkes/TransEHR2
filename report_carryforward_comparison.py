@@ -48,7 +48,8 @@ import pandas as pd
 from generate_redo_configs import experiment_name
 from reporting.jmir.formatting import fmt_cell, fmt_number, fmt_p_value
 from reporting.jmir.tables import Table, build_document, render_text
-from reporting.stats import benjamini_hochberg, corrected_resampled_ttest
+from reporting.stats import (benjamini_hochberg, corrected_resampled_ttest,
+                             corrected_standard_error)
 
 DEFAULT_INPUT_DIR = os.path.join('misc', 'stratified_carryforward')
 
@@ -92,14 +93,21 @@ def read_per_fold(input_dir, experiment, split):
     return df.set_index(['phenotype', 'fold'])
 
 
-def summarise(values):
-    """Mean and standard error of the mean, ignoring nans."""
+def summarise(values, n_train_test_ratio):
+    """Mean and corrected standard error of the mean, ignoring nans.
+
+    The standard error carries the Nadeau and Bengio inflation, as the P values
+    beside it do. The folds' training sets overlap whatever is averaged over
+    them, so an uncorrected sd / sqrt(k) here would describe a narrower interval
+    than the test in the same row.
+    """
     values = np.asarray([v for v in values if v == v], dtype=float)
     if values.size == 0:
         return float('nan'), float('nan')
     if values.size == 1:
         return float(values[0]), float('nan')
-    return float(values.mean()), float(values.std(ddof=1) / np.sqrt(values.size))
+    return (float(values.mean()),
+            corrected_standard_error(values, n_train_test_ratio))
 
 
 def compare(reference, text_arm, n_train_test_ratio=None):
@@ -119,12 +127,26 @@ def compare(reference, text_arm, n_train_test_ratio=None):
         ValueError: If the arms disagree on how many positives are named,
             which means they did not run on the same episodes.
     """
-    shared_folds = sorted(
-        set(reference.index.get_level_values('fold'))
-        & set(text_arm.index.get_level_values('fold'))
-    )
+    reference_folds = set(reference.index.get_level_values('fold'))
+    arm_folds = set(text_arm.index.get_level_values('fold'))
+    shared_folds = sorted(reference_folds & arm_folds)
     if not shared_folds:
         raise ValueError('the two arms share no folds, so they cannot be paired.')
+
+    # The ratio is a property of the cross-validation design, so it is taken
+    # from every fold either arm ran rather than from the ones they share. A
+    # model trains on (k-1)/k of the data whether or not the other arm's run of
+    # that fold finished, and shrinking the ratio with the paired count would
+    # make a partial comparison conservative for the wrong reason.
+    if n_train_test_ratio is None:
+        design_folds = len(reference_folds | arm_folds)
+        if design_folds < 2:
+            raise ValueError(
+                f'the correction needs at least 2 folds in the design, found '
+                f'{design_folds}. Pass --n-train-test-ratio to set the ratio '
+                f'directly.'
+            )
+        n_train_test_ratio = 1.0 / (design_folds - 1)
 
     rows = []
     phenotypes = [p for p in text_arm.index.get_level_values('phenotype').unique()
@@ -166,25 +188,19 @@ def compare(reference, text_arm, n_train_test_ratio=None):
                 arm_values.append(arm_p)
 
         deltas = [a - r for a, r in zip(arm_values, ref_values)]
-        ref_mean, ref_sem = summarise(ref_values)
-        arm_mean, arm_sem = summarise(arm_values)
-        delta_mean, delta_sem = summarise(deltas)
+        # Every standard error here is the one the test uses, so a reader can
+        # recompute t from the difference column and get the P beside it.
+        ref_mean, ref_sem = summarise(ref_values, n_train_test_ratio)
+        arm_mean, arm_sem = summarise(arm_values, n_train_test_ratio)
+        delta_mean, delta_sem = summarise(deltas, n_train_test_ratio)
 
         if len(deltas) >= 2:
             test = corrected_resampled_ttest(arm_values, ref_values,
                                              n_train_test_ratio)
             statistic, df, p_value, note = (test.statistic, test.df,
                                             test.p_value, test.note)
-            # The standard error the test actually used. Reporting the plain
-            # SEM beside a corrected P value would let a reader recompute t and
-            # get a different answer from the one in the same cell.
-            k = len(deltas)
-            ratio = (1.0 / (k - 1) if n_train_test_ratio is None
-                     else n_train_test_ratio)
-            corrected_sem = float(np.sqrt((1.0 / k + ratio)
-                                          * np.var(deltas, ddof=1)))
         else:
-            statistic = df = p_value = corrected_sem = float('nan')
+            statistic = df = p_value = float('nan')
             note = 'fewer than two folds where both arms are defined'
 
         rows.append({
@@ -194,7 +210,6 @@ def compare(reference, text_arm, n_train_test_ratio=None):
             'reference_p': ref_mean, 'reference_sem': ref_sem,
             'text_p': arm_mean, 'text_sem': arm_sem,
             'delta': delta_mean, 'delta_sem': delta_sem,
-            'delta_sem_corrected': corrected_sem,
             't_statistic': statistic, 'df': df,
             'p_value': p_value, 'note': note,
             'n_folds': len(deltas),
@@ -324,7 +339,7 @@ def build_table(result, table_number, caption, reference_name, text_arm_name,
         values += [
             estimate(row.reference_p, row.reference_sem),
             estimate(row.text_p, row.text_sem),
-            estimate(row.delta, row.delta_sem_corrected, reported, alpha, raw),
+            estimate(row.delta, row.delta_sem, reported, alpha, raw),
         ]
         return values
 
@@ -362,9 +377,11 @@ def main(argv=None):
     parser.add_argument('--show-raw-p', action='store_true',
                         help='Report the unadjusted P value alongside the adjusted one')
     parser.add_argument('--n-train-test-ratio', type=float, default=None,
-                        help='n_test / n_train for the corrected resampled t test. '
-                             'Default uses the fixed 1/(k-1) adjustment for a single '
-                             'run of k-fold cross-validation.')
+                        help='n_test / n_train for the corrected resampled t test '
+                             'and for the standard errors. Default uses the fixed '
+                             '1/(k-1) adjustment for a single run of k-fold '
+                             'cross-validation, with k the number of distinct folds '
+                             'either arm ran rather than the number they share.')
     parser.add_argument('--csv', default=None,
                         help='Optional path for the underlying numbers, including '
                              'the t statistics and unadjusted P values')
