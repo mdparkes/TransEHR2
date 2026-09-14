@@ -169,7 +169,7 @@ Trials are ranked on the criterion each hyperparameter's grid entry names in the
 ## Charlson comorbidity baseline
 
 A logistic regression on age at admission, sex and the Charlson comorbidity index, reported
-against an in-stay-only model as a conventional-severity-score reference for in-hospital
+against a peri-stay-only model as a conventional-severity-score reference for in-hospital
 mortality. The index is that of the patient's most recent earlier hospital admission.
 
 **The cohort is an explicit episode manifest, and both arms are given the same file.** An
@@ -206,18 +206,18 @@ validation and test splits, in the layout `dump_finetuned_predictions.py` uses.
 python run_charlson_logistic_regression.py ${DATASET_CONFIG}
 ```
 
-**4. Train the control.** Experiment 18 is the in-stay-only model on the same episodes, and it
-has to be trained like any other experiment.
+**4. Train the control.** Experiment 28 is the peri-stay-only model on the same episodes, and
+it has to be trained like any other experiment.
 
 ```shell
-EXPERIMENT_CONFIG=TransEHR2/configs/experiments/experiment18_instay_charlsonsubset_rev.yaml \
+EXPERIMENT_CONFIG=TransEHR2/configs/experiments/experiment28_peristay_charlsonsubset_rev.yaml \
 TASKS=mortality \
     sbatch --array=0-4 SLURM/slurm_run_experiment.sh
 ```
 
 ```shell
 sbatch --array=0-0 SLURM/slurm_dump_predictions.sh \
-    TransEHR2/configs/experiments/experiment18_instay_charlsonsubset_rev.yaml
+    TransEHR2/configs/experiments/experiment28_peristay_charlsonsubset_rev.yaml
 ```
 
 **5. Build the table.**

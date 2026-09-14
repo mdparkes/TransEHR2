@@ -2,7 +2,8 @@
 """
 Filter fold listfiles to retain only patient-episodes that have at least one
 discharge summary in their historical records (records predating the current
-ICU stay, i.e., Hours < 0 in the timeseries CSV).
+ICU stay, i.e., Hours earlier than the dataset config's
+PREADMISSION_CUTOFF_HOURS in the timeseries CSV).
 
 Backs up original listfiles as {name}.unfiltered.csv, then overwrites with
 filtered versions. Reports per-fold, per-partition filtering statistics.
@@ -21,7 +22,7 @@ import pandas as pd
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 
-def has_historical_discharge_summary(episode_file_path):
+def has_historical_discharge_summary(episode_file_path, cutoff_hours=0.0):
     """Check whether an episode has discharge summary text in its historical records.
 
     Args:
@@ -38,7 +39,7 @@ def has_historical_discharge_summary(episode_file_path):
         df = pd.read_csv(ts_path, usecols=['Hours', 'Discharge Summary'])
     except (FileNotFoundError, ValueError):
         return episode_file_path, False
-    historical = df[df['Hours'] < 0]
+    historical = df[df['Hours'] < -float(cutoff_hours)]
     if historical.empty:
         return episode_file_path, False
     ds = historical['Discharge Summary'].dropna()
@@ -48,7 +49,7 @@ def has_historical_discharge_summary(episode_file_path):
     return episode_file_path, has_text
 
 
-def check_episodes(episode_file_paths, n_workers=1):
+def check_episodes(episode_file_paths, n_workers=1, cutoff_hours=0.0):
     """Check which episodes have historical discharge summaries.
 
     Args:
@@ -63,13 +64,14 @@ def check_episodes(episode_file_paths, n_workers=1):
 
     if n_workers <= 1:
         for path in unique_paths:
-            _, result = has_historical_discharge_summary(path)
+            _, result = has_historical_discharge_summary(path, cutoff_hours)
             if result:
                 passing.add(path)
     else:
         with ProcessPoolExecutor(max_workers=n_workers) as executor:
             futures = {
-                executor.submit(has_historical_discharge_summary, p): p
+                executor.submit(has_historical_discharge_summary, p,
+                                cutoff_hours): p
                 for p in unique_paths
             }
             for future in as_completed(futures):
@@ -211,6 +213,7 @@ if __name__ == "__main__":
         config = yaml.safe_load(f)
 
     DATA_DIR = config['DATA_DIR']
+    CUTOFF_HOURS = float(config.get('PREADMISSION_CUTOFF_HOURS', 0))
     fold_names = discover_folds(DATA_DIR, args.folds)
 
     if not fold_names:
@@ -256,7 +259,7 @@ if __name__ == "__main__":
             print(f"\n  {partition}: checking {len(episode_paths)} episodes...")
 
             # Determine which episodes have historical discharge summaries
-            passing = check_episodes(episode_paths, args.n_workers)
+            passing = check_episodes(episode_paths, args.n_workers, CUTOFF_HOURS)
 
             # Filter fold CSV
             result = filter_fold_csv(

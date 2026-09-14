@@ -35,10 +35,19 @@ BATCH_SIZE: 200
 # Whether to use text data as features
 USE_TEXT: True
 
-# Whether to use pre-admission historical records. If False, historical
-# timesteps are masked out at collation time so the model only sees
-# episode data. Requires data extracted with left-padded history layout.
-USE_HISTORICAL_RECORDS: True
+# Which records reach the model. Each switch clears its region's indicators at collation time
+# and rebuilds the timestep mask from what survives; all three on is the full sequence, which
+# is what this sweep varies the length of rather than the content of.
+#
+# These replaced a single USE_HISTORICAL_RECORDS when text became switchable separately. The
+# old name sat here until the redo: unknown keys are not validated, so it was read by nothing.
+USE_HISTORICAL_NONTEXT_RECORDS: True
+USE_HISTORICAL_TEXT_RECORDS: True
+USE_INSTAY_RECORDS: True
+
+# The population the sweep runs on, matching the tuning bases it inherits its hyperparameters
+# from. A history-length sweep over episodes with no history measures nothing.
+COHORT_SUBSET: any_history
 
 # In-stay sequence length is held fixed at everything that was extracted; only history varies.
 EPISODE_LEN_STEPS: null

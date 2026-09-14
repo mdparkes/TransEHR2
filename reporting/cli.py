@@ -20,7 +20,7 @@ import yaml
 from .evaluation import evaluate_experiment
 from .jmir.formatting import fmt_cell, fmt_number, fmt_p_value, fmt_t_statistic
 from .stats import (benjamini_hochberg, corrected_resampled_ttest,
-                    mean_of_folds, standard_error_of_mean)
+                    corrected_standard_error, mean_of_folds)
 from .jmir.tables import Table, build_document, render_text, strip_markup
 
 DEFAULT_LABEL_FILE = 'reporting_labels.yaml'
@@ -158,6 +158,15 @@ def build_parser(task, description, default_caption,
              'controls the false discovery rate: every comparison in '
              'the table, every comparison within one metric row, or no '
              'correction'
+    )
+    parser.add_argument(
+        '--cv-folds', type=int, default=None,
+        help='Number of folds the cross-validation design has, which sets '
+             'the ratio of test set size to training set size in the '
+             'Nadeau-Bengio correction. Defaults to the number of distinct '
+             'folds found across the experiments. It is not the number of '
+             'folds averaged over: a model still trains on (k-1)/k of the '
+             'data when one fold\'s run is missing from the report.'
     )
     parser.add_argument(
         '--show-raw-p', action='store_true',
@@ -357,7 +366,8 @@ class Comparison:
         return self.test.p_value
 
 
-def compare_experiments(results, order, control, metric_specs, fdr_scope):
+def compare_experiments(results, order, control, metric_specs, fdr_scope,
+                        n_train_test_ratio):
     """Run every comparison for a table and adjust the P values.
 
     Args:
@@ -367,6 +377,10 @@ def compare_experiments(results, order, control, metric_specs, fdr_scope):
         control: The control experiment number.
         metric_specs: The :class:`MetricSpec` objects to report.
         fdr_scope: ``'table'``, ``'row'`` or ``'none'``.
+        n_train_test_ratio: The ratio of test set size to training set size,
+            from the design's fold count. Used for both the test and the
+            standard errors, so a reader cannot be given an interval narrower
+            than the test that sits beside it.
 
     Returns:
         A dict mapping ``(metric_key, experiment_number)`` to
@@ -389,11 +403,13 @@ def compare_experiments(results, order, control, metric_specs, fdr_scope):
             test = None
             if number != control and spec.compare:
                 test = corrected_resampled_ttest(
-                    values, control_result.values(spec.key)
+                    values, control_result.values(spec.key),
+                    n_train_test_ratio
                 )
             comparisons[(spec.key, number)] = Comparison(
                 spec.key, number, mean_of_folds(values),
-                standard_error_of_mean(values), values, test
+                corrected_standard_error(values, n_train_test_ratio),
+                values, test
             )
 
     if fdr_scope == 'none':
@@ -421,12 +437,64 @@ def compare_experiments(results, order, control, metric_specs, fdr_scope):
     return comparisons
 
 
+def restrict_to_common_folds(results):
+    """Reduce every experiment to the folds all of them share.
+
+    Each experiment discovers its own folds, so one whose fold failed carries a
+    shorter list than the rest. Every per-fold quantity downstream is indexed by
+    position: the paired test pairs by position, and the per-fold columns of the
+    statistics CSV are headed with the control's fold names. Two experiments
+    holding the same number of different folds therefore produce a comparison
+    between mismatched folds, with nothing in the output to say so.
+
+    Restricting to the intersection is a no-op when every experiment ran every
+    fold, which is the case this is normally in. It matters when it is not, and
+    the report job runs on whatever has finished by design.
+
+    Args:
+        results: Mapping from experiment number to
+            :class:`~reporting.evaluation.ExperimentResult`.
+
+    Returns:
+        The mapping, with every result over the same folds in the same order.
+        The input mapping is returned unchanged when they already agree.
+
+    Raises:
+        SystemExit: If the experiments share no fold.
+    """
+    fold_sets = {number: list(result.folds) for number, result in results.items()}
+    shared = set.intersection(*(set(folds) for folds in fold_sets.values()))
+    common = sorted(shared, key=lambda name: int(name[4:]))
+
+    if not common:
+        detail = '; '.join(f'{number}: {", ".join(folds) or "none"}'
+                           for number, folds in sorted(fold_sets.items()))
+        raise SystemExit(
+            f'The experiments share no fold, so there is nothing to compare '
+            f'them on ({detail}).'
+        )
+
+    if all(folds == common for folds in fold_sets.values()):
+        return results
+
+    for number, folds in sorted(fold_sets.items()):
+        dropped = [fold for fold in folds if fold not in shared]
+        if dropped:
+            print(f'  experiment {number}: dropping {", ".join(dropped)}, '
+                  f'not present in every experiment', file=sys.stderr)
+    print(f'  every comparison is over {", ".join(common)} '
+          f'({len(common)} folds)', file=sys.stderr)
+
+    return {number: result.restricted_to(common)
+            for number, result in results.items()}
+
+
 # ------------------------------------------------------------------
 # Table assembly
 # ------------------------------------------------------------------
 
 def build_table(args, results, order, control, specs, labels,
-                threshold_note=None):
+                design_folds, threshold_note=None):
     """Assemble the manuscript table.
 
     Footnotes are registered in the order the house style requires, which is left to
@@ -442,6 +510,9 @@ def build_table(args, results, order, control, specs, labels,
         specs: A sequence of :class:`MetricSpec` and :class:`CategorySpec`
             objects, in row order.
         labels: Mapping from experiment number to column heading.
+        design_folds: Fold count of the cross-validation design, which sets
+            the Nadeau-Bengio ratio. Not necessarily the number of folds
+            averaged over.
         threshold_note: Optional sentence describing how the decision
             threshold was chosen.
 
@@ -449,8 +520,10 @@ def build_table(args, results, order, control, specs, labels,
         A tuple ``(table, comparisons)``.
     """
     metric_specs = [s for s in specs if isinstance(s, MetricSpec)]
+    n_train_test_ratio = 1.0 / (design_folds - 1)
     comparisons = compare_experiments(
-        results, order, control, metric_specs, args.fdr_scope
+        results, order, control, metric_specs, args.fdr_scope,
+        n_train_test_ratio
     )
 
     n_folds = len(results[control].folds)
@@ -464,10 +537,14 @@ def build_table(args, results, order, control, specs, labels,
     markers = []
     markers.append(table.add_footnote(
         f' Values are the mean across the {n_folds} cross-validation '
-        f'folds, with the standard error of the mean in parentheses.'
+        f'folds, with the standard error of that mean in parentheses. The '
+        f'standard error carries the same correction as the <i>P</i> values, '
+        f'below, because it is a mean over the same overlapping training '
+        f'sets.'
     ))
     markers.append(table.add_footnote(_p_value_footnote(
-        args, n_folds, column_heading(control, labels, results[control])
+        args, n_folds, design_folds,
+        column_heading(control, labels, results[control])
     )))
     if threshold_note:
         markers.append(table.add_footnote(' ' + threshold_note))
@@ -536,12 +613,17 @@ def _format_comparison(comparison, precision, args):
     return f'{fmt_number(comparison.mean, precision)} ({body})'
 
 
-def _p_value_footnote(args, n_folds, control_label):
+def _p_value_footnote(args, n_folds, design_folds, control_label):
     """Compose the footnote describing the statistical test.
 
     Args:
         args: The parsed arguments.
-        n_folds: Number of cross-validation folds.
+        n_folds: Number of folds averaged over, which sets the degrees of
+            freedom.
+        design_folds: Fold count of the cross-validation design, which sets
+            the ratio of test set size to training set size. The two differ
+            only when a fold is missing from the report; the training sets
+            are the design's either way.
         control_label: Column heading of the control.
 
     Returns:
@@ -553,8 +635,8 @@ def _p_value_footnote(args, n_folds, control_label):
         f'model on {n_folds - 1} <i>df</i>. The correction of Nadeau and '
         f'Bengio inflates the variance of the mean per-fold difference by '
         f'the ratio of test set size to training set size, fixed at '
-        f'1/({n_folds} − 1) for a single run of '
-        f'{n_folds}-fold cross-validation.'
+        f'1/({design_folds} − 1) for a single run of '
+        f'{design_folds}-fold cross-validation.'
     )
     if args.fdr_scope == 'table':
         text += (' Reported values are adjusted by the '
@@ -793,21 +875,28 @@ def run(args, task, specs, threshold_note_builder=None):
         except (FileNotFoundError, ValueError) as exc:
             raise SystemExit(f'experiment {number}: {exc}')
 
-    fold_counts = {n: len(r.folds) for n, r in results.items()}
-    if len(set(fold_counts.values())) > 1:
-        detail = ', '.join(f'{n}: {c}' for n, c in fold_counts.items())
+    # Before restricting, because this is a property of the cross-validation
+    # design and not of how many of its folds finished. A model still trains on
+    # (k-1)/k of the data when one fold's run is missing from the report, so the
+    # ratio the correction uses must not shrink with the fold count.
+    design_folds = args.cv_folds or len(
+        {fold for result in results.values() for fold in result.folds}
+    )
+    if design_folds < 2:
         raise SystemExit(
-            f'The corrected resampled t test compares models across the '
-            f'same folds, but the fold counts differ ({detail}). Pass '
-            f'--folds to restrict every experiment to a common set.'
+            f'the correction needs at least 2 folds in the design, found '
+            f'{design_folds}. Pass --cv-folds if the report covers fewer '
+            f'folds than the design has.'
         )
+
+    results = restrict_to_common_folds(results)
 
     threshold_note = (threshold_note_builder(args, results)
                       if threshold_note_builder else None)
 
     table, comparisons = build_table(
         args, results, args.experiments, args.control, specs, labels,
-        threshold_note
+        design_folds, threshold_note
     )
 
     render_text(table)

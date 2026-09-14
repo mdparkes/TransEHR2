@@ -9,8 +9,8 @@ against and what Phase 4 runs across the manuscript folds.
 Usage:
     # Decide, and write the assembled config for the winning arm
     python select_tuned_hyperparameters.py <manifest> \\
-        --output TransEHR2/configs/experiments/experiment10_tuned.yaml \\
-        --experiment_name experiment10_tuned
+        --output TransEHR2/configs/experiments/experiment20_tuned.yaml \\
+        --experiment_name experiment20_tuned
 
     # Force a particular arm rather than taking the head-to-head winner
     python select_tuned_hyperparameters.py <manifest> --arm additive --output <path>

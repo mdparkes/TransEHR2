@@ -106,8 +106,21 @@ def main(argv=None):
         if n_finetune:
             print(f"  sbatch --array=0-{n_finetune - 1} "
                   f"SLURM/slurm_tune_finetune.sh {manifest_path}")
-        print(f"  sbatch SLURM/slurm_report_tuning.sh {manifest_path}")
+        # slurm_report_tuning.sh writes the per-hyperparameter manuscript tables, which a
+        # factorial sweep has no rows for: each value appears in several cells and none of
+        # them is that value's result. Printing it anyway hands over a command that raises
+        # once every trial has already run.
+        if spec.get('DESIGN') == 'factorial':
+            print(f"  python report_tuning_results.py {manifest_path} --no_tables")
+            print(f"  python select_tuned_cell.py {manifest_path} --dry_run")
+        else:
+            print(f"  sbatch SLURM/slurm_report_tuning.sh {manifest_path}")
         print()
+        if spec.get('DESIGN') == 'factorial':
+            print("This is a factorial sweep, so it is read as a grid of cells rather than as "
+                  "one ranking per hyperparameter. Those two steps run in seconds on a login "
+                  "node; there is no reporting job to chain.")
+            print()
         if n_finetune:
             print("The finetune array depends on the pretrain array: every finetune loads the "
                   "encoder weights its own pretrain wrote. Chain them with")

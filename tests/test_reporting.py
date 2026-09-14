@@ -34,7 +34,7 @@ from reporting.jmir.formatting import (
 from reporting.stats import (
     benjamini_hochberg,
     corrected_resampled_ttest,
-    standard_error_of_mean,
+    corrected_standard_error,
 )
 from reporting.jmir.tables import (
     Table,
@@ -201,10 +201,48 @@ def test_bh_passes_nan_through_and_excludes_it_from_the_family():
     assert adjusted[0] == pytest.approx(0.02)
 
 
-def test_sem_uses_the_sample_standard_deviation():
+def test_the_reported_se_is_the_corrected_one():
+    """What goes in a table cell. sd/sqrt(k) describes a narrower interval than
+    the test printed beside it, which is what made a larger effect at the same
+    SE look like an error when its P came out larger."""
     values = [0.86, 0.85, 0.85, 0.84, 0.84]
-    expected = np.std(values, ddof=1) / math.sqrt(5)
-    assert standard_error_of_mean(values) == pytest.approx(expected)
+    k = len(values)
+    expected = math.sqrt((1 / k + 1 / (k - 1)) * np.var(values, ddof=1))
+    assert corrected_standard_error(values) == pytest.approx(expected)
+
+
+def test_the_correction_inflates_the_se_by_one_and_a_half_at_five_folds():
+    values = [0.86, 0.85, 0.85, 0.84, 0.84]
+    uncorrected = np.std(values, ddof=1) / math.sqrt(len(values))
+    assert corrected_standard_error(values) / uncorrected == pytest.approx(1.5)
+
+
+def test_the_se_and_the_test_agree_on_the_ratio_they_were_given():
+    """Both take the ratio from the caller, so a cell's SE and its P cannot be
+    computed on different assumptions about the design."""
+    a = [0.84, 0.83, 0.85, 0.82, 0.83]
+    d = np.array(a) - np.array([0.80, 0.81, 0.79, 0.80, 0.80])
+    se = corrected_standard_error(d, n_train_test_ratio=1 / 4)
+    test = corrected_resampled_ttest(a, [0.80, 0.81, 0.79, 0.80, 0.80],
+                                     n_train_test_ratio=1 / 4)
+    assert test.statistic == pytest.approx(np.mean(d) / se)
+
+
+def test_an_explicit_ratio_overrides_the_fold_count():
+    values = [0.86, 0.85, 0.85, 0.84, 0.84]
+    assert corrected_standard_error(values, n_train_test_ratio=1 / 4) == \
+        pytest.approx(corrected_standard_error(values))
+    assert corrected_standard_error(values, n_train_test_ratio=1 / 2) > \
+        corrected_standard_error(values)
+
+
+def test_the_corrected_se_drops_nan_and_needs_two_values():
+    assert corrected_standard_error([0.8, float('nan'), 0.9]) == \
+        pytest.approx(corrected_standard_error([0.8, 0.9]))
+    assert math.isnan(corrected_standard_error([0.8]))
+    assert math.isnan(corrected_standard_error([]))
+
+
 
 
 # ------------------------------------------------------------------
@@ -487,3 +525,169 @@ def test_text_rendering_uses_short_column_labels(capsys):
     out = capsys.readouterr().out
     assert 'Expt 3 = A very long column heading indeed' in out
     assert max(len(line) for line in out.splitlines()) < 80
+
+
+# ------------------------------------------------------------------
+# Aligning the folds
+#
+# Every per-fold quantity is indexed by position: the paired test pairs by
+# position, and the statistics CSV heads its per-fold columns with the control's
+# fold names. The guard that used to stand here compared fold counts, so two
+# experiments holding the same number of different folds went through and were
+# compared fold by fold against the wrong folds, with nothing in the output to
+# say so.
+# ------------------------------------------------------------------
+
+from reporting.cli import restrict_to_common_folds
+from reporting.evaluation import ExperimentResult
+
+
+def result(number, folds, auroc=None, with_thresholds=True):
+    """An ExperimentResult carrying one metric, one value per fold."""
+    values = list(auroc) if auroc is not None else [0.8 + 0.01 * i
+                                                    for i in range(len(folds))]
+    return ExperimentResult(
+        number, f'experiment{number}_stub', list(folds),
+        {'auroc': values},
+        {fold: np.array([0.5]) for fold in folds} if with_thresholds else None,
+        ['label'],
+    )
+
+
+def test_experiments_agreeing_on_their_folds_are_left_alone():
+    """The normal case. Restricting must not perturb a complete run."""
+    results = {20: result(20, ['fold1', 'fold2', 'fold3']),
+               21: result(21, ['fold1', 'fold2', 'fold3'])}
+    assert restrict_to_common_folds(results) is results
+
+
+def test_the_same_number_of_different_folds_is_reduced_rather_than_paired():
+    """What the old count check let through: five values against five values,
+    three of which belong to other folds."""
+    control = result(20, ['fold1', 'fold2', 'fold3', 'fold4'])
+    arm = result(21, ['fold1', 'fold2', 'fold4', 'fold6'])
+    assert len(control.folds) == len(arm.folds)
+
+    restricted = restrict_to_common_folds({20: control, 21: arm})
+    assert restricted[20].folds == ['fold1', 'fold2', 'fold4']
+    assert restricted[21].folds == ['fold1', 'fold2', 'fold4']
+
+
+def test_the_values_that_survive_are_the_ones_belonging_to_those_folds():
+    """Reducing the fold list without reindexing the values would keep the
+    mispairing and hide it behind a correct-looking header."""
+    control = result(20, ['fold1', 'fold2', 'fold3'], auroc=[0.81, 0.82, 0.83])
+    arm = result(21, ['fold1', 'fold3', 'fold5'], auroc=[0.91, 0.93, 0.95])
+
+    restricted = restrict_to_common_folds({20: control, 21: arm})
+    assert list(restricted[20].values('auroc')) == pytest.approx([0.81, 0.83])
+    assert list(restricted[21].values('auroc')) == pytest.approx([0.91, 0.93])
+
+
+def test_the_thresholds_follow_the_folds_they_belong_to():
+    arm = ExperimentResult(
+        21, 'experiment21_stub', ['fold1', 'fold2', 'fold3'],
+        {'auroc': [0.9, 0.9, 0.9]},
+        {'fold1': np.array([0.1]), 'fold2': np.array([0.2]),
+         'fold3': np.array([0.3])},
+        ['label'],
+    )
+    restricted = restrict_to_common_folds(
+        {20: result(20, ['fold1', 'fold3']), 21: arm})[21]
+    assert sorted(restricted.thresholds) == ['fold1', 'fold3']
+    assert restricted.thresholds['fold3'] == pytest.approx([0.3])
+
+
+def test_a_regression_task_carries_no_thresholds_to_restrict():
+    """length_of_stay sets thresholds to None, which must survive the trip."""
+    results = {20: result(20, ['fold1', 'fold2'], with_thresholds=False),
+               21: result(21, ['fold1'], with_thresholds=False)}
+    assert restrict_to_common_folds(results)[20].thresholds is None
+
+
+def test_restriction_puts_an_arm_ahead_of_its_control_on_every_shared_fold():
+    """The whole point, end to end: an arm uniformly better than the control
+    must not come out of the pairing looking mixed."""
+    control = result(20, ['fold1', 'fold2', 'fold3', 'fold4', 'fold5'],
+                     auroc=[0.831, 0.833, 0.828, 0.840, 0.836])
+    arm = result(21, ['fold1', 'fold2', 'fold4', 'fold5', 'fold6'],
+                 auroc=[0.835, 0.837, 0.844, 0.840, 0.838])
+
+    positional = corrected_resampled_ttest(arm.values('auroc'),
+                                           control.values('auroc'))
+    restricted = restrict_to_common_folds({20: control, 21: arm})
+    aligned = corrected_resampled_ttest(restricted[21].values('auroc'),
+                                        restricted[20].values('auroc'))
+
+    differences = restricted[21].values('auroc') - restricted[20].values('auroc')
+    assert np.all(differences > 0), 'the fixture must favour the arm everywhere'
+    assert positional.p_value > aligned.p_value
+    assert aligned.mean_difference == pytest.approx(0.004)
+
+
+def test_folds_are_ordered_numerically_rather_than_lexically():
+    """fold10 sorts before fold2 as a string, and the order is what the pairing
+    and the CSV's per-fold columns both rest on."""
+    results = {20: result(20, ['fold2', 'fold10']),
+               21: result(21, ['fold10', 'fold2'])}
+    restricted = restrict_to_common_folds(results)
+    assert restricted[20].folds == ['fold2', 'fold10']
+    assert restricted[21].folds == ['fold2', 'fold10']
+
+
+def test_sharing_no_fold_is_refused():
+    results = {20: result(20, ['fold1', 'fold2']),
+               21: result(21, ['fold3', 'fold4'])}
+    with pytest.raises(SystemExit):
+        restrict_to_common_folds(results)
+
+
+# ------------------------------------------------------------------
+# The ratio comes from the design, not from what survived
+#
+# n_test / n_train describes how the data were split, so it is 1/4 for 5-fold
+# cross-validation whether the report averages over five folds or three. Deriving
+# it from the surviving count makes a partial report conservative for a reason
+# that has nothing to do with the data.
+# ------------------------------------------------------------------
+
+from reporting.cli import _p_value_footnote, compare_experiments, MetricSpec
+
+
+class _Args:
+    fdr_scope = 'none'
+    show_raw_p = False
+
+
+def test_the_cell_se_is_the_corrected_one():
+    results = {20: result(20, ['fold1', 'fold2', 'fold3', 'fold4', 'fold5'],
+                          auroc=[0.830, 0.831, 0.829, 0.832, 0.828]),
+               21: result(21, ['fold1', 'fold2', 'fold3', 'fold4', 'fold5'],
+                          auroc=[0.835, 0.837, 0.833, 0.838, 0.834])}
+    spec = MetricSpec('auroc', 'AUROC')
+    comparisons = compare_experiments(results, [20, 21], 20, [spec], 'none',
+                                      1 / 4)
+    for number in (20, 21):
+        assert comparisons[('auroc', number)].se == pytest.approx(
+            corrected_standard_error(results[number].values('auroc'), 1 / 4))
+
+
+def test_a_reduced_fold_set_keeps_the_design_ratio():
+    """Three folds averaged, but each model still trained on 4/5 of the data."""
+    a = [0.835, 0.837, 0.833]
+    b = [0.830, 0.831, 0.829]
+    design = corrected_resampled_ttest(a, b, n_train_test_ratio=1 / 4)
+    from_survivors = corrected_resampled_ttest(a, b)      # would use 1/2
+    assert design.df == from_survivors.df == 2
+    assert abs(design.statistic) > abs(from_survivors.statistic)
+    assert design.p_value < from_survivors.p_value
+
+
+def test_the_footnote_names_the_design_fold_count():
+    """The df comes from the folds averaged and the ratio from the design, and
+    a footnote that conflated them would describe a test nobody ran."""
+    text = _p_value_footnote(_Args(), 3, 5, 'Peri-stay only')
+    assert '2 <i>df</i>' in text
+    # Matched loosely: the typography around the minus sign is thin spaces.
+    assert '1/(5' in text and '5-fold cross-validation' in text
+    assert '1/(3' not in text and '3-fold cross-validation' not in text

@@ -6,9 +6,9 @@ task's metrics, compares every experiment against a nominated control with the c
 resampled t test of Nadeau & Bengio (2003), controls the false discovery rate with the
 Benjamini-Hochberg procedure, and writes a numbered table per task.
 
-The experiments split into cohorts, each reported against its own in-stay-only control: every
-model in a set is compared with the one that reads no pre-admission data at all, which is the
-contrast the tables exist to make. Column order and control are properties of the design, so
+The experiments split into cohorts, each reported against its own peri-stay-only control:
+every model in a set is compared with the one that reads no pre-admission data at all, which is
+the contrast the tables exist to make. Column order and control are properties of the design, so
 they are declared below rather than retyped per run.
 
 A cohort may also declare which tasks it reports. The Charlson arm is a logistic regression on
@@ -17,11 +17,11 @@ asking for its length-of-stay table would only report a missing file.
 
 Usage:
     python report_results_tables.py
-    python report_results_tables.py --tasks mortality --cohorts dischargesubset
+    python report_results_tables.py --tasks mortality --cohorts textsubset
     python report_results_tables.py --dry_run
 
     # Any other set of experiments, in the given column order
-    python report_results_tables.py --experiments 3 1 2 --control 3 --tasks mortality
+    python report_results_tables.py --experiments 22 23 20 --control 20 --tasks mortality
 
 Options this does not define are passed through to the per-task reporter, so the threshold,
 metric, fold and formatting flags all still apply:
@@ -43,15 +43,15 @@ from reporting.tasks import TASK_SPECS, TASKS
 
 # (key, caption suffix, experiment numbers in column order, control, tasks or None for all)
 COHORTS = (
-    ('dischargesubset',
-     'patients with at least one pre-admission discharge summary',
-     (10, 11, 12, 13, 14), 10, None),
+    ('textsubset',
+     'patients with at least one pre-admission text record',
+     (20, 21, 22, 23, 24), 20, None),
     ('historysubset',
      'patients with at least one pre-admission record',
-     (15, 16, 17), 15, None),
+     (25, 26, 27), 25, None),
     ('charlson',
      'patients with a Charlson comorbidity index from an earlier hospital admission',
-     (18, 19), 18, ('mortality',)),
+     (28, 29), 28, ('mortality',)),
 )
 
 COHORT_KEYS = tuple(key for key, *_ in COHORTS)

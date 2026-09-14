@@ -16,21 +16,22 @@ Usage:
 
 Cohorts. Comparing a model that reads pre-admission history against one that does not is
 diluted by episodes with no history to read, and the paired tests need both arms on the same
-episodes. `discharge_summary` keeps episodes with at least one pre-admission discharge summary;
-`any_history` keeps those with at least one pre-admission value-stream record, which is the
-wider cohort for contrasts the narrower one underpowers.
+episodes. `any_text` keeps episodes with at least one pre-admission record of either text
+feature; `any_history` keeps those with at least one pre-admission value-stream record, which
+is the wider cohort for contrasts the narrower one underpowers.
 
-Experiment 18 takes its cohort as an explicit episode manifest instead, through
-COHORT_EPISODES. It is the in-stay-only control that `run_charlson_logistic_regression.py` is
+Experiment 28 takes its cohort as an explicit episode manifest instead, through
+COHORT_EPISODES. It is the peri-stay-only control that `run_charlson_logistic_regression.py` is
 compared against, and that comparison's cohort is the episodes for which a Charlson index, an
 age and a sex all exist -- which is not a predicate over the extracted arrays. Handing both
 arms the one file `compute_charlson_index.py --write_cohort` writes is what puts them on the
 same episodes. Generate the configs after writing it: the path is recorded here, and
 `run_experiment.py` refuses to start if it is missing.
 
-Text. The in-stay window closes at 48 h, before a discharge summary is written, so every text
-record is pre-admission. A model reading in-stay records only therefore has no text available
-to it, which is why experiments 10 and 15 carry none.
+Text. Only pre-admission text reaches the model: text is subject to the same cutoff as every
+other feature, and `collate_tensorized` drops any text record from the era boundary onward.
+A model reading peri-stay records only therefore has no text available to it, which is why
+experiments 20 and 25 carry none.
 """
 
 import argparse
@@ -50,7 +51,8 @@ OUTPUT_DIR = os.path.join(REPO, 'TransEHR2', 'configs', 'experiments')
 # seeds included: all eight experiments share one seed pair, so a contrast between them is
 # paired on initialisation and batch order as well as on fold and episode, and each run
 # reproduces.
-DROP_KEYS = ('EXPERIMENT_NAME', 'HISTORY_LEN_STEPS', 'USE_TEXT',
+DROP_KEYS = ('EXPERIMENT_NAME', 'HISTORY_LEN_STEPS', 'PRETRAIN_TOTAL_EPOCH',
+             'USE_TEXT',
              'USE_HISTORICAL_NONTEXT_RECORDS', 'USE_HISTORICAL_TEXT_RECORDS',
              'USE_INSTAY_RECORDS', 'COHORT_SUBSET', 'COHORT_EPISODES',
              'USE_HISTORICAL_RECORDS')
@@ -58,38 +60,59 @@ DROP_KEYS = ('EXPERIMENT_NAME', 'HISTORY_LEN_STEPS', 'USE_TEXT',
 # Written by compute_charlson_index.py --write_cohort; see the note on cohorts above.
 CHARLSON_COHORT = os.path.join('misc', 'charlson', 'charlson_cohort.txt')
 
-# (name, description, cohort, text, historical non-text, historical text, in-stay). A cohort
-# that is not one of the named predicates is taken as a path to an episode manifest.
+# Epoch budgets for the reported runs, set here rather than inherited from the tuned base.
+#
+# A tuning budget and a final-run budget are different quantities. 200 epochs is enough to
+# rank hyperparameters -- it asks which of them reach a good place quickest, at an allowance
+# every trial shares -- but a reported model that is still improving when its budget runs out
+# is truncated rather than converged, and the result would be what the budget bought instead
+# of what the architecture did. The value encoder now carries 41 features rather than 10, and
+# pretraining reaches 200 epochs without a 40-epoch stretch of no improvement, so the budget
+# is raised for the runs that are reported.
+#
+# Early stopping still governs when a run actually ends: EARLY_STOPPING_PATIENCE is 40 epochs
+# without a validation improvement, so a converged run stops well inside this and pays nothing
+# for the larger allowance.
+PRETRAIN_TOTAL_EPOCH = 500
+
+# (name, description, cohort, text, historical non-text, historical text, peri-stay). A
+# cohort that is not one of the named predicates is taken as a path to an episode manifest.
+#
+# Numbered from 20. The 10-19 series ran before the pre-admission cutoff and the merged
+# feature set, so its model directories and its results stand as the record of that run
+# rather than being overwritten by this one.
 EXPERIMENTS = [
-    ('experiment10_instay_dischargesubset_rev',
-     'In-Stay Records Only, Patients With At Least 1 Discharge Summary',
-     'discharge_summary', False, False, False, True),
-    ('experiment11_history_text_dischargesubset_rev',
-     'Historical Records Only, Text Features, Patients With At Least 1 Discharge Summary',
-     'discharge_summary', True, True, True, False),
-    ('experiment12_history_instay_notext_dischargesubset_rev',
-     'In-Stay + Historical Records, No Text Features, '
-     'Patients With At Least 1 Discharge Summary',
-     'discharge_summary', False, True, False, True),
-    ('experiment13_history_instay_text_dischargesubset_rev',
-     'In-Stay + Historical Records, Text Features, '
-     'Patients With At Least 1 Discharge Summary',
-     'discharge_summary', True, True, True, True),
-    ('experiment14_instay_textonly_dischargesubset_rev',
-     'In-Stay + Text Features Only, Patients With At Least 1 Discharge Summary',
-     'discharge_summary', True, False, True, True),
-    ('experiment15_instay_historysubset_rev',
-     'In-Stay Records Only, Patients With At Least 1 Historical Record',
+    ('experiment20_peristay_textsubset_rev',
+     'Peri-Stay Records Only, Patients With At Least 1 Pre-Admission Text Record',
+     'any_text', False, False, False, True),
+    ('experiment21_history_text_textsubset_rev',
+     'Historical Records Only, Text Features, '
+     'Patients With At Least 1 Pre-Admission Text Record',
+     'any_text', True, True, True, False),
+    ('experiment22_history_peristay_notext_textsubset_rev',
+     'Peri-Stay + Historical Records, No Text Features, '
+     'Patients With At Least 1 Pre-Admission Text Record',
+     'any_text', False, True, False, True),
+    ('experiment23_history_peristay_text_textsubset_rev',
+     'Peri-Stay + Historical Records, Text Features, '
+     'Patients With At Least 1 Pre-Admission Text Record',
+     'any_text', True, True, True, True),
+    ('experiment24_peristay_textonly_textsubset_rev',
+     'Peri-Stay + Text Features Only, '
+     'Patients With At Least 1 Pre-Admission Text Record',
+     'any_text', True, False, True, True),
+    ('experiment25_peristay_historysubset_rev',
+     'Peri-Stay Records Only, Patients With At Least 1 Historical Record',
      'any_history', False, False, False, True),
-    ('experiment16_history_text_historysubset_rev',
+    ('experiment26_history_text_historysubset_rev',
      'Historical Records Only, Text Features, Patients With At Least 1 Historical Record',
      'any_history', True, True, True, False),
-    ('experiment17_history_instay_text_historysubset_rev',
-     'In-Stay + Historical Records, Text Features, '
+    ('experiment27_history_peristay_text_historysubset_rev',
+     'Peri-Stay + Historical Records, Text Features, '
      'Patients With At Least 1 Historical Record',
      'any_history', True, True, True, True),
-    ('experiment18_instay_charlsonsubset_rev',
-     'In-Stay Records Only, Patients With A Charlson Comorbidity Index',
+    ('experiment28_peristay_charlsonsubset_rev',
+     'Peri-Stay Records Only, Patients With A Charlson Comorbidity Index',
      CHARLSON_COHORT, False, False, False, True),
 ]
 
@@ -109,9 +132,10 @@ def build(base: dict, name: str, cohort: str, use_text: bool, historical_nontext
     config['USE_HISTORICAL_TEXT_RECORDS'] = historical_text
     config['USE_INSTAY_RECORDS'] = instay
     # With no history of either kind the region is dead weight, so crop it away rather than
-    # masking 500 padded timesteps per episode. A run that keeps text must keep the region,
-    # because all text is pre-admission.
+    # masking 500 padded timesteps per episode. A run that keeps text must keep the region:
+    # only pre-admission text reaches the model, so cropping the region removes all of it.
     config['HISTORY_LEN_STEPS'] = 0 if not (historical_nontext or historical_text) else None
+    config['PRETRAIN_TOTAL_EPOCH'] = PRETRAIN_TOTAL_EPOCH
     return config
 
 
@@ -135,13 +159,13 @@ def main(argv=None):
 
     width = max(len(name) for name, *_ in EXPERIMENTS)
     print(f"{'experiment':{width}}  {'cohort':17}  {'text':>5}  {'h-nontext':>9}  "
-          f"{'h-text':>6}  {'in-stay':>7}  {'hist steps':>10}")
+          f"{'h-text':>6}  {'peri-stay':>9}  {'hist steps':>10}")
     print('-' * (width + 66))
     for name, description, cohort, use_text, nontext, text, instay in EXPERIMENTS:
         config = build(base, name, cohort, use_text, nontext, text, instay)
         steps = config['HISTORY_LEN_STEPS']
         print(f'{name:{width}}  {cohort:17}  {str(use_text):>5}  {str(nontext):>9}  '
-              f'{str(text):>6}  {str(instay):>7}  '
+              f'{str(text):>6}  {str(instay):>9}  '
               f"{'all' if steps is None else steps:>10}")
         if args.dry_run:
             continue

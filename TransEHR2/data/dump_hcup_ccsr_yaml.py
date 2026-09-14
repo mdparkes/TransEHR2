@@ -23,6 +23,8 @@ import os
 import pandas as pd
 import yaml
 
+
+
 if __name__ == "__main__":
 
     # Load mappings from ICD-10-CM codes to CCSR categories
@@ -38,17 +40,28 @@ if __name__ == "__main__":
     ccsr_code_cols = slice(5, len(dxccsr.columns), 2)  # Non-default category codes start at column 5
     dxccsr.iloc[:, ccsr_code_cols] = dxccsr.iloc[:, ccsr_code_cols].replace({
         'RSP014': 'RSP011',  # Pneumothorax -> Pleurisy; pneumothorax; pulmonary collapse
+        'CIR020': 'CIR021',  # Cerebral infarction -> Acute cerebrovascular disease
     })
     ccsr_codes = dxccsr.iloc[:, ccsr_code_cols].to_numpy().ravel()
 
     ccsr_desc_cols = slice(6, len(dxccsr.columns), 2)  # Non-default category descriptions start at column 6
-    # Replace CCSR respiratory condition descriptions in dataframe
-    # Note that there will be some information corruption here, but this is a "best effort" solution to align CCS and
-    # CCSR categories that are mostly the same. Here we replace CCSR labels with their closest CCS equivalents.
+    # Align CCSR category descriptions with their CCS 2015 counterparts so that a phenotype occupies a single column
+    # of the label matrix regardless of whether a stay was coded in ICD-9-CM or ICD-10-CM. Where CCSR subdivides a
+    # CCS category, every CCSR part is renamed to the CCS name and the parts are unioned (see the code replacements
+    # above, which keep a single CCSR id for the merged category). This coarsens ICD-10 to ICD-9 resolution, which is
+    # the only direction in which the two taxonomies can be reconciled.
+    #
+    # A CCSR category is renamed only when its CCS counterpart is in the benchmark. CCSR categories whose CCS
+    # counterpart is deliberately excluded from the benchmark keep their own names and remain unused, e.g.
+    # 'Cerebral infarction' is merged into 'Acute cerebrovascular disease' (CCS 109) but 'Transient cerebral
+    # ischemia' (CCS 112), 'Occlusion or stenosis of precerebral or cerebral arteries without infarction' (CCS 110)
+    # and the sequela categories (CCS 113) are not.
     dxccsr.iloc[:, ccsr_desc_cols] = dxccsr.iloc[:, ccsr_desc_cols].replace({
         'Acute hemorrhagic cerebrovascular disease': 'Acute cerebrovascular disease',
+        'Cerebral infarction': 'Acute cerebrovascular disease',
+        'Complication of other surgical or medical care, injury, initial encounter': 'Complications of surgical procedures or medical care',
         'Diabetes mellitus with complication': 'Diabetes mellitus with complications',
-        'External cause codes: complications of medical and surgical care, initial encounter': 'Complications of surgical procedures or medical care',
+        'Heart failure': 'Congestive heart failure; nonhypertensive',
         'Other specified and unspecified liver disease': 'Other liver diseases',
         'Other specified and unspecified lower respiratory disease': 'Other lower respiratory disease',
         'Other specified and unspecified upper respiratory disease': 'Other upper respiratory disease',
@@ -79,9 +92,9 @@ if __name__ == "__main__":
         descriptions = row[1][ccsr_desc_cols].dropna().tolist()
         for desc in descriptions:
             output_dict[desc]['codes'].add(icd_code)
-    # Convert the set of codes for each CCSR category to a list
+    # Convert the set of codes for each CCSR category to a sorted list so that the dumped YAML is reproducible
     for key in output_dict.keys():
-        output_dict[key]['codes'] = list(output_dict[key]['codes'])
+        output_dict[key]['codes'] = sorted(output_dict[key]['codes'])
 
     # Set the use_in_benchmark flag to True for select CCSR categories
     use_in_benchmark = [
@@ -93,6 +106,7 @@ if __name__ == "__main__":
         'Chronic obstructive pulmonary disease and bronchiectasis',
         'Complications of surgical procedures or medical care',
         'Conduction disorders',
+        'Congestive heart failure; nonhypertensive',
         'Coronary atherosclerosis and other heart disease',
         'Diabetes mellitus with complications',
         'Diabetes mellitus without complication',
@@ -100,7 +114,6 @@ if __name__ == "__main__":
         'Essential hypertension',
         'Fluid and electrolyte disorders',
         'Gastrointestinal hemorrhage',
-        'Heart failure',
         'Hypertension with complications and secondary hypertension',
         'Other liver diseases',
         'Other lower respiratory disease',

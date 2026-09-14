@@ -161,16 +161,16 @@ def main():
         print(f"Processing fold {i}...")
         fold_path = os.path.join(args.output_path, f"fold{i}")
         train_file_table = pd.read_csv(
-            os.path.join(args.listfile_dir, f'fold{i}_train.csv'), 
+            os.path.join(args.listfile_dir, f'fold{i}', f'fold{i}_train.csv'), 
             dtype={'patient_id': str, 'episode': int}
         )
         test_file_table = pd.read_csv(
-            os.path.join(args.listfile_dir, f'fold{i}_test.csv'),
+            os.path.join(args.listfile_dir, f'fold{i}', f'fold{i}_test.csv'),
             dtype={'patient_id': str, 'episode': int}
         )
-        if os.path.exists(os.path.join(args.listfile_dir, f'fold{i}_val.csv')):
+        if os.path.exists(os.path.join(args.listfile_dir, f'fold{i}', f'fold{i}_val.csv')):
             val_file_table = pd.read_csv(
-                os.path.join(args.listfile_dir, f'fold{i}_val.csv'),
+                os.path.join(args.listfile_dir, f'fold{i}', f'fold{i}_val.csv'),
                 dtype={'patient_id': str, 'episode': int}
             )
             process_partition(args.root_path, fold_path, "val", val_file_table, definitions)

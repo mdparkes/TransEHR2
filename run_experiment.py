@@ -86,6 +86,8 @@ RECORDED_HYPERPARAMETERS = (
     'POSITION_ENCODING',
     'PRETRAIN_LEARNING_RATE',
     'PRETRAIN_LR_HALF_LIFE',
+    'FINETUNE_LEARNING_RATE',
+    'FINETUNE_LR_HALF_LIFE',
     'PRETRAIN_SEED',
     'FINETUNE_SEED',
     'FINETUNE_ENCODER_INIT',
@@ -535,9 +537,10 @@ def main():
     # ranks rare labels above common ones, which is a modelling stance, not a correction.
     FINETUNE_POS_WEIGHT_TASKS = tuple(
         experiment_config.get('FINETUNE_POS_WEIGHT_TASKS', ['mortality']))
-    # Which records reach the model. All text is pre-admission -- the in-stay window closes at
-    # 48 h, before a discharge summary exists -- so USE_HISTORICAL_TEXT_RECORDS is what removes
-    # text records, while USE_TEXT decides whether the model has a text pathway at all.
+    # Which records reach the model. Text at or after admission is dropped by
+    # `collate_tensorized` whatever these say -- a text feature is a discharge-time artifact of
+    # the admission being predicted -- so USE_HISTORICAL_TEXT_RECORDS is what removes text
+    # records, while USE_TEXT decides whether the model has a text pathway at all.
     #
     # USE_HISTORICAL_RECORDS is the single switch these two replace. It is still read, because
     # every config the finished tuning phases generated carries it, but it cannot be combined

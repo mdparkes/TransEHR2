@@ -388,9 +388,10 @@ def _collated():
 
     # A full history window, a partial one, and none at all -- the last two carry leading padding.
     batch = [_episode(HIST_LEN), _episode(2), _episode(0)]
-    # Passed positionally: the history-length argument is named max_history_len_steps on main and
-    # history_len_steps on the sequence-length branches, and this probe has to run on both.
-    return collate_tensorized(batch, True, HIST_LEN)
+    # By keyword. The signature has gained the three record switches ahead of this argument,
+    # so a positional call lands HIST_LEN on a switch and leaves history_len_steps at 0, which
+    # silently disables the slice these probes exist to check.
+    return collate_tensorized(batch, history_len_steps=HIST_LEN)
 
 
 def test_event_stream_drops_the_history_region():

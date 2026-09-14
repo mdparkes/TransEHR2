@@ -322,7 +322,7 @@ def test_the_predictions_are_written_where_the_reporter_reads_them(tmp_path):
     """The reporter locates a column by experiment number and reads `pred`/`target` columns, so
     the path and the header are the contract this arm has to meet."""
     model_dir = str(tmp_path / 'models')
-    experiment = 'experiment19_charlson_logreg_charlsonsubset_rev'
+    experiment = 'experiment29_charlson_logreg_charlsonsubset_rev'
     probabilities = np.array([0.1, 0.9, 0.4])
     targets = np.array([0.0, 1.0, 1.0])
 

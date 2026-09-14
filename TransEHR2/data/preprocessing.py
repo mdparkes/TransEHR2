@@ -737,7 +737,8 @@ def _process_single_episode(
     max_episode_len_steps: int,
     max_episode_len_hours: Optional[int],
     min_episode_len_steps: Optional[int],
-    min_episode_len_hours: Optional[int]
+    min_episode_len_hours: Optional[int],
+    preadmission_cutoff_hours: float = 0.0
 ) -> Optional[EpisodeData]:
     """
     Process a single episode into EpisodeData for tensor insertion.
@@ -755,8 +756,12 @@ def _process_single_episode(
             the extracted episode must contain after resampling and
             truncation. Counts value-associated timesteps (merged
             with text timesteps when text features are in use); the
-            event stream is not subject to a minimum.
+            event stream is not subject to a minimum. Measured from
+            admission, not from the era boundary, so pre-admission
+            records inside the episode region cannot satisfy it.
         min_episode_len_hours: Minimum required hours
+        preadmission_cutoff_hours: Hours before admission at which the
+            pre-admission era ends. See `filter_timeseries_records`.
         
     Returns:
         EpisodeData if episode passes filters, None otherwise
@@ -776,6 +781,12 @@ def _process_single_episode(
                 return None
         
         # Pre-filter on minimum timesteps.
+        #
+        # Anchored at admission rather than at the era boundary, which
+        # is what the authoritative check below is anchored at too: an
+        # episode has to carry ICU data to qualify, and a run of
+        # pre-admission records sitting inside the episode region is
+        # not that.
         #
         # This is a cheap early-out on the RAW records, not the
         # authoritative check: the hourly resample below collapses
@@ -817,7 +828,7 @@ def _process_single_episode(
          _max_history_len) = filter_timeseries_records(
             val_data, event_data, text_data,
             max_history_len_steps, max_episode_len_steps,
-            max_episode_len_hours
+            max_episode_len_hours, preadmission_cutoff_hours
         )
         
         # Merge text with value data
@@ -830,16 +841,16 @@ def _process_single_episode(
         
         # Authoritative check on minimum timesteps.
         #
-        # val_data now holds exactly the timesteps that will be
-        # written to disk, history first and then the current stay.
-        # val_history_len is the number of pre-admission timesteps
-        # retained by filter_timeseries_records(); in the text branch
-        # that function filters the merged text+numeric frame and
-        # returns the merged frame's history length, and the merge
-        # above reconstructs that same frame, so the subtraction is
-        # correct in both branches.
+        # val_data now holds exactly the timesteps that will be written
+        # to disk, history first and then the episode region. The count
+        # is taken from admission by timestamp rather than as
+        # len(val_data) - val_history_len, because with a non-zero
+        # cutoff the episode region opens before admission and that
+        # subtraction would let pre-admission records satisfy a minimum
+        # that exists to require ICU data. At a cutoff of 0 the two
+        # agree.
         if min_episode_len_steps is not None:
-            n_current_steps = len(val_data) - val_history_len
+            n_current_steps = int((val_data.index >= pd.Timedelta(0)).sum())
             if n_current_steps < min_episode_len_steps:
                 return None
         
@@ -923,6 +934,46 @@ def compute_static_feat_dims(var_properties, static_feats, max_token_length):
         else:
             dims.append(var_properties[feat]['size'])
     return dims
+
+
+# The value stream's feature types, in the order `_get_tensor_dimensions` allocates their
+# indicator tensors. A type outside this tuple occupies no tensor.
+VALUE_TYPES = ('numeric', 'categorical', 'ordinal', 'multilabel')
+
+
+def partition_valued_feats(valued_feats: List[str], var_properties: dict) -> dict:
+    """Group value-associated features by type, in indicator column order.
+
+    Extraction writes one indicator tensor per type and preserves the config order within each
+    type, so a column's meaning is recoverable only by repeating that grouping. `VALUED_FEATS`
+    is not itself grouped by type, so slicing it at the per-type counts attaches the wrong name
+    to every column past the first type boundary.
+
+    Args:
+        valued_feats: Feature names in config order.
+        var_properties: The parsed variable properties, keyed by feature name.
+
+    Returns:
+        Dict mapping each of `VALUE_TYPES` to its feature names, in column order.
+
+    Raises:
+        ValueError: If a feature is undeclared, or carries a type that occupies no indicator
+            tensor -- either of which would otherwise misname a column silently.
+    """
+    grouped = {value_type: [] for value_type in VALUE_TYPES}
+    for name in valued_feats:
+        if name not in var_properties:
+            raise ValueError(
+                f'{name} is named as a valued feature but not in the variable properties, so '
+                f'the indicator column it occupies cannot be identified.'
+            )
+        value_type = var_properties[name]['type']
+        if value_type not in grouped:
+            raise ValueError(
+                f'{name} has type {value_type!r}, which occupies no value indicator tensor.'
+            )
+        grouped[value_type].append(name)
+    return grouped
 
 
 def _get_tensor_dimensions(
@@ -1131,9 +1182,21 @@ def filter_timeseries_records(
         text_data: Optional[pd.DataFrame] = None,
         max_history_len: int = 0,
         max_episode_len: int = 100,
-        max_episode_len_hours: Optional[int] = None
+        max_episode_len_hours: Optional[int] = None,
+        preadmission_cutoff_hours: float = 0.0
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, int, int, int]:
     """Filter timeseries records by history and episode length constraints.
+
+    Args:
+        numeric_data: Value-associated records, indexed by time relative to ICU admission.
+        event_data: Event-associated records, same index convention.
+        text_data: Text records, or None.
+        max_history_len: Most pre-admission timesteps to retain, keeping the most recent.
+        max_episode_len: Most episode timesteps to retain, keeping the earliest.
+        max_episode_len_hours: Upper edge of the episode window, in hours after admission.
+        preadmission_cutoff_hours: Hours before admission at which the pre-admission era ends.
+            Records from `-preadmission_cutoff_hours` onward belong to the episode region;
+            earlier ones are history. 0 puts the boundary at admission.
 
     Returns:
         Tuple of (numeric_data, event_data, text_data,
@@ -1144,6 +1207,10 @@ def filter_timeseries_records(
         the configured maximum history length (for computing left-pad
         offsets during array insertion).
     """
+
+    # The era boundary, as an offset from admission. Negative for a non-zero cutoff, so the
+    # episode region opens before admission and the history region closes before it.
+    boundary = -pd.Timedelta(hours=float(preadmission_cutoff_hours))
 
     def filter(df):
 
@@ -1157,21 +1224,21 @@ def filter_timeseries_records(
             )
             df = df.loc[selected_records, :]
 
-        # Get indices of up to x records from the current ICU stay
-        # episode, starting from the earliest record
-        episode_record_indices = np.where(
-            df.index >= np.timedelta64(0, 'h')
-        )[0]
+        # Get indices of up to x records from the episode region,
+        # starting from the earliest record. With a non-zero cutoff the
+        # earliest of those sit before admission, so max_episode_len has
+        # to cover the whole region -- if it is smaller than the region
+        # holds, what gets dropped is the ICU stay and not the
+        # pre-admission run.
+        episode_record_indices = np.where(df.index >= boundary)[0]
         episode_len = min(
             len(episode_record_indices), max_episode_len
         )
         episode_record_indices = episode_record_indices[:episode_len]
 
         # Get indices of up to x most recent records that were
-        # collected before the current ICU stay episode
-        historic_record_indices = np.where(
-            df.index < np.timedelta64(0, 'h')
-        )[0]
+        # collected before the episode region opens
+        historic_record_indices = np.where(df.index < boundary)[0]
         history_len = min(
             len(historic_record_indices), max_history_len
         )
@@ -1248,9 +1315,9 @@ def collate_tensorized(
             ordinal and multilabel records in the history region
             [0, history_len_steps). Defaults to True.
         use_historical_text_records: If False, drop the text records in the
-            history region. All text is pre-admission, because the in-stay
-            window closes before a discharge summary can be written, so this
-            is the switch that removes text entirely. Defaults to True.
+            history region. Text at or after admission is dropped
+            unconditionally, so this is the switch that removes text entirely.
+            Defaults to True.
         use_instay_records: If False, drop every record from
             [history_len_steps, ...), leaving a history-only model. The event
             stream is in-stay by construction and is emptied with it.
@@ -1326,8 +1393,21 @@ def collate_tensorized(
             val_text_ind[:, history] = 0.0
         val_masks[:, history] *= _observed(nontext_ind + [val_text_ind], history).float()
 
+    # No text record at or after admission reaches the model, whatever the switches say.
+    # Every text feature is a discharge-time artifact of an admission -- a discharge summary
+    # and the diagnosis list that goes with it -- so a text record at a non-negative timestamp
+    # belongs to the stay being predicted and states its outcome. Extraction keeps whatever
+    # falls inside the episode window, and a stay shorter than that window has its own
+    # discharge documentation inside it, so the exclusion is enforced rather than assumed.
+    #
+    # Guarded on presence so that a batch carrying no in-stay text is left exactly as it was,
+    # rather than having its in-stay mask rebuilt for nothing.
+    in_stay = slice(history_len_steps, val_masks.shape[1])
+    if val_text_ind.shape[-1] > 0 and bool(val_text_ind[:, in_stay].any()):
+        val_text_ind[:, in_stay] = 0.0
+        val_masks[:, in_stay] *= _observed(nontext_ind + [val_text_ind], in_stay).float()
+
     if not use_instay_records:
-        in_stay = slice(history_len_steps, val_masks.shape[1])
         for tensor in nontext_ind + [val_text_ind]:
             tensor[:, in_stay] = 0.0
         val_masks[:, in_stay] = 0.0
@@ -1373,16 +1453,16 @@ def collate_tensorized(
             ]) if batch else torch.zeros(0, dtype=torch.int64)
             timesteps = torch.cat([b['val_text_embeddings'][f][0] for b in batch])
             values = torch.cat([b['val_text_embeddings'][f][1] for b in batch])
-            # The indicators above were cleared for the disabled regions; the embeddings are a
-            # separate sparse block and have to be filtered to match, or a dropped record would
-            # still reach the encoder through its embedding.
-            if not use_historical_text_records or not use_instay_records:
-                keep = torch.ones_like(timesteps, dtype=torch.bool)
-                if not use_historical_text_records:
-                    keep &= timesteps >= history_len_steps
-                if not use_instay_records:
-                    keep &= timesteps < history_len_steps
-                episodes, timesteps, values = episodes[keep], timesteps[keep], values[keep]
+            # The indicators above were cleared for the disabled regions; the embeddings are
+            # a separate sparse block and have to be filtered to match, or a dropped record
+            # would still reach the encoder through its embedding.
+            #
+            # Text survives only in the history region, and only while history text is
+            # enabled: the in-stay guard above removes the rest, so there is no combination of
+            # switches under which a record at or after admission is kept.
+            keep = ((timesteps < history_len_steps) if use_historical_text_records
+                    else torch.zeros_like(timesteps, dtype=torch.bool))
+            episodes, timesteps, values = episodes[keep], timesteps[keep], values[keep]
             val_text_sparse.append({
                 'episode_index': episodes,
                 'timestep_index': timesteps,
@@ -1684,6 +1764,39 @@ def load_dataset(
     )
 
 
+def feature_scale(norms: np.ndarray) -> float:
+    """A non-degenerate scale for one numeric feature's observed magnitudes.
+
+    The 5th-95th percentile range is the estimator of record: robust, and wide enough that a
+    typical value standardizes to order one. It collapses to zero for a feature whose
+    distribution is concentrated enough that both percentiles land on the same value, which is
+    ordinary for a laboratory result reported at a detection limit, or for an assessment coded
+    0 and abnormal in a few percent of cases. Dividing by that zero is what the caller's guard
+    prevents, but zeroing the feature in its place discards every value it holds and leaves the
+    occurrence indicator behind -- which is exactly the state a feature is moved onto the value
+    stream to escape.
+
+    So the range widens until it is non-degenerate, and only a feature that is genuinely
+    constant is given no scale at all. Widening in this order matters: the outermost
+    percentiles are tried before the full span, because for a heavy-tailed feature the span is
+    set by the largest outlier and would compress every typical value to near zero.
+
+    Args:
+        norms: (n_observed,) magnitudes of one feature's observed values.
+
+    Returns:
+        A positive scale, or 0.0 when the feature takes one value throughout.
+    """
+    if norms.size == 0:
+        return 0.0
+    for low, high in ((5, 95), (1, 99)):
+        lower, upper = np.percentile(norms, [low, high])
+        if upper > lower:
+            return float(upper - lower)
+    span = float(norms.max() - norms.min())
+    return span if span > 0.0 else 0.0
+
+
 def standardize_feats(
     arrays: Dict[str, Union[np.ndarray, List[np.ndarray]]],
     dims: TensorDimensions,
@@ -1720,33 +1833,40 @@ def standardize_feats(
         means = data['means']
         p5 = data['p5']
         p95 = data['p95']
+        # `scale` is what the values are actually divided by. Statistics written before it was
+        # recorded fall back to the range it replaced, so an existing npz keeps its meaning.
+        scale = data['scale'] if 'scale' in data.files else (p95 - p5)
     else:
         means = np.zeros(n_feats, dtype=np.float32)
         p5 = np.zeros(n_feats, dtype=np.float32)
         p95 = np.zeros(n_feats, dtype=np.float32)
-        
+        scale = np.zeros(n_feats, dtype=np.float32)
+
         indicators = arrays['val_numeric_indicators']
-        
+
         for f in range(n_feats):
             values = arrays['val_numeric_values'][f]
             mask = indicators[:, :, f] == 1.0
-            
+
             if mask.any():
                 observed = values[mask]
                 means[f] = observed.mean()
                 norms = np.linalg.norm(observed, ord=2, axis=-1)
                 p5[f] = np.percentile(norms, 5)
                 p95[f] = np.percentile(norms, 95)
-        
+                scale[f] = feature_scale(norms)
+
         if save_path is not None:
-            np.savez(save_path, means=means, p5=p5, p95=p95)
-    
+            np.savez(save_path, means=means, p5=p5, p95=p95, scale=scale)
+
     for f in range(n_feats):
-        if p5[f] == p95[f]:
+        # A zero scale means the feature is constant wherever it is observed, so it carries no
+        # information beyond its own occurrence and the indicator already says that.
+        if scale[f] == 0:
             arrays['val_numeric_values'][f][:] = 0
         else:
             arrays['val_numeric_values'][f] -= means[f]
-            arrays['val_numeric_values'][f] /= (p95[f] - p5[f])
+            arrays['val_numeric_values'][f] /= scale[f]
 
 
 def get_text_counts_from_dataset_vectorized(dataset) -> np.ndarray:
@@ -1791,6 +1911,7 @@ def extract_mimic(
     min_episode_len_steps: Optional[int] = 10,
     min_episode_len_hours: Optional[int] = 48,
     max_episode_len_hours: Optional[int] = 48,
+    preadmission_cutoff_hours: float = 0.0,
     n_workers: Optional[int] = None
 ) -> None:
     """
@@ -1946,7 +2067,8 @@ def extract_mimic(
         max_episode_len_steps=max_episode_len_steps,
         max_episode_len_hours=max_episode_len_hours,
         min_episode_len_steps=min_episode_len_steps,
-        min_episode_len_hours=min_episode_len_hours
+        min_episode_len_hours=min_episode_len_hours,
+        preadmission_cutoff_hours=preadmission_cutoff_hours
     )
     
     # Collect results in a first pass to count surviving episodes
@@ -2306,13 +2428,15 @@ def prepare_dataloaders(
         use_historical_nontext_records (bool, optional): If False, drop the non-text records in
             the history region. Defaults to True.
         use_historical_text_records (bool, optional): If False, drop the text records in the
-            history region. Defaults to True.
+            history region. Text at or after admission is dropped unconditionally -- see
+            `collate_tensorized` -- so this is the switch that removes text entirely.
+            Defaults to True.
         use_instay_records (bool, optional): If False, drop every in-stay record, emptying the
             event stream with them. Defaults to True.
             Dropping history in place leaves the sequence length unchanged; when both history
             switches are off, `history_len_steps=0` removes those timesteps entirely instead,
-            which is cheaper. Text is pre-admission in its entirety, so a run that keeps text
-            must keep the region.
+            which is cheaper. Only pre-admission text reaches the model, so a run that keeps
+            text must keep the region.
         history_len_steps (int, optional): Runtime cap on historical timesteps per episode.
             Sequences are cropped at load time, which is equivalent to re-extracting with a
             smaller MAX_HISTORY_LEN_STEPS (see `MixedDataset`). Must not exceed the extracted

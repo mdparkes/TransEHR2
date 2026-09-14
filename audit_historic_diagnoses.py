@@ -32,12 +32,6 @@ Method
 5. Intersect each episode's positive labels with the phenotype groups recovered
    from its historical diagnosis text.
 
-Note that the audit is strict about category names by default: ICD-9 codes
-reach their phenotype through HCUP CCS 2015 and ICD-10 codes through HCUP CCSR
-2024, and the two vocabularies name one benchmark category differently
-("Congestive heart failure; nonhypertensive" vs. "Heart failure"). Pass
---merge_synonymous_phenotypes to count those as the same phenotype.
-
 Outputs (written to --output_dir)
 ---------------------------------
 * `historic_diagnosis_audit_summary.csv`   -- overall label- and episode-level counts
@@ -82,15 +76,6 @@ from TransEHR2.data.preprocessing import load_episode_ids
 
 TEXT_FEATURE = 'Diagnosis Descriptions'
 TASK_PREFIX = 'phenotyping'
-
-# ICD-9 codes reach their phenotype through HCUP CCS 2015 and ICD-10 codes
-# through HCUP CCSR 2024. The two vocabularies name one benchmark category
-# differently, so a heart failure diagnosis coded in ICD-9 will not match a
-# heart failure label derived from an ICD-10 code unless the two names are
-# treated as equivalent. Enable that with --merge_synonymous_phenotypes.
-PHENOTYPE_SYNONYMS = [
-    {'Congestive heart failure; nonhypertensive', 'Heart failure'},
-]
 
 
 # ---------------------------------------------------------------------------
@@ -326,7 +311,7 @@ def build_title_to_groups(diagnoses_df, code_to_groups):
     return title_to_groups
 
 
-def historical_titles(episode_csv_path, n_retained):
+def historical_titles(episode_csv_path, n_retained, preadmission_cutoff_hours=0.0):
     """The ICD long titles of the pre-admission diagnosis records the model saw.
 
     `n_retained` comes from the extracted arrays and says how many
@@ -337,9 +322,19 @@ def historical_titles(episode_csv_path, n_retained):
     therefore exactly the `n_retained` most recent pre-admission diagnosis
     records in the source CSV.
 
+    That argument only holds when both sides agree on where pre-admission
+    starts. `n_retained` counts the history region of the arrays, which begins
+    `preadmission_cutoff_hours` before admission, so the CSV has to be cut at
+    the same boundary. Cutting it at admission instead selects the suffix from a
+    longer run and returns the peri-stay records -- the ones the model does not
+    read -- while the count still agrees.
+
     Args:
         episode_csv_path: Path to episodeX.csv; the timeseries beside it is read.
         n_retained: Number of pre-admission diagnosis records extraction kept.
+        preadmission_cutoff_hours: Hours before admission at which the
+            pre-admission era ends. Must match the extraction's
+            PREADMISSION_CUTOFF_HOURS.
 
     Returns:
         Tuple of (titles, n_records, n_records_in_source, status). `titles` and
@@ -359,7 +354,7 @@ def historical_titles(episode_csv_path, n_retained):
         # usecols raises ValueError when a requested column is absent
         return [], 0, 0, 'missing_column'
 
-    history = df.loc[df['Hours'] < 0].sort_values('Hours')
+    history = df.loc[df['Hours'] < -float(preadmission_cutoff_hours)].sort_values('Hours')
     text = history[TEXT_FEATURE].dropna().astype(str).str.strip()
     text = text[text != '']
     n_in_source = int(len(text))
@@ -377,11 +372,13 @@ def historical_titles(episode_csv_path, n_retained):
 # The ICD code -> phenotype group lookup holds ~90k entries. It is shared with
 # the workers once at pool start-up rather than pickled with every task.
 _CODE_TO_GROUPS = {}
+_PREADMISSION_CUTOFF_HOURS = 0.0
 
 
-def _init_worker(code_to_groups):
-    global _CODE_TO_GROUPS
+def _init_worker(code_to_groups, preadmission_cutoff_hours=0.0):
+    global _CODE_TO_GROUPS, _PREADMISSION_CUTOFF_HOURS
     _CODE_TO_GROUPS = code_to_groups
+    _PREADMISSION_CUTOFF_HOURS = preadmission_cutoff_hours
 
 
 def audit_patient(task):
@@ -418,7 +415,7 @@ def audit_patient(task):
     results = []
     for key, episode_number, n_retained in episode_records:
         (titles, n_text_records, n_records_in_source,
-         status) = historical_titles(key, n_retained)
+         status) = historical_titles(key, n_retained, _PREADMISSION_CUTOFF_HOURS)
         unique_titles = set(titles)
         groups = set()
         n_unmapped_titles = 0
@@ -444,7 +441,8 @@ def audit_patient(task):
     return results
 
 
-def run_audit(episodes, code_to_groups, n_workers, retained):
+def run_audit(episodes, code_to_groups, n_workers, retained,
+              preadmission_cutoff_hours=0.0):
     """Audit all episodes, grouping the work by patient.
 
     Args:
@@ -453,6 +451,9 @@ def run_audit(episodes, code_to_groups, n_workers, retained):
         n_workers: Parallel worker processes.
         retained: Mapping from patient-episode ID to the number of
             pre-admission diagnosis records extraction kept.
+        preadmission_cutoff_hours: Hours before admission at which the
+            pre-admission era ends. Passed to both the serial and the parallel
+            path, which have to agree.
     """
     by_patient = defaultdict(list)
     for key, (pt_id, ep_num) in episodes.items():
@@ -467,7 +468,7 @@ def run_audit(episodes, code_to_groups, n_workers, retained):
 
     results = []
     if n_workers <= 1:
-        _init_worker(code_to_groups)
+        _init_worker(code_to_groups, preadmission_cutoff_hours)
         for i, task in enumerate(tasks, 1):
             results.extend(audit_patient(task))
             if i % 500 == 0:
@@ -475,7 +476,7 @@ def run_audit(episodes, code_to_groups, n_workers, retained):
     else:
         with ProcessPoolExecutor(
             max_workers=n_workers, initializer=_init_worker,
-            initargs=(code_to_groups,)
+            initargs=(code_to_groups, preadmission_cutoff_hours)
         ) as executor:
             futures = [executor.submit(audit_patient, task) for task in tasks]
             for i, future in enumerate(as_completed(futures), 1):
@@ -488,21 +489,11 @@ def run_audit(episodes, code_to_groups, n_workers, retained):
 # ---------------------------------------------------------------------------
 # Tabulation
 # ---------------------------------------------------------------------------
-
-def expand_synonyms(groups):
-    """Add the equivalent names of any phenotype in `groups` (see PHENOTYPE_SYNONYMS)."""
-    expanded = set(groups)
-    for synonyms in PHENOTYPE_SYNONYMS:
-        if expanded & synonyms:
-            expanded |= synonyms
-    return expanded
-
-
 def pct(numerator, denominator):
     return float('nan') if denominator == 0 else 100.0 * numerator / denominator
 
 
-def tabulate(results, labels, phenotype_names, merge_synonyms=False):
+def tabulate(results, labels, phenotype_names):
     """Cross the historical diagnosis groups with the phenotype labels.
 
     Returns:
@@ -526,8 +517,6 @@ def tabulate(results, labels, phenotype_names, merge_synonyms=False):
             continue
 
         history = row['historical_groups']
-        if merge_synonyms:
-            history = expand_synonyms(history)
         has_history = row['n_historical_dx_records'] > 0
         matched = positives & history
 
@@ -640,12 +629,10 @@ def tabulate(results, labels, phenotype_names, merge_synonyms=False):
     return per_episode_df, by_phenotype_df, summary_df
 
 
-def print_report(summary_df, by_phenotype_df, merge_synonyms=False):
+def print_report(summary_df, by_phenotype_df):
     print(f"\n{'='*78}")
     print("Historical diagnosis text vs. last-stay phenotype labels")
     print(f"{'='*78}\n")
-    if merge_synonyms:
-        print("  (ICD-9/ICD-10 synonymous phenotype names merged for matching)\n")
     for metric, value in summary_df.itertuples(index=False):
         if isinstance(value, bool) or isinstance(value, str):
             print(f"  {metric:<56s} {value:>12s}")
@@ -696,6 +683,13 @@ def main():
         help="Directory for the output CSV files (default: current directory)"
     )
     parser.add_argument(
+        '--preadmission-cutoff-hours', type=float, default=None,
+        help="Hours before admission at which the pre-admission era ends. Defaults to the "
+             "dataset config's PREADMISSION_CUTOFF_HOURS, which is what the extraction used; "
+             'override only to audit a boundary other than the one the arrays were built at. '
+             'The retained-record counts come from the arrays, so a boundary that disagrees '
+             'with them selects the wrong source records while the counts still agree.')
+    parser.add_argument(
         '--cohort', type=str, default=None, choices=list(COHORTS),
         help="Restrict the audit to the episodes a named cohort keeps, so that it "
              "describes the population an experiment configured the same way ran on. "
@@ -706,12 +700,6 @@ def main():
         help="Restrict the audit to an explicit episode manifest (one patient-episode ID "
              "per line), as compute_charlson_index.py --write_cohort writes. Combines with "
              "--cohort: an episode must then satisfy both."
-    )
-    parser.add_argument(
-        '--merge_synonymous_phenotypes', action='store_true',
-        help="Treat benchmark categories that HCUP CCS 2015 and CCSR 2024 name "
-             "differently as equivalent when matching (see PHENOTYPE_SYNONYMS). "
-             "Off by default, which reports the strict name-for-name overlap."
     )
     parser.add_argument(
         '--write_per_episode', action='store_true',
@@ -734,6 +722,10 @@ def main():
     with open(args.dataset_config, 'r') as f:
         config = yaml.safe_load(f)
     data_dir = config['DATA_DIR']
+    cutoff_hours = (args.preadmission_cutoff_hours
+                    if args.preadmission_cutoff_hours is not None
+                    else float(config.get('PREADMISSION_CUTOFF_HOURS', 0)))
+    print(f'Pre-admission era ends {cutoff_hours:g} h before ICU admission')
 
     fold_names = discover_folds(data_dir, args.folds)
     if not fold_names:
@@ -788,10 +780,11 @@ def main():
         sys.exit(1)
 
     print(f"\nAuditing historical diagnosis text with {args.n_workers} worker(s)...")
-    results = run_audit(episodes, code_to_groups, args.n_workers, retained)
+    results = run_audit(episodes, code_to_groups, args.n_workers, retained,
+                        cutoff_hours)
 
     per_episode_df, by_phenotype_df, summary_df = tabulate(
-        results, labels, phenotype_names, args.merge_synonymous_phenotypes
+        results, labels, phenotype_names
     )
 
     restriction = args.cohort or ''
@@ -818,7 +811,7 @@ def main():
         per_episode_df.to_csv(episode_path, index=False)
         written.append(episode_path)
 
-    print_report(summary_df, by_phenotype_df, args.merge_synonymous_phenotypes)
+    print_report(summary_df, by_phenotype_df)
     print("Wrote:")
     for path in written:
         print(f"  {path}")

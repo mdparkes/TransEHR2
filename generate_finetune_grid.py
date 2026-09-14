@@ -180,8 +180,10 @@ def main():
     print(f'Base config:  {args.base}')
     print(f'Encoder:      {args.encoder + "  (linked)" if args.encoder else "one per cell"}')
     if seeds is not None:
+        # A half-life of None is 'flat', i.e. no decay, which has no numeric form to print.
+        decay = 'no decay' if half_lives[0] is None else f'half-life {half_lives[0]:g}'
         print(f'Cells:        {len(cell_paths)}  (one per seed at lr {rates[0]:g}, '
-              f'half-life {half_lives[0]:g})\n')
+              f'{decay})\n')
     else:
         print(f'Cells:        {len(cell_paths)}  ({len(rates)} rates x '
               f'{len(half_lives)} half-lives'
