@@ -76,20 +76,21 @@ TransEHR2/
 ├── reporting/                     Evaluation, statistics and table building
 │   └── jmir/                      Publisher house style: number formatting, table layout
 ├── tests/                         Test suite (pytest)
-├── extract_data.py                MIMIC-IV episodes -> tensorized arrays
-├── embed_text.py                  Pre-embed text features with the frozen encoder
-├── run_experiment.py              Pretrain, finetune, evaluate (single GPU)
-├── generate_tuning_configs.py     Expand a tuning spec into one config per trial
-├── tuning_trial.py                Look one trial up in a manifest, for job arrays
-├── report_tuning_results.py       Rank a sweep's trials
-├── select_tuned_hyperparameters.py  Assemble the winning config (additive sweep)
-├── select_tuned_cell.py           Write the winning cell's config (factorial sweep)
-├── generate_finetune_grid.py      Finetuning grid or seed repeats over one shared encoder
-├── report_experiment_results.py   Tabulate finished runs by name pattern
-├── dump_finetuned_predictions.py  Per-fold prediction CSVs
-├── compute_charlson_index.py      Charlson index per episode, and the cohort manifest
-├── run_charlson_logistic_regression.py  Charlson mortality baseline, per fold
-├── report_results_tables.py       Result tables, one document per cohort
+├── scripts/                       Entry points; run them from the repository root
+│   ├── extract_data.py            MIMIC-IV episodes -> tensorized arrays
+│   ├── embed_text.py              Pre-embed text features with the frozen encoder
+│   ├── run_experiment.py          Pretrain, finetune, evaluate (single GPU)
+│   ├── generate_tuning_configs.py  Expand a tuning spec into one config per trial
+│   ├── tuning_trial.py            Look one trial up in a manifest, for job arrays
+│   ├── report_tuning_results.py   Rank a sweep's trials
+│   ├── select_tuned_hyperparameters.py  Assemble the winning config (additive sweep)
+│   ├── select_tuned_cell.py       Write the winning cell's config (factorial sweep)
+│   ├── generate_finetune_grid.py  Finetuning grid or seed repeats over one shared encoder
+│   ├── report_experiment_results.py  Tabulate finished runs by name pattern
+│   ├── dump_finetuned_predictions.py  Per-fold prediction CSVs
+│   ├── compute_charlson_index.py  Charlson index per episode, and the cohort manifest
+│   ├── run_charlson_logistic_regression.py  Charlson mortality baseline, per fold
+│   └── report_results_tables.py   Result tables, one document per cohort
 └── experiment_descriptions.md     What each experiment number means
 ```
 
@@ -100,19 +101,19 @@ An experiment consists of pretraining, finetuning and evaluating on a test set. 
 **1. Extract the prepared data.** Reads the episode files `mimic4dataprep` produced and writes tensorized arrays.
 
 ```shell
-python extract_data.py TransEHR2/configs/datasets/mimic4.yaml
+python scripts/extract_data.py TransEHR2/configs/datasets/mimic4.yaml
 ```
 
 **2. Embed text**, if the experiment uses text features. Scans the extracted dataset directories and writes one embedding per note.
 
 ```shell
-python embed_text.py --data-dir ${DATA_DIR}
+python scripts/embed_text.py --data-dir ${DATA_DIR}
 ```
 
 **3. Train and evaluate.**
 
 ```shell
-python run_experiment.py TransEHR2/configs/datasets/mimic4.yaml TransEHR2/configs/experiments/<experiment>.yaml
+python scripts/run_experiment.py TransEHR2/configs/datasets/mimic4.yaml TransEHR2/configs/experiments/<experiment>.yaml
 ```
 
 `--folds` restricts the run to particular folds and `--tasks` to particular tasks, which is how the work is spread across jobs. `fold0` is reserved for hyperparameter tuning and is excluded from reported results.
@@ -152,16 +153,16 @@ A sweep is described by a spec under `TransEHR2/configs/experiments/tuning/`. Th
 
 ```shell
 # Expand the spec into one config per trial, plus a manifest
-python generate_tuning_configs.py TransEHR2/configs/experiments/tuning/<spec>.yaml
+python scripts/generate_tuning_configs.py TransEHR2/configs/experiments/tuning/<spec>.yaml
 
 # Run trial $SLURM_ARRAY_TASK_ID; prints the config path for run_experiment.py
-python tuning_trial.py ${MANIFEST} ${SLURM_ARRAY_TASK_ID}
+python scripts/tuning_trial.py ${MANIFEST} ${SLURM_ARRAY_TASK_ID}
 
 # Rank the results. Safe to run before every trial has finished.
-python report_tuning_results.py ${MANIFEST} --progress
+python scripts/report_tuning_results.py ${MANIFEST} --progress
 
 # Write the winning config
-python select_tuned_hyperparameters.py ${MANIFEST} --arm ${ARM} --output ${CONFIG}
+python scripts/select_tuned_hyperparameters.py ${MANIFEST} --arm ${ARM} --output ${CONFIG}
 ```
 
 Trials are ranked on the criterion each hyperparameter's grid entry names in the spec: `select_on: pretrain` ranks on pretraining loss, `select_on: mortality` on mortality validation performance.
@@ -187,7 +188,7 @@ a sex in the extracted arrays. The printed funnel shows what each condition remo
 run fails if any fold is short of a cohort episode.
 
 ```shell
-python compute_charlson_index.py ${DATASET_CONFIG} -w 8 --write_cohort
+python scripts/compute_charlson_index.py ${DATASET_CONFIG} -w 8 --write_cohort
 ```
 
 Writes `misc/charlson/charlson_index.csv` and `misc/charlson/charlson_cohort.txt`.
@@ -196,14 +197,14 @@ Writes `misc/charlson/charlson_index.csv` and `misc/charlson/charlson_cohort.txt
 write the manifest first; `run_experiment.py` refuses to start if the file is missing.
 
 ```shell
-python generate_revision_experiments.py
+python scripts/generate_revision_experiments.py
 ```
 
 **3. Fit the regression.** One fit per fold on that fold's training split, predicting its
 validation and test splits, in the layout `dump_finetuned_predictions.py` uses.
 
 ```shell
-python run_charlson_logistic_regression.py ${DATASET_CONFIG}
+python scripts/run_charlson_logistic_regression.py ${DATASET_CONFIG}
 ```
 
 **4. Train the control.** Experiment 28 is the peri-stay-only model on the same episodes, and
@@ -223,7 +224,7 @@ sbatch --array=0-0 SLURM/slurm_dump_predictions.sh \
 **5. Build the table.**
 
 ```shell
-python report_results_tables.py --cohorts charlson
+python scripts/report_results_tables.py --cohorts charlson
 ```
 
 The fit is unpenalized by default, so it is plain maximum likelihood with no regularization
@@ -242,7 +243,7 @@ stay of a patient rather than an age recomputed at each admission.
 The reporting scripts read per-fold prediction CSVs, not the aggregated `*_evaluation.yaml` files, because calibrating a decision threshold needs the raw predicted probabilities. Run the dump for every experiment that will appear in a table:
 
 ```shell
-python dump_finetuned_predictions.py ${DATASET_CONFIG} ${EXPERIMENT_CONFIG} ${EXPERIMENT_NAME}
+python scripts/dump_finetuned_predictions.py ${DATASET_CONFIG} ${EXPERIMENT_CONFIG} ${EXPERIMENT_NAME}
 ```
 
 This produces one CSV per fold, task and split:
@@ -272,7 +273,7 @@ Experiment numbers are given in the order their columns should appear, left to r
 `report_results_tables.py` declares the cohorts, their column order, and the control each is tested against, and writes one document per cohort with a numbered table per task:
 
 ```shell
-python report_results_tables.py
+python scripts/report_results_tables.py
 ```
 
 A task whose predictions have not been dumped is named and skipped rather than aborting the tables that are ready. Restrict the run with `--tasks` and `--cohorts`, and check a single table on screen by naming one of each.
@@ -280,13 +281,13 @@ A task whose predictions have not been dumped is named and skipped rather than a
 Any other set of experiments can be reported by giving them explicitly, in the order their columns should appear:
 
 ```shell
-python report_results_tables.py --experiments 3 1 2 --control 3 --tasks mortality
+python scripts/report_results_tables.py --experiments 3 1 2 --control 3 --tasks mortality
 ```
 
 Options the script does not define are passed through to the per-task reporter, so the threshold, metric, fold and formatting flags below all still apply:
 
 ```shell
-python report_results_tables.py --tasks mortality --threshold 0.5
+python scripts/report_results_tables.py --tasks mortality --threshold 0.5
 ```
 
 The Word tables carry P values only. A stats CSV is written beside each one with every per-fold value, mean difference, *t* statistic, degrees of freedom, and both unadjusted and adjusted P value.

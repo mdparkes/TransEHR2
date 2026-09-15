@@ -41,9 +41,9 @@ Outputs
 `charlson_cohort.txt` with `--write_cohort`, one patient-episode ID per line.
 
 Usage:
-    python compute_charlson_index.py TransEHR2/configs/datasets/mimic4.yaml -w 8 \
+    python scripts/compute_charlson_index.py TransEHR2/configs/datasets/mimic4.yaml -w 8 \
         --write_cohort
-    python compute_charlson_index.py TransEHR2/configs/datasets/mimic4.yaml
+    python scripts/compute_charlson_index.py TransEHR2/configs/datasets/mimic4.yaml
 """
 
 import argparse
@@ -56,6 +56,10 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 import pandas as pd
 import yaml
+
+# This entry point lives in scripts/, so the repository root -- which holds the TransEHR2,
+# reporting and hp_tuning packages -- is not on sys.path when the file is run directly.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from TransEHR2.data.charlson import (CONDITION_KEYS, charlson_conditions,
                                      conditions_for_code, WEIGHTS)

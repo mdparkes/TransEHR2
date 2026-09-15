@@ -33,8 +33,8 @@ Reads the `carryforward_{experiment}_{split}_per_fold.csv` files written by
 `stratify_predictions_by_history.py --output-dir`.
 
 Usage:
-    python report_carryforward_comparison.py
-    python report_carryforward_comparison.py --table-number S2 \
+    python scripts/report_carryforward_comparison.py
+    python scripts/report_carryforward_comparison.py --table-number S2 \
         --output tables/tableS2_carryforward.docx --with-counts
 """
 
@@ -46,6 +46,11 @@ import numpy as np
 import pandas as pd
 
 from generate_redo_configs import experiment_name
+
+# This entry point lives in scripts/, so the repository root -- which holds the TransEHR2,
+# reporting and hp_tuning packages -- is not on sys.path when the file is run directly.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from reporting.jmir.formatting import fmt_cell, fmt_number, fmt_p_value
 from reporting.jmir.tables import Table, build_document, render_text
 from reporting.stats import (benjamini_hochberg, corrected_resampled_ttest,

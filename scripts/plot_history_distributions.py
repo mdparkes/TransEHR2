@@ -43,7 +43,7 @@ can read. The timestamps are then only used for the interval and gap panels, and
 convention is checked rather than assumed.
 
 Usage:
-    python plot_history_distributions.py --data_dir data/ \\
+    python scripts/plot_history_distributions.py --data_dir data/ \\
         --output tables/history_distributions.png --csv tables/history_distributions.csv
 
 One fold's train, val and test partitions cover the cohort once, so the default reads fold0.
@@ -59,6 +59,10 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator, StrMethodFormatter
 import numpy as np
+
+# This entry point lives in scripts/, so the repository root -- which holds the TransEHR2,
+# reporting and hp_tuning packages -- is not on sys.path when the file is run directly.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from TransEHR2.data.cohorts import (COHORTS, cohort_mask, has_any_history,
                                    has_value_history, history_observed)

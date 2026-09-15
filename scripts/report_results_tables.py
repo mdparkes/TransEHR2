@@ -16,18 +16,18 @@ age, sex and the comorbidity index, so it predicts in-hospital mortality and not
 asking for its length-of-stay table would only report a missing file.
 
 Usage:
-    python report_results_tables.py
-    python report_results_tables.py --tasks mortality --cohorts textsubset
-    python report_results_tables.py --dry_run
+    python scripts/report_results_tables.py
+    python scripts/report_results_tables.py --tasks mortality --cohorts textsubset
+    python scripts/report_results_tables.py --dry_run
 
     # Any other set of experiments, in the given column order
-    python report_results_tables.py --experiments 22 23 20 --control 20 --tasks mortality
+    python scripts/report_results_tables.py --experiments 22 23 20 --control 20 --tasks mortality
 
 Options this does not define are passed through to the per-task reporter, so the threshold,
 metric, fold and formatting flags all still apply:
 
-    python report_results_tables.py --tasks mortality --threshold 0.5
-    python report_results_tables.py --list-metrics --tasks phenotype
+    python scripts/report_results_tables.py --tasks mortality --threshold 0.5
+    python scripts/report_results_tables.py --list-metrics --tasks phenotype
 
 This replaces the former per-task entry points. What each task reports lives in
 reporting/tasks.py; the tables and statistics are unchanged.
@@ -36,6 +36,10 @@ reporting/tasks.py; the tables and statistics are unchanged.
 import argparse
 import os
 import sys
+
+# This entry point lives in scripts/, so the repository root -- which holds the TransEHR2,
+# reporting and hp_tuning packages -- is not on sys.path when the file is run directly.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from reporting.cli import build_parser, run
 from reporting.tasks import TASK_SPECS, TASKS

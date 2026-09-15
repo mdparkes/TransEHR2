@@ -8,15 +8,15 @@ against and what Phase 4 runs across the manuscript folds.
 
 Usage:
     # Decide, and write the assembled config for the winning arm
-    python select_tuned_hyperparameters.py <manifest> \\
+    python scripts/select_tuned_hyperparameters.py <manifest> \\
         --output TransEHR2/configs/experiments/experiment20_tuned.yaml \\
         --experiment_name experiment20_tuned
 
     # Force a particular arm rather than taking the head-to-head winner
-    python select_tuned_hyperparameters.py <manifest> --arm additive --output <path>
+    python scripts/select_tuned_hyperparameters.py <manifest> --arm additive --output <path>
 
     # See the decision without writing anything
-    python select_tuned_hyperparameters.py <manifest> --dry_run
+    python scripts/select_tuned_hyperparameters.py <manifest> --dry_run
 
 An additive sweep returns independent winners whose *combination* is never run. That is a
 known and accepted gap -- the revision plan says so, and Phase 4 validates the assembled
@@ -29,6 +29,10 @@ import os
 import sys
 
 import yaml
+
+# This entry point lives in scripts/, so the repository root -- which holds the TransEHR2,
+# reporting and hp_tuning packages -- is not on sys.path when the file is run directly.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from hp_tuning.reporting import format_grid_value, format_metric
 from hp_tuning.results import compare_arms, rank_hyperparameter

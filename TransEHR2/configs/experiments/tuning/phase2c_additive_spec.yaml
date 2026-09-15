@@ -16,7 +16,7 @@
 # quietly sweeping these three against untuned settings.
 #
 # Expand with:
-#     python generate_tuning_configs.py \
+#     python scripts/generate_tuning_configs.py \
 #         TransEHR2/configs/experiments/tuning/phase2c_additive_spec.yaml
 #
 # One arm per spec. The two encodings reached this phase carrying different learning rates and

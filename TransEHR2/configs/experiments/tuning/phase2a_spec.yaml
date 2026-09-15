@@ -1,7 +1,7 @@
 # Phase 2a: the pretraining learning rate and its schedule, crossed, on both encoding arms.
 #
 # Expand with:
-#     python generate_tuning_configs.py TransEHR2/configs/experiments/tuning/phase2a_spec.yaml
+#     python scripts/generate_tuning_configs.py TransEHR2/configs/experiments/tuning/phase2a_spec.yaml
 #
 # The design is factorial rather than additive because these two do not act independently: a
 # high rate held flat is a different proposition from the same rate annealed, and the best

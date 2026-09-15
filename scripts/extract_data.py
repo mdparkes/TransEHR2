@@ -52,7 +52,12 @@ Output Structure:
 import argparse
 import os
 import re
+import sys
 import yaml
+
+# This entry point lives in scripts/, so the repository root -- which holds the TransEHR2,
+# reporting and hp_tuning packages -- is not on sys.path when the file is run directly.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from TransEHR2.data.datareaders import MIMICDataReader
 from TransEHR2.data.preprocessing import extract_mimic

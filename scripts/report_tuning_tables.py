@@ -29,19 +29,19 @@ exist otherwise produces a table of blanks.
 
 Usage:
     # Pretraining sweep, learning rate by half-life
-    python report_tuning_tables.py 'phase2a_*' --layout grid --task pretrain \\
+    python scripts/report_tuning_tables.py 'phase2a_*' --layout grid --task pretrain \\
         --metric val:Optimization_Loss --row PRETRAIN_LEARNING_RATE \\
         --col PRETRAIN_LR_HALF_LIFE --table-number S4 \\
         --caption 'Pretraining validation set losses during hyperparameter tuning'
 
     # Finetuning sweep, learning rate by half-life
-    python report_tuning_tables.py 'phase2b_*' --layout grid --task mortality \\
+    python scripts/report_tuning_tables.py 'phase2b_*' --layout grid --task mortality \\
         --metric val:AUPRC --row FINETUNE_LEARNING_RATE --col FINETUNE_LR_HALF_LIFE \\
         --table-number S5
 
     # One row per tuned configuration. --spec gives the order of the blocks and of the rows
     # within them, which the trial names do not carry.
-    python report_tuning_tables.py 'phase2c_*' --layout flat --task mortality \\
+    python scripts/report_tuning_tables.py 'phase2c_*' --layout flat --task mortality \\
         --metrics val:AUROC,val:AUPRC --table-number S6 \\
         --spec 'TransEHR2/configs/experiments/tuning/phase2c_*_spec.yaml' 
 """
@@ -58,6 +58,11 @@ import yaml
 
 from report_experiment_results import (BLOCKS, metric_value, read_run, render,
                                        resolve_model_dir, varying_hyperparameters)
+
+# This entry point lives in scripts/, so the repository root -- which holds the TransEHR2,
+# reporting and hp_tuning packages -- is not on sys.path when the file is run directly.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from reporting.jmir.tables import Table, build_document, render_text, strip_markup
 
 

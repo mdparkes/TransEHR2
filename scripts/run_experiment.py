@@ -8,20 +8,20 @@ setting, per encoding arm, per fold -- which fills a node far better than 8-way 
 200, where each rank would see 25 samples and pay all-reduce on top.
 
 Usage:
-    python run_experiment.py <dataset_config> <experiment_config> [options]
+    python scripts/run_experiment.py <dataset_config> <experiment_config> [options]
 
     # One tuning trial: pretrain only, fold0, no downstream tasks
-    python run_experiment.py TransEHR2/configs/datasets/mimic4.yaml \\
+    python scripts/run_experiment.py TransEHR2/configs/datasets/mimic4.yaml \\
         TransEHR2/configs/experiments/tuning/p2_additive_lr_0.0002.yaml \\
         --folds fold0 --tasks none --num_workers 4
 
     # The finetune half of the same trial: reuses the pretrained encoders it just wrote
-    python run_experiment.py TransEHR2/configs/datasets/mimic4.yaml \\
+    python scripts/run_experiment.py TransEHR2/configs/datasets/mimic4.yaml \\
         TransEHR2/configs/experiments/tuning/p2_additive_lr_0.0002.yaml \\
         --folds fold0 --tasks mortality --num_workers 4
 
     # A manuscript run: every task, one fold per job
-    python run_experiment.py TransEHR2/configs/datasets/mimic4.yaml \\
+    python scripts/run_experiment.py TransEHR2/configs/datasets/mimic4.yaml \\
         TransEHR2/configs/experiments/experiment1_baseline.yaml --folds fold3
 
 Differences from the accelerate version, all deliberate:
@@ -47,6 +47,7 @@ import argparse
 import gc
 import os
 import re
+import sys
 import time
 import torch
 import yaml
@@ -58,6 +59,10 @@ _PROCESS_START = time.perf_counter()
 
 from accelerate import Accelerator
 from accelerate.utils import DistributedType, set_seed
+
+# This entry point lives in scripts/, so the repository root -- which holds the TransEHR2,
+# reporting and hp_tuning packages -- is not on sys.path when the file is run directly.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from TransEHR2.data.cohorts import COHORTS
 from torch.utils.tensorboard import SummaryWriter

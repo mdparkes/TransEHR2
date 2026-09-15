@@ -14,8 +14,8 @@ entry point. Experiment 28 is its control and is written here, restricted to the
 through COHORT_EPISODES.
 
 Usage:
-    python generate_redo_configs.py --history_len_steps 261
-    python generate_redo_configs.py --base TransEHR2/configs/experiments/tuning/phase3_base.yaml \\
+    python scripts/generate_redo_configs.py --history_len_steps 261
+    python scripts/generate_redo_configs.py --base TransEHR2/configs/experiments/tuning/phase3_base.yaml \\
         --history_len_steps 261 --charlson_episodes data/charlson_episodes.txt --dry_run
 
 The history length is required rather than defaulted, because the value Phase 3 selects is the

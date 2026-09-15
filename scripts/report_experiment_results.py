@@ -5,9 +5,9 @@ experiment whose name matches a pattern, and prints one row per run. Any recorde
 hyperparameter that differs across the selected runs becomes a column, so a grid describes
 itself.
 
-    python report_experiment_results.py 'phase2b_*'
-    python report_experiment_results.py 'phase2h_*' --paired
-    python report_experiment_results.py 'phase2b_additive_*' --csv wave_b_additive.csv
+    python scripts/report_experiment_results.py 'phase2b_*'
+    python scripts/report_experiment_results.py 'phase2h_*' --paired
+    python scripts/report_experiment_results.py 'phase2b_additive_*' --csv wave_b_additive.csv
 
 ``--paired`` pairs runs by the seed in their names and reports the mean difference between
 two groups with a confidence interval. Pairing removes the run-to-run variance the groups
@@ -24,6 +24,10 @@ import sys
 
 import yaml
 from scipy import stats
+
+# This entry point lives in scripts/, so the repository root -- which holds the TransEHR2,
+# reporting and hp_tuning packages -- is not on sys.path when the file is run directly.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from hp_tuning.reporting import print_table
 

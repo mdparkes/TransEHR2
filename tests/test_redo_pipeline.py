@@ -141,7 +141,7 @@ def test_the_reported_cohorts_are_the_ones_the_writer_declares(report_job):
 ])
 def test_every_writer_the_redo_needs_is_invoked(report_job, script):
     assert script in commands(report_job)
-    assert os.path.exists(os.path.join(REPO, script)), f'{script} is invoked but absent'
+    assert os.path.exists(os.path.join(REPO, 'scripts', script)), f'{script} is invoked but absent'
 
 
 def test_the_figure_is_built_on_the_cohort_the_tables_report(report_job):

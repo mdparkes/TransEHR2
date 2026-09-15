@@ -36,9 +36,9 @@ What it checks, in the order it checks it:
    measured limit rather than the placeholder in the batch scripts.
 
 Usage:
-    python test_phase2_pipeline.py --work_dir /tmp/phase2_test
-    python test_phase2_pipeline.py --work_dir /tmp/phase2_test --skip memory
-    python test_phase2_pipeline.py --work_dir /tmp/phase2_test --only data
+    python scripts/test_phase2_pipeline.py --work_dir /tmp/phase2_test
+    python scripts/test_phase2_pipeline.py --work_dir /tmp/phase2_test --skip memory
+    python scripts/test_phase2_pipeline.py --work_dir /tmp/phase2_test --only data
 
 Nothing here writes to the real models/ tree: MODEL_DIR is rewritten to point inside
 --work_dir, which the SLURM wrapper deletes afterwards.
@@ -54,6 +54,10 @@ import time
 
 import numpy as np
 import yaml
+
+# This entry point lives in scripts/, so the repository root -- which holds the TransEHR2,
+# reporting and hp_tuning packages -- is not on sys.path when the file is run directly.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from TransEHR2.utils import EPOCH_TIMING_PREFIX, STARTUP_TIMING_PREFIX
 

@@ -22,8 +22,8 @@ mass is not something a crop can remove. Text records are reported alongside as 
 they are a small and unevenly distributed share of the same timesteps.
 
 Usage:
-    python choose_history_cutpoints.py --data_dir data --fold fold0
-    python choose_history_cutpoints.py --steps 8 --cohort any_text
+    python scripts/choose_history_cutpoints.py --data_dir data --fold fold0
+    python scripts/choose_history_cutpoints.py --steps 8 --cohort any_text
 
 One fold's train, val and test partitions cover the cohort once, so the default reads fold0 --
 which is also the fold the sweep runs on.
@@ -34,6 +34,10 @@ import os
 import sys
 
 import numpy as np
+
+# This entry point lives in scripts/, so the repository root -- which holds the TransEHR2,
+# reporting and hp_tuning packages -- is not on sys.path when the file is run directly.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from TransEHR2.data.cohorts import cohort_mask, history_observed
 from TransEHR2.data.preprocessing import load_dataset

@@ -9,9 +9,9 @@ Backs up original listfiles as {name}.unfiltered.csv, then overwrites with
 filtered versions. Reports per-fold, per-partition filtering statistics.
 
 Usage:
-    python filter_listfiles_by_discharge_summary.py TransEHR2/configs/datasets/mimic4.yaml
-    python filter_listfiles_by_discharge_summary.py TransEHR2/configs/datasets/mimic4.yaml --dry_run
-    python filter_listfiles_by_discharge_summary.py TransEHR2/configs/datasets/mimic4.yaml --restore
+    python scripts/filter_listfiles_by_discharge_summary.py TransEHR2/configs/datasets/mimic4.yaml
+    python scripts/filter_listfiles_by_discharge_summary.py TransEHR2/configs/datasets/mimic4.yaml --dry_run
+    python scripts/filter_listfiles_by_discharge_summary.py TransEHR2/configs/datasets/mimic4.yaml --restore
 """
 
 import argparse

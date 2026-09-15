@@ -7,13 +7,18 @@ globbing a directory -- a glob would silently reorder if a config were added, an
 and finetune arrays index different subsets of the same manifest.
 
 Usage:
-    python tuning_trial.py <manifest> --stage pretrain --count
-    python tuning_trial.py <manifest> --stage pretrain --index 0 --field config
-    python tuning_trial.py <manifest> --stage finetune --index 3 --field name
+    python scripts/tuning_trial.py <manifest> --stage pretrain --count
+    python scripts/tuning_trial.py <manifest> --stage pretrain --index 0 --field config
+    python scripts/tuning_trial.py <manifest> --stage finetune --index 3 --field name
 """
 
 import argparse
+import os
 import sys
+
+# This entry point lives in scripts/, so the repository root -- which holds the TransEHR2,
+# reporting and hp_tuning packages -- is not on sys.path when the file is run directly.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from hp_tuning.spec import finetune_trials, load_manifest, pretrain_trials
 

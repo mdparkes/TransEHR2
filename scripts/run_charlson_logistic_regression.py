@@ -8,7 +8,7 @@ split and applied to its validation and test splits. The predictions are written
 column and the corrected resampled t test compares it against the peri-stay-only model without
 any special case:
 
-    python report_results_tables.py --tasks mortality --cohorts charlson
+    python scripts/report_results_tables.py --tasks mortality --cohorts charlson
 
 Cohort and row order
 --------------------
@@ -41,11 +41,11 @@ the predictions. The decision threshold is not chosen here -- the reporter calib
 the validation split, as it does for every other arm.
 
 Usage:
-    python run_charlson_logistic_regression.py TransEHR2/configs/datasets/mimic4.yaml
-    python run_charlson_logistic_regression.py TransEHR2/configs/datasets/mimic4.yaml \
+    python scripts/run_charlson_logistic_regression.py TransEHR2/configs/datasets/mimic4.yaml
+    python scripts/run_charlson_logistic_regression.py TransEHR2/configs/datasets/mimic4.yaml \
         --charlson_csv misc/charlson/charlson_index.csv \
         --cohort_episodes misc/charlson/charlson_cohort.txt --model_dir models
-    python run_charlson_logistic_regression.py TransEHR2/configs/datasets/mimic4.yaml \
+    python scripts/run_charlson_logistic_regression.py TransEHR2/configs/datasets/mimic4.yaml \
         --class_weight balanced --penalty l2
 """
 
@@ -56,8 +56,13 @@ import re
 
 import numpy as np
 import pandas as pd
+import sys
 import yaml
 from sklearn.linear_model import LogisticRegression
+
+# This entry point lives in scripts/, so the repository root -- which holds the TransEHR2,
+# reporting and hp_tuning packages -- is not on sys.path when the file is run directly.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from TransEHR2.data.cohorts import load_episode_manifest
 from TransEHR2.data.preprocessing import load_dataset

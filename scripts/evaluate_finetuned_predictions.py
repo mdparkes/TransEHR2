@@ -8,7 +8,7 @@ fold.  Results are written to one YAML file per data split at
 metric stored as a list of per-fold values.
 
 Usage:
-    python evaluate_finetuned_predictions.py <experiment_name> \
+    python scripts/evaluate_finetuned_predictions.py <experiment_name> \
         [--model_dir ./models] [--threshold 0.5]
 """
 

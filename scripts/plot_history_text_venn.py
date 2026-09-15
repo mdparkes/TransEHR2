@@ -27,7 +27,7 @@ an episode in the one-feature ring is missing is reported in the table rather th
 two are not nested in each other, so separating them is what would need a lens.
 
 Usage:
-    python plot_history_text_venn.py --data_dir data/ --output tables/history_text_venn.png
+    python scripts/plot_history_text_venn.py --data_dir data/ --output tables/history_text_venn.png
 
 Folds partition the same patients, so one fold's train, val and test partitions cover the
 cohort once. Sets are keyed on patient id, so passing more folds is harmless but redundant.
@@ -44,6 +44,10 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 import numpy as np
+
+# This entry point lives in scripts/, so the repository root -- which holds the TransEHR2,
+# reporting and hp_tuning packages -- is not on sys.path when the file is run directly.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from TransEHR2.data.cohorts import (has_all_historical_text, has_any_historical_text,
                                     has_any_history, has_historical_text,

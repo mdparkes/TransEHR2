@@ -8,13 +8,13 @@ doubles as the progress check while the sweep is in flight.
 
 Usage:
     # Where is the sweep up to?
-    python report_tuning_results.py <manifest> --progress
+    python scripts/report_tuning_results.py <manifest> --progress
 
     # Full report: rankings to the terminal, tables to tables/
-    python report_tuning_results.py <manifest>
+    python scripts/report_tuning_results.py <manifest>
 
     # Just the tables, no terminal output
-    python report_tuning_results.py <manifest> --quiet --docx tables/phase2_tuning.docx
+    python scripts/report_tuning_results.py <manifest> --quiet --docx tables/phase2_tuning.docx
 
 Two selection criteria are in play and which applies is a property of the hyperparameter, not
 a choice made here. Learning rate and decay leave the pretraining objective intact, so
@@ -27,6 +27,10 @@ mortality validation performance instead.
 import argparse
 import os
 import sys
+
+# This entry point lives in scripts/, so the repository root -- which holds the TransEHR2,
+# reporting and hp_tuning packages -- is not on sys.path when the file is run directly.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from hp_tuning.reporting import format_grid_value, format_metric, print_table, write_tables
 from hp_tuning.results import compare_arms, progress, rank_cells, rank_hyperparameter

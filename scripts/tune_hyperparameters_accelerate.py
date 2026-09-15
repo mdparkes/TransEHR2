@@ -2,7 +2,7 @@
 Accelerate-compatible version of hyperparameter tuning for multi-GPU DDP/FSDP training.
 
 Usage:
-    accelerate launch --config_file <accelerate_config> tune_hyperparameters_accelerate.py <dataset_config> <experiment_config> [--num_workers N]
+    accelerate launch --config_file <accelerate_config> scripts/tune_hyperparameters_accelerate.py <dataset_config> <experiment_config> [--num_workers N]
 """
 
 import argparse
@@ -18,6 +18,11 @@ from typing import Any, Dict, Tuple
 
 import pickle
 import re
+import sys
+
+# This entry point lives in scripts/, so the repository root -- which holds the TransEHR2,
+# reporting and hp_tuning packages -- is not on sys.path when the file is run directly.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from TransEHR2.constants import MAX_TOKEN_LENGTH
 from TransEHR2.data.preprocessing import compute_static_feat_dims, prepare_dataloaders

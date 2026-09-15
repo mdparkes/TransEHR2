@@ -4,8 +4,8 @@ Selection ranks whole cells, so the winner is a configuration that was actually 
 than one assembled from coordinate winners. The config written is the winning trial's own,
 renamed.
 
-    python select_tuned_cell.py <manifest>                       # report every arm
-    python select_tuned_cell.py <manifest> --arm rope --output <path>
+    python scripts/select_tuned_cell.py <manifest>                       # report every arm
+    python scripts/select_tuned_cell.py <manifest> --arm rope --output <path>
 
 Use select_tuned_hyperparameters.py for an additive sweep.
 """
@@ -15,6 +15,10 @@ import os
 import sys
 
 import yaml
+
+# This entry point lives in scripts/, so the repository root -- which holds the TransEHR2,
+# reporting and hp_tuning packages -- is not on sys.path when the file is run directly.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from hp_tuning.reporting import format_grid_value, format_metric
 from hp_tuning.results import rank_cells

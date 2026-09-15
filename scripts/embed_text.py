@@ -19,7 +19,7 @@ After running this script, each partition directory will contain:
     metadata.pkl                 -- updated with 'text_embed_dim'
 
 Usage:
-    python embed_text.py --data-dir /path/to/data [--batch-size 64]
+    python scripts/embed_text.py --data-dir /path/to/data [--batch-size 64]
 """
 
 import argparse
@@ -28,9 +28,14 @@ import numpy as np
 import os
 import pickle
 import re
+import sys
 import torch
 
 from typing import Dict, List, Optional, Tuple
+
+# This entry point lives in scripts/, so the repository root -- which holds the TransEHR2,
+# reporting and hp_tuning packages -- is not on sys.path when the file is run directly.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from TransEHR2.modules import GradientTraceableLLM
 

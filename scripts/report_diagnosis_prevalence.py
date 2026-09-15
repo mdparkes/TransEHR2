@@ -18,8 +18,8 @@ aligned to their CCS counterparts when the definitions are built; each phenotype
 column of the label matrix regardless of the coding era of the stay.
 
 Usage:
-    python report_diagnosis_prevalence.py --data_dir data/
-    python report_diagnosis_prevalence.py --table-number S3 \\
+    python scripts/report_diagnosis_prevalence.py --data_dir data/
+    python scripts/report_diagnosis_prevalence.py --table-number S3 \\
         --output tables/tableS3_diagnosis_labels.docx --csv tables/tableS3.csv
 
 One fold's train, val and test partitions cover the cohort once, so the default reads fold0.
@@ -32,6 +32,10 @@ import sys
 
 import numpy as np
 import pandas as pd
+
+# This entry point lives in scripts/, so the repository root -- which holds the TransEHR2,
+# reporting and hp_tuning packages -- is not on sys.path when the file is run directly.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from TransEHR2.data.cohorts import has_any_historical_text, has_value_history
 from TransEHR2.data.preprocessing import load_dataset, load_episode_ids

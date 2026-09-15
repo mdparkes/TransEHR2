@@ -2,7 +2,7 @@
 Accelerate-compatible version of hyperparameter tuning for multi-GPU DDP/FSDP training.
 
 Usage:
-    accelerate launch --config_file <accelerate_config> tune_hyperparameters_accelerate.py <dataset_config> <experiment_config> [--num_workers N]
+    accelerate launch --config_file <accelerate_config> scripts/tune_hyperparameters_accelerate.py <dataset_config> <experiment_config> [--num_workers N]
 """
 
 import argparse

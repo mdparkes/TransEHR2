@@ -14,7 +14,7 @@ Two control cells are added unless --no_controls: one finetunes from a fresh ini
 instead of the linked weights, the other freezes the encoder. Read against the matching grid
 cell they separate what pretraining contributed from what finetuning the encoder contributed.
 
-    python generate_finetune_grid.py --base <selected>.yaml --encoder <trial> \
+    python scripts/generate_finetune_grid.py --base <selected>.yaml --encoder <trial> \
         --prefix phase2b_additive --output_dir <dir> \
         --rates 5e-5,2.2e-5,1e-5 --half_lives 160,60,20 --no_controls
 

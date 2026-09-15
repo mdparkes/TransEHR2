@@ -278,17 +278,17 @@ class TestPinMemoryIsControllable:
     size, not worker count, so it has to be measurable rather than hardcoded."""
 
     def test_the_flag_offers_auto_on_and_off(self):
-        source = open(os.path.join(REPO_ROOT, 'run_experiment.py')).read()
+        source = open(os.path.join(REPO_ROOT, 'scripts', 'run_experiment.py')).read()
         assert "'--pin_memory'" in source
         assert "choices=['auto', 'on', 'off']" in source
 
     def test_the_dataloader_reads_the_resolved_value_not_cuda_availability(self):
-        source = open(os.path.join(REPO_ROOT, 'run_experiment.py')).read()
+        source = open(os.path.join(REPO_ROOT, 'scripts', 'run_experiment.py')).read()
         assert 'pin_memory=pin_memory,' in source
         assert 'pin_memory=torch.cuda.is_available()' not in source
 
     def test_auto_still_means_on_under_cuda(self):
         """Every measurement so far ran with pinning on; the default must not quietly change."""
-        source = open(os.path.join(REPO_ROOT, 'run_experiment.py')).read()
+        source = open(os.path.join(REPO_ROOT, 'scripts', 'run_experiment.py')).read()
         assert ("pin_memory = (torch.cuda.is_available() if args.pin_memory == 'auto'"
                 in source)

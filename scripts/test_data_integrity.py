@@ -3,7 +3,7 @@
 indicator and value tensor across the training, validation, and test splits of fold0.
 
 Usage:
-    python test_data_integrity.py <dataset_config>
+    python scripts/test_data_integrity.py <dataset_config>
 
 The script iterates through batches of 100 samples.  For each feature type
 (numeric, categorical, text, event, static) it checks whether the indicator
@@ -20,6 +20,10 @@ import yaml
 
 from functools import partial
 from torch.utils.data import DataLoader
+
+# This entry point lives in scripts/, so the repository root -- which holds the TransEHR2,
+# reporting and hp_tuning packages -- is not on sys.path when the file is run directly.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from TransEHR2.data.preprocessing import (VALUE_TYPES, collate_tensorized, load_dataset,
                                           partition_valued_feats)

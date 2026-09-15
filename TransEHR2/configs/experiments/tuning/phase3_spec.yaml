@@ -1,7 +1,7 @@
 # Phase 3 pre-admission history sweep: one arm, six history lengths, mortality on fold0.
 #
 # Expand with:
-#     python generate_tuning_configs.py TransEHR2/configs/experiments/tuning/phase3_spec.yaml
+#     python scripts/generate_tuning_configs.py TransEHR2/configs/experiments/tuning/phase3_spec.yaml
 #
 # BASE_CONFIG is phase3_base.yaml, which carries the encoding arm and the five hyperparameters
 # Phase 2 settled. It is in the repository beside this spec, and each of its values has a
@@ -10,8 +10,8 @@
 #
 # The sweep is the same additive shape as Phase 2 with a grid of one, so it needs no new
 # machinery and no new SLURM scripts -- the same manifest-driven arrays run it:
-#     python tuning_trial.py <manifest> --stage pretrain  --count   ->  7
-#     python tuning_trial.py <manifest> --stage finetune  --count   ->  7
+#     python scripts/tuning_trial.py <manifest> --stage pretrain  --count   ->  7
+#     python scripts/tuning_trial.py <manifest> --stage finetune  --count   ->  7
 # Every trial is selected on mortality, so every pretrain has a finetune. Fourteen runs in two
 # stages, seven wide, against a suggested %8 throttle that therefore never binds.
 

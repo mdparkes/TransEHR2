@@ -56,9 +56,9 @@ the run used is read from it and applied here through the same
 by construction rather than by argument.
 
 Usage:
-    python stratify_predictions_by_history.py \
+    python scripts/stratify_predictions_by_history.py \
         TransEHR2/configs/datasets/mimic4.yaml experiment2_text
-    python stratify_predictions_by_history.py \
+    python scripts/stratify_predictions_by_history.py \
         TransEHR2/configs/datasets/mimic4.yaml experiment2_text \
         --split val --output-dir misc/stratified_carryforward
 """
@@ -72,6 +72,10 @@ import sys
 import numpy as np
 import pandas as pd
 import yaml
+
+# This entry point lives in scripts/, so the repository root -- which holds the TransEHR2,
+# reporting and hp_tuning packages -- is not on sys.path when the file is run directly.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from TransEHR2.data.cohorts import COHORTS, cohort_indices
 from TransEHR2.data.preprocessing import load_episode_ids

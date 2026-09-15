@@ -13,11 +13,11 @@ Output files are written to:
     {model_dir}/{experiment_name}/{fold}/{task}/{task}_{split}_finetuned_output.csv
 
 Usage (single GPU):
-    python dump_finetuned_predictions.py <dataset_config> <experiment_config> <experiment_name> \
+    python scripts/dump_finetuned_predictions.py <dataset_config> <experiment_config> <experiment_name> \
         [--model_dir ./models] [--num_workers 0] [--batch_size 750]
 
 Usage (multi-GPU):
-    accelerate launch dump_finetuned_predictions.py <dataset_config> <experiment_config> \
+    accelerate launch scripts/dump_finetuned_predictions.py <dataset_config> <experiment_config> \
         <experiment_name> [--model_dir ./models] [--num_workers 0] [--batch_size 750]
 """
 
@@ -29,6 +29,7 @@ import os
 import pandas as pd
 import pickle
 import re
+import sys
 import torch
 import yaml
 
@@ -40,6 +41,11 @@ from tqdm import tqdm
 from typing import Dict, List, Optional, Tuple
 
 from functools import partial
+
+# This entry point lives in scripts/, so the repository root -- which holds the TransEHR2,
+# reporting and hp_tuning packages -- is not on sys.path when the file is run directly.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from TransEHR2.constants import MAX_TOKEN_LENGTH
 from TransEHR2.data.preprocessing import load_dataset, collate_tensorized, compute_static_feat_dims
 from TransEHR2.models import MixedClassifier

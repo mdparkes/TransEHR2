@@ -7,20 +7,25 @@ configurations per arm, and each becomes a standalone config that a single-GPU
 ``run_experiment.py`` job runs on its own.
 
 Usage:
-    python generate_tuning_configs.py TransEHR2/configs/experiments/tuning/phase2_spec.yaml
+    python scripts/generate_tuning_configs.py TransEHR2/configs/experiments/tuning/phase2_spec.yaml
 
     # See what it would write without writing anything
-    python generate_tuning_configs.py <spec> --dry_run
+    python scripts/generate_tuning_configs.py <spec> --dry_run
 
     # Print the sbatch commands the manifest implies
-    python generate_tuning_configs.py <spec> --dry_run --show_commands
+    python scripts/generate_tuning_configs.py <spec> --dry_run --show_commands
 
 Regenerating over existing configs needs --overwrite, because a config file is the record of
 what a finished run actually ran. Rewriting one silently re-describes results already on disk.
 """
 
 import argparse
+import os
 import sys
+
+# This entry point lives in scripts/, so the repository root -- which holds the TransEHR2,
+# reporting and hp_tuning packages -- is not on sys.path when the file is run directly.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from hp_tuning.spec import (SELECTION_CRITERIA, expand_trials, load_spec, write_manifest,
                             write_trial_configs)
@@ -111,8 +116,8 @@ def main(argv=None):
         # them is that value's result. Printing it anyway hands over a command that raises
         # once every trial has already run.
         if spec.get('DESIGN') == 'factorial':
-            print(f"  python report_tuning_results.py {manifest_path} --no_tables")
-            print(f"  python select_tuned_cell.py {manifest_path} --dry_run")
+            print(f"  python scripts/report_tuning_results.py {manifest_path} --no_tables")
+            print(f"  python scripts/select_tuned_cell.py {manifest_path} --dry_run")
         else:
             print(f"  sbatch SLURM/slurm_report_tuning.sh {manifest_path}")
         print()

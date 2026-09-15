@@ -525,9 +525,9 @@ def test_the_rotary_arm_holds_its_phase_at_production_scale():
 # --------------------------------------------------------------------------------------------
 
 ENTRY_POINTS = (
-    'run_experiment_accelerate.py',
-    'tune_hyperparameters_accelerate.py',
-    'dump_finetuned_predictions.py',
+    'scripts/run_experiment_accelerate.py',
+    'scripts/tune_hyperparameters_accelerate.py',
+    'scripts/dump_finetuned_predictions.py',
     'TransEHR2/test_tune_hyperparameters.py',
 )
 LADDER_KEYS = ('POSITION_ENCODING', 'VALUE_LADDER_P_MIN', 'VALUE_LADDER_P_MAX',

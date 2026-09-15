@@ -52,9 +52,9 @@ audited population match the experiment; it does not make the two definitions
 identical.
 
 Usage:
-    python audit_historic_diagnoses.py TransEHR2/configs/datasets/mimic4.yaml -w 8
-    python audit_historic_diagnoses.py TransEHR2/configs/datasets/mimic4.yaml --unfiltered
-    python audit_historic_diagnoses.py TransEHR2/configs/datasets/mimic4.yaml --folds fold0
+    python scripts/audit_historic_diagnoses.py TransEHR2/configs/datasets/mimic4.yaml -w 8
+    python scripts/audit_historic_diagnoses.py TransEHR2/configs/datasets/mimic4.yaml --unfiltered
+    python scripts/audit_historic_diagnoses.py TransEHR2/configs/datasets/mimic4.yaml --folds fold0
 """
 
 import argparse
@@ -69,6 +69,10 @@ import pandas as pd
 
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
+
+# This entry point lives in scripts/, so the repository root -- which holds the TransEHR2,
+# reporting and hp_tuning packages -- is not on sys.path when the file is run directly.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from TransEHR2.data.cohorts import (COHORTS, DIAGNOSIS_DESCRIPTIONS_INDEX,
                                     cohort_indices)

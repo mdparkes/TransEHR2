@@ -250,12 +250,12 @@ def script(name):
     """Absolute path to a repository entry point, so it can be run from anywhere.
 
     Args:
-        name: File name at the repository root, e.g. 'run_experiment.py'.
+        name: File name in scripts/, e.g. 'run_experiment.py'.
 
     Returns:
         The absolute path.
     """
-    return os.path.join(REPO_ROOT, name)
+    return os.path.join(REPO_ROOT, 'scripts', name)
 
 
 @pytest.fixture(scope='module')

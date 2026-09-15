@@ -11,8 +11,8 @@ generator rather than its output and cannot end up carrying two configurations t
 describe the same experiment.
 
 Usage:
-    python generate_revision_experiments.py
-    python generate_revision_experiments.py --dry_run
+    python scripts/generate_revision_experiments.py
+    python scripts/generate_revision_experiments.py --dry_run
 
 Cohorts. Comparing a model that reads pre-admission history against one that does not is
 diluted by episodes with no history to read, and the paired tests need both arms on the same
@@ -37,7 +37,12 @@ experiments 20 and 25 carry none.
 import argparse
 import os
 
+import sys
 import yaml
+
+# This entry point lives in scripts/, so the repository root -- which holds the TransEHR2,
+# reporting and hp_tuning packages -- is not on sys.path when the file is run directly.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from TransEHR2.data.cohorts import COHORTS
 
