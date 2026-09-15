@@ -42,15 +42,15 @@ import yaml
 
 # This entry point lives in scripts/, so the repository root -- which holds the TransEHR2,
 # reporting and hp_tuning packages -- is not on sys.path when the file is run directly.
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO_ROOT)
 
 from TransEHR2.data.cohorts import COHORTS
 
 
-REPO = os.path.dirname(os.path.abspath(__file__))
-BASE_CONFIG = os.path.join(REPO, 'TransEHR2', 'configs', 'experiments', 'tuning',
+BASE_CONFIG = os.path.join(REPO_ROOT, 'TransEHR2', 'configs', 'experiments', 'tuning',
                            'phase3_base.yaml')
-OUTPUT_DIR = os.path.join(REPO, 'TransEHR2', 'configs', 'experiments')
+OUTPUT_DIR = os.path.join(REPO_ROOT, 'TransEHR2', 'configs', 'experiments')
 
 # Keys this generator sets itself. Everything else in the base config carries through, the
 # seeds included: all eight experiments share one seed pair, so a contrast between them is

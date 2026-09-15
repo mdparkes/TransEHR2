@@ -72,7 +72,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # This entry point lives in scripts/, so the repository root -- which holds the TransEHR2,
 # reporting and hp_tuning packages -- is not on sys.path when the file is run directly.
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO_ROOT)
 
 from TransEHR2.data.cohorts import (COHORTS, DIAGNOSIS_DESCRIPTIONS_INDEX,
                                     cohort_indices)
@@ -711,14 +712,12 @@ def main():
     )
     parser.add_argument(
         '--icd9_phenotype_definitions', '-p9', type=str,
-        default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                             'data', 'hcup_ccs_2015_definitions.yaml'),
+        default=os.path.join(REPO_ROOT, 'data', 'hcup_ccs_2015_definitions.yaml'),
         help="YAML file with ICD-9 phenotype definitions."
     )
     parser.add_argument(
         '--icd10_phenotype_definitions', '-p10', type=str,
-        default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                             'data', 'hcup_ccsr_2024_definitions.yaml'),
+        default=os.path.join(REPO_ROOT, 'data', 'hcup_ccsr_2024_definitions.yaml'),
         help="YAML file with ICD-10 phenotype definitions."
     )
     args = parser.parse_args()
