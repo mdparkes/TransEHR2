@@ -33,7 +33,7 @@ pip install -r requirements.txt
 deactivate
 ```
 
-The text encoder is named by `LLM_NAME` in `TransEHR2/constants.py`, along with the token limit and the pooling rule. It must be available to the machine that runs `embed_text.py`. If you point it at a gated model, put a HuggingFace token in a `.env` file at the repository root as `HF_READ_TOKEN`.
+The text encoder is named by `LLM_NAME` in `TransEHR2/constants.py`, along with the token limit and the pooling rule. It must be available to the machine that runs `embed_text.py`, and may be either a HuggingFace model id or a local path; the shipped default is a cluster-local copy of `BAAI/bge-m3`. `embed_text.py --llm-name` overrides it for one run. For a gated model, put a HuggingFace token in a `.env` file at the repository root as `HF_READ_TOKEN`.
 
 ### Installing optional libraries for MIMIC-IV data
 
@@ -66,10 +66,12 @@ TransEHR2/
 ├── TransEHR2/                     Package: model, losses, training routines, data pipeline
 │   ├── configs/
 │   │   ├── datasets/              Dataset configs (paths, feature selection, sequence lengths)
-│   │   └── experiments/           Experiment configs, and tuning specs under tuning/
+│   │   └── experiments/           Tuning specs under tuning/; per-experiment configs are generated
 │   ├── constants.py               Text encoder, token limit, pooling, device selection
 │   ├── losses.py                  Generator, discriminator and Hawkes process losses
-│   ├── model.py                   Encoders, MixedClassifier
+│   ├── models.py                  ELECTRA, MixedClassifier
+│   ├── modules.py                 Value and event encoders, generator, discriminator, Hawkes process
+│   ├── layers.py                  Attention, encoder layers, temporal position encodings
 │   ├── routines_accelerate.py     Pretrain, finetune and evaluation loops
 │   └── data/                      Dataset, collation, standardization
 ├── hp_tuning/                     Sweep specs, trial expansion, result ranking
@@ -94,6 +96,20 @@ TransEHR2/
 └── experiment_descriptions.md     What each experiment number means
 ```
 
+Everything in `scripts/` is run from the repository root, as `python scripts/<name>.py`.
+
+The batch scripts (`SLURM/` and the shell drivers at the root) are **not tracked**: what submits a job carries the absolute paths of the machine it runs on, so each installation keeps its own. The `sbatch` commands below are from a working copy that has them, and a fresh clone will not.
+
+The per-experiment configs under `TransEHR2/configs/experiments/` are not tracked either. They are written by `generate_revision_experiments.py` from the tuned configuration, so a config file stays the record of what a finished run actually ran.
+
+## Tests
+
+```shell
+pytest tests/ TransEHR2/
+```
+
+`tests/` holds the probes for the entry points and the reporting; `TransEHR2/` holds the model's own. Two tests in `tests/test_phase2_infrastructure.py` train a small model and are marked `slow`; `-m "not slow"` skips them.
+
 ## Running an experiment
 
 An experiment consists of pretraining, finetuning and evaluating on a test set. Scripts take a dataset config and an experiment config, both under `TransEHR2/configs/`; edit those to change parameters.
@@ -116,7 +132,9 @@ python scripts/embed_text.py --data-dir ${DATA_DIR}
 python scripts/run_experiment.py TransEHR2/configs/datasets/mimic4.yaml TransEHR2/configs/experiments/<experiment>.yaml
 ```
 
-`--folds` restricts the run to particular folds and `--tasks` to particular tasks, which is how the work is spread across jobs. `fold0` is reserved for hyperparameter tuning and is excluded from reported results.
+`--folds` restricts the run to particular folds and `--tasks` to particular tasks, which is how the work is spread across jobs. `fold0` is reserved for hyperparameter tuning and is excluded from reported results. `--tasks none` pretrains only.
+
+`--num_workers` and `--mixed_precision` (default `bf16`) are the two flags worth setting per machine. `--limit_episodes` runs the whole cycle on a handful of episodes to check a configuration end to end; its results are meaningless as measurements and are written to the paths a real run would use, so point `MODEL_DIR` somewhere disposable. `--help` lists the rest.
 
 ### Re-running an experiment
 
@@ -129,7 +147,7 @@ Everything is keyed on `EXPERIMENT_NAME` from the experiment config, with `MODEL
 | Pretrained weights | `<MODEL_DIR>/<EXPERIMENT_NAME>/<fold>/pretrained/*.pt` | **Pretraining is skipped entirely.** Any `.pt` in the directory counts; the most recently written is loaded. |
 | Finetuned weights | `<MODEL_DIR>/<EXPERIMENT_NAME>/<fold>/pretrained/finetuned_<task>.pt` | Finetuning is skipped for that task. Evaluation still runs. |
 | Task evaluation | `<MODEL_DIR>/<EXPERIMENT_NAME>/<fold>/<task>/evaluation/evaluation_<task>.yaml` | That task is skipped entirely, finetuning and evaluation both. |
-| Checkpoints | `checkpoints/<EXPERIMENT_NAME>/<fold>/{pretrained,finetuned}/` | Training resumes from the recorded epoch. **Removed automatically when a run completes**, so these are present only after a job was killed. |
+| Checkpoints | `checkpoints/<EXPERIMENT_NAME>/<fold>/{pretrained,finetuned_<task>}/` | Training resumes from the recorded epoch. **Removed automatically when a run completes**, so these are present only after a job was killed. |
 | TensorBoard logs | `log/<EXPERIMENT_NAME>/<fold>/{pretrained,finetuned_<task>}/` | Nothing is skipped, but `SummaryWriter` appends: old and new curves are drawn together at overlapping steps. |
 | Pretraining evaluation | `<MODEL_DIR>/<EXPERIMENT_NAME>/<fold>/pretrained/evaluation/evaluation_pretrained.yaml` | Overwritten. Stale only if pretraining was skipped. |
 
@@ -149,14 +167,14 @@ ls checkpoints/
 
 ## Hyperparameter tuning
 
-A sweep is described by a spec under `TransEHR2/configs/experiments/tuning/`. The sweep is additive: an all-defaults centre per encoding arm, plus one trial for each non-default value of each hyperparameter. Each trial becomes a standalone experiment config that one job can run.
+A sweep is described by a spec under `TransEHR2/configs/experiments/tuning/`. The default sweep is additive: an all-defaults centre per encoding arm, plus one trial for each non-default value of each hyperparameter. Each trial becomes a standalone experiment config that one job can run.
 
 ```shell
 # Expand the spec into one config per trial, plus a manifest
 python scripts/generate_tuning_configs.py TransEHR2/configs/experiments/tuning/<spec>.yaml
 
-# Run trial $SLURM_ARRAY_TASK_ID; prints the config path for run_experiment.py
-python scripts/tuning_trial.py ${MANIFEST} ${SLURM_ARRAY_TASK_ID}
+# Look up trial $SLURM_ARRAY_TASK_ID; prints the config path for run_experiment.py
+python scripts/tuning_trial.py ${MANIFEST} --stage pretrain --index ${SLURM_ARRAY_TASK_ID} --field config
 
 # Rank the results. Safe to run before every trial has finished.
 python scripts/report_tuning_results.py ${MANIFEST} --progress
@@ -165,76 +183,47 @@ python scripts/report_tuning_results.py ${MANIFEST} --progress
 python scripts/select_tuned_hyperparameters.py ${MANIFEST} --arm ${ARM} --output ${CONFIG}
 ```
 
+`tuning_trial.py` indexes the same lists the job arrays index, so `--stage` is required: the pretrain and finetune arrays cover different subsets of one manifest. `--count` gives the array bound, `--list` prints the whole stage.
+
 Trials are ranked on the criterion each hyperparameter's grid entry names in the spec: `select_on: pretrain` ranks on pretraining loss, `select_on: mortality` on mortality validation performance.
+
+For a factorial sweep, where trials are cells of a grid rather than one-at-a-time departures from a centre, `select_tuned_cell.py` takes the same arguments and writes the winning cell's config. `report_tuning_tables.py` builds the sweep's results as a table, reading evaluation YAMLs directly rather than a manifest, so it serves either sweep shape.
 
 ## Charlson comorbidity baseline
 
-A logistic regression on age at admission, sex and the Charlson comorbidity index, reported
-against a peri-stay-only model as a conventional-severity-score reference for in-hospital
-mortality. The index is that of the patient's most recent earlier hospital admission.
+Experiment 29 is a logistic regression on age at admission, sex and the Charlson comorbidity index, reported against experiment 28 — a peri-stay-only model on the same episodes — as a conventional-severity-score reference for in-hospital mortality. The index is that of the patient's most recent earlier hospital admission.
 
-**The cohort is an explicit episode manifest, and both arms are given the same file.** An
-episode belongs to the comparison exactly when all three features exist -- an index, an age
-and a sex -- which is not a predicate over the extracted arrays, because whether the index
-could be computed depends on `diagnoses.csv`. Both arms resolve that one file by
-patient-episode ID through the same loader, so they select identical episodes in identical
-order, which is what the paired test needs. Do not substitute the `diagnosis_history` cohort:
-it asks whether the *text* of an earlier admission's diagnoses survived extraction, which
-neither arm reads, and it excludes episodes whose codes are perfectly available.
-
-**1. Score the earlier admissions and write the cohort.** Reads `stays.csv` and
-`diagnoses.csv` per subject, then intersects the result with the episodes that have an age and
-a sex in the extracted arrays. The printed funnel shows what each condition removed, and the
-run fails if any fold is short of a cohort episode.
+**The cohort is an explicit episode manifest, and both arms are given the same file.** An episode belongs to the comparison exactly when all three features exist: an index, an age and a sex. That is not a predicate over the extracted arrays, because whether the index could be computed depends on `diagnoses.csv`. Both arms resolve the one file by patient-episode ID through the same loader, so they select identical episodes in identical order, which is what the paired test needs. Do not substitute the `diagnosis_history` cohort: it asks whether the *text* of an earlier admission's diagnoses survived extraction, which neither arm reads, and it excludes episodes whose codes are perfectly available.
 
 ```shell
+# 1. Score the earlier admissions and write the cohort manifest. Reads stays.csv and
+#    diagnoses.csv per subject, then intersects with the episodes that have an age and a sex.
+#    Writes misc/charlson/charlson_index.csv and misc/charlson/charlson_cohort.txt, and fails
+#    if any fold is short of a cohort episode.
 python scripts/compute_charlson_index.py ${DATASET_CONFIG} -w 8 --write_cohort
-```
 
-Writes `misc/charlson/charlson_index.csv` and `misc/charlson/charlson_cohort.txt`.
-
-**2. Generate the configs.** Experiment 18 records the manifest path in `COHORT_EPISODES`, so
-write the manifest first; `run_experiment.py` refuses to start if the file is missing.
-
-```shell
+# 2. Generate the configs. Experiment 28 records the manifest path in COHORT_EPISODES, so
+#    write the manifest first; run_experiment.py refuses to start if the file is missing.
 python scripts/generate_revision_experiments.py
-```
 
-**3. Fit the regression.** One fit per fold on that fold's training split, predicting its
-validation and test splits, in the layout `dump_finetuned_predictions.py` uses.
-
-```shell
+# 3. Fit the regression: one fit per fold on that fold's training split, predicting its
+#    validation and test splits, in the layout dump_finetuned_predictions.py uses.
 python scripts/run_charlson_logistic_regression.py ${DATASET_CONFIG}
-```
 
-**4. Train the control.** Experiment 28 is the peri-stay-only model on the same episodes, and
-it has to be trained like any other experiment.
-
-```shell
+# 4. Train and dump the control, like any other experiment.
 EXPERIMENT_CONFIG=TransEHR2/configs/experiments/experiment28_peristay_charlsonsubset_rev.yaml \
 TASKS=mortality \
     sbatch --array=0-4 SLURM/slurm_run_experiment.sh
-```
-
-```shell
 sbatch --array=0-0 SLURM/slurm_dump_predictions.sh \
     TransEHR2/configs/experiments/experiment28_peristay_charlsonsubset_rev.yaml
-```
 
-**5. Build the table.**
-
-```shell
+# 5. Build the table.
 python scripts/report_results_tables.py --cohorts charlson
 ```
 
-The fit is unpenalized by default, so it is plain maximum likelihood with no regularization
-strength to tune. Its decision threshold is calibrated by the reporter on the validation
-split, exactly as for every other arm. Per-fold coefficients and odds ratios are written to
-`charlson_coefficients.csv` in the experiment directory.
+The fit is unpenalized, so it is plain maximum likelihood with no regularization strength to tune, and its decision threshold is calibrated on the validation split exactly as for every other arm. Per-fold coefficients and odds ratios are written to `charlson_coefficients.csv` in the experiment directory.
 
-Age and sex are read from the extracted `static_data` array, so they are the values the deep
-models receive. Note that the extraction's `Age` is MIMIC-IV `anchor_age` carried onto every
-stay of a patient rather than an age recomputed at each admission.
+Age and sex are read from the extracted `static_data` array, so they are the values the deep models receive. Note that the extraction's `Age` is MIMIC-IV `anchor_age` carried onto every stay of a patient rather than an age recomputed at each admission.
 
 ## Reporting results
 
@@ -250,7 +239,7 @@ This produces one CSV per fold, task and split:
 
 ```
 models/
-└── experiment3_nohistory/
+└── experiment20_peristay_textsubset_rev/
     ├── fold1/
     │   ├── mortality/
     │   │   ├── mortality_train_finetuned_output.csv
@@ -268,9 +257,9 @@ By default the `test` split supplies the reported numbers, and the `val` split i
 
 ### Building tables
 
-Experiment numbers are given in the order their columns should appear, left to right, and one is nominated as the control that every other column is tested against. Numbers are resolved by globbing `experiment{N}_*` under `--model-dir`, so `--experiments 3` finds `experiment3_nohistory`. See `experiment_descriptions.md` for what each number is.
+Experiment numbers are given in the order their columns should appear, left to right, and one is nominated as the control that every other column is tested against. Numbers are resolved by globbing `experiment{N}_*` under `--model-dir`, so `--experiments 20` finds `experiment20_peristay_textsubset_rev`. See `experiment_descriptions.md` for what each number is.
 
-`report_results_tables.py` declares the cohorts, their column order, and the control each is tested against, and writes one document per cohort with a numbered table per task:
+`report_results_tables.py` declares the cohorts — `textsubset`, `historysubset` and `charlson` — with their column order and the control each is tested against, and writes one document per cohort with a numbered table per task:
 
 ```shell
 python scripts/report_results_tables.py
@@ -281,7 +270,7 @@ A task whose predictions have not been dumped is named and skipped rather than a
 Any other set of experiments can be reported by giving them explicitly, in the order their columns should appear:
 
 ```shell
-python scripts/report_results_tables.py --experiments 3 1 2 --control 3 --tasks mortality
+python scripts/report_results_tables.py --experiments 23 22 20 --control 20 --tasks mortality
 ```
 
 Options the script does not define are passed through to the per-task reporter, so the threshold, metric, fold and formatting flags below all still apply:
@@ -302,6 +291,8 @@ t = mean(d) / sqrt((1/n + n_test/n_train) * var(d, ddof=1))
 
 on *n* − 1 degrees of freedom, where *d* holds the per-fold differences. For one run of *k*-fold cross-validation, `n_test/n_train = 1/(k − 1)`.
 
+*k* is a property of the split, not of how many runs finished, so pass `--cv-folds` when a fold is missing from the report: a model still trained on (k−1)/k of the data, and taking *k* from the folds found would make a partial comparison conservative for a reason that has nothing to do with the data.
+
 P values are adjusted with the Benjamini-Hochberg procedure. `--fdr-scope` selects the family: `table` (the default), `row`, or `none`.
 
 ### Decision thresholds
@@ -317,7 +308,7 @@ AUROC and AUPRC are threshold-free and are unaffected by any of this.
 
 ### Option reference
 
-Common to all three scripts:
+`report_results_tables.py` defines `--tasks`, `--cohorts`, `--experiments`, `--control`, `--tables_dir` and `--dry_run`, and passes everything else through to the per-task reporter. `--help` on either lists the full set; the options below are the ones that change what is computed rather than how it is printed.
 
 | Option | Default | Purpose |
 |---|---|---|
@@ -326,19 +317,9 @@ Common to all three scripts:
 | `--model-dir DIR` | `./models` | Directory holding one subdirectory per experiment |
 | `--split SPLIT` | `test` | Split to report |
 | `--folds FOLD [FOLD ...]` | auto-discover | Restrict to a common set of folds |
-| `--metrics KEY [KEY ...]` | task default | Select and reorder rows |
-| `--list-metrics` | off | Print the available metric keys and exit |
-| `--precision N` | `3` | Decimal places for means and standard errors |
-| `--alpha A` | `0.05` | Significance level, for the 3-decimal-place P value rule |
+| `--cv-folds N` | folds found | Folds the *design* has, which sets `n_test/n_train` in the correction. Not the number averaged over: a model still trains on (k−1)/k of the data when one fold's run is missing. |
 | `--fdr-scope {table,row,none}` | `table` | Family for the Benjamini-Hochberg adjustment |
-| `--show-raw-p` | off | Report the unadjusted P value as well |
-| `--table-number N` | `1` | Table number used in the caption |
-| `--caption TEXT` | per task | Caption, without the "Table N." prefix |
-| `--labels PATH` | `reporting_labels.yaml` | Column heading definitions |
-| `--output PATH` | none | Word document to write |
-| `--append` | off | Add to `--output` instead of replacing it |
-| `--stats-csv PATH` | none | Per-fold values and test statistics |
-| `--quiet` | off | Suppress the statistical detail block |
+| `--metrics KEY [KEY ...]` | task default | Select and reorder rows (`--list-metrics` prints the keys) |
 
 Classification tasks only (`--tasks mortality`, `--tasks phenotype`):
 
@@ -346,12 +327,9 @@ Classification tasks only (`--tasks mortality`, `--tasks phenotype`):
 |---|---|---|
 | `--threshold {prevalence,FLOAT}` | `prevalence` | How probabilities become class labels |
 | `--calibration-split SPLIT` | `val` | Split the threshold is calibrated on |
+| `--phenotype-threshold-scope {per-label,global}` | `per-label` | One threshold per label, or one shared (`--tasks phenotype` only) |
 
-`--tasks phenotype` only:
-
-| Option | Default | Purpose |
-|---|---|---|
-| `--phenotype-threshold-scope {per-label,global}` | `per-label` | One threshold per label, or one shared |
+Output and formatting — `--output`, `--append`, `--stats-csv`, `--precision`, `--alpha`, `--show-raw-p`, `--table-number`, `--caption`, `--labels`, `--quiet` — behave as their names suggest; see `--help`.
 
 ### Troubleshooting
 
@@ -367,6 +345,6 @@ Classification tasks only (`--tasks mortality`, `--tasks phenotype`):
 
 ## Distributed training is unsupported
 
-`run_experiment_accelerate.py`, `tune_hyperparameters_accelerate.py`, `accelerate_config_ddp.yaml` and `accelerate_config_fsdp.yaml` are present in the repository but are **not currently supported and should not be expected to work as-is.** They have not been kept in step with the single-GPU path, and no part of the workflow above depends on them.
+`scripts/run_experiment_accelerate.py`, `scripts/tune_hyperparameters_accelerate.py` and the two `TransEHR2/configs/accelerate_config_*.yaml` files are present in the repository but are **not currently supported and should not be expected to work as-is.** They have not been kept in step with the single-GPU path, and no part of the workflow above depends on them.
 
-Use `run_experiment.py`. Work is spread across GPUs by running independent jobs — one per fold, task, or configuration file — rather than by distributing a single run.
+Use `scripts/run_experiment.py`. Work is spread across GPUs by running independent jobs — one per fold, task, or configuration file — rather than by distributing a single run.
