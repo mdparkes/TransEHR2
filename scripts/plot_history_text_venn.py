@@ -275,16 +275,32 @@ def ring_label(ax, value: int, inner_r: float, outer_r: float, side: int) -> boo
     return True
 
 
-def draw(counts: dict, output: str, title: str, dpi: int = 300) -> None:
+# Inches per side in square mode, and the resolution that goes with it. The two are separated
+# so that a pixel size divides into an exact inch size: 150 dpi puts 1200 px at 8 inches, where
+# 10 pt type is 1.7% of the figure's height -- the proportion the default layout has.
+SQUARE_DPI = 150
+
+
+def draw(counts: dict, output: str, title: str, dpi: int = 300,
+         size_px: int = None) -> None:
     """Render the Euler diagram and write it to `output`.
 
     Args:
         counts: Region counts from `region_counts`.
         output: Destination path; the extension picks the format.
         title: Figure title.
-        dpi: Raster resolution. Ignored for a vector format. 300 is the usual journal
-            minimum for a raster figure; 600 is worth it for line art, which this is.
+        dpi: Raster resolution. Ignored for a vector format and when `size_px` is given. 300
+            is the usual journal minimum for a raster figure; 600 is worth it for line art,
+            which this is.
+        size_px: Side of a square raster, in pixels, for a journal that specifies one. The
+            diagram is taller than it is wide, so a square canvas pads it at the sides rather
+            than cropping or stretching it.
     """
+    if size_px:
+        side = size_px / SQUARE_DPI
+        figsize, dpi = (side, side), SQUARE_DPI
+    else:
+        figsize = (7.0, 7.6)
     n_all, n_history, n_text = counts['all'], counts['history'], counts['text']
     n_sum, n_diag, n_all_text = counts['summary'], counts['diagnosis'], counts['all_text']
 
@@ -292,7 +308,7 @@ def draw(counts: dict, output: str, title: str, dpi: int = 300) -> None:
     all_r, history_r = geometry['all_r'], geometry['history_r']
     (x_sum, r_sum), (x_diag, r_diag) = geometry['summary'], geometry['diagnosis']
 
-    fig, ax = plt.subplots(figsize=(7.0, 7.6))
+    fig, ax = plt.subplots(figsize=figsize)
     cohort = plt.Circle((0, 0), all_r, facecolor=ALL_COLOUR, alpha=0.16,
                         edgecolor=HISTORY_COLOUR, linewidth=1.4)
     history = plt.Circle((0, 0), history_r, facecolor=HISTORY_COLOUR, alpha=0.20,
@@ -452,6 +468,10 @@ def main(argv=None):
                         help='Figure path; the extension picks the format')
     parser.add_argument('--csv', default=None, help='Also write the counts to this CSV')
     parser.add_argument('--title', default='', help='Figure title (default: none)')
+    parser.add_argument('--size-px', type=int, default=None,
+                        help='Write a square raster this many pixels on a side, for a journal '
+                             'that specifies one. Overrides --dpi. The diagram is taller than '
+                             'it is wide, so a square canvas gains padding at the sides.')
     parser.add_argument('--dpi', type=int, default=300,
                         help='Raster resolution, ignored for a vector format. 300 '
                              'is the usual journal minimum; 600 is worth it for '
@@ -481,7 +501,7 @@ def main(argv=None):
         print(f'Wrote {args.csv}')
 
     if not args.no_figure:
-        draw(counts, args.output, args.title, args.dpi)
+        draw(counts, args.output, args.title, args.dpi, args.size_px)
     return 0
 
 
