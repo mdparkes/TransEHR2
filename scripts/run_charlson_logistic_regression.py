@@ -5,25 +5,25 @@ A logistic regression on three features -- age at admission, sex, and the Charls
 index of the most recent earlier hospital admission -- fitted per fold on that fold's training
 split and applied to its validation and test splits. The predictions are written in the layout
 `dump_finetuned_predictions.py` uses, so the existing reporter treats this arm as one more
-column and the corrected resampled t test compares it against the peri-stay-only model without
-any special case:
+column and the corrected resampled t test compares it against the TransEHR2 arms on the same
+episodes without any special case:
 
-    python scripts/report_results_tables.py --tasks mortality --cohorts charlson
+    python scripts/report_results_tables.py --tasks mortality --cohorts charlson charlson_history
 
 Cohort and row order
 --------------------
-The cohort is the episode manifest `compute_charlson_index.py --write_cohort` writes: exactly
-those episodes for which all three features exist. Both arms are given that one file -- this
-one here, the peri-stay-only control through `COHORT_EPISODES` in its experiment config -- and
-both resolve it through the same `load_dataset(..., cohort_episodes=...)` call, which selects
-rows by patient-episode ID in ascending array order. Row `i` of a prediction CSV is therefore
-the same episode in both arms, which is what the paired test requires.
+The cohort is the episode manifest `compute_charlson_index.py --write_cohort` writes: episodes
+for which all three features exist, restricted with `--cohort diagnosis_history` to those that
+also carry a pre-admission discharge diagnosis record in the arrays. Every arm is given that
+one file -- this one here, the TransEHR2 arms through `COHORT_EPISODES` in their experiment
+configs -- and all resolve it through the same `load_dataset(..., cohort_episodes=...)` call,
+which selects rows by patient-episode ID in ascending array order. Row `i` of a prediction CSV
+is therefore the same episode in every arm, which is what the paired test requires.
 
 A manifest is used rather than a predicate over the arrays because membership depends on
 something the arrays do not carry: whether the index could be computed from `diagnoses.csv`.
-The array-side proxy `diagnosis_history` answers a different question -- whether the *text* of
-an earlier admission's diagnoses survived extraction -- which neither arm reads, and which
-excludes episodes whose codes are perfectly available.
+The array-side restriction is what lets a history-only arm, which reads the diagnosis text,
+run on the same episodes as the regression.
 
 Features
 --------
@@ -44,7 +44,7 @@ Usage:
     python scripts/run_charlson_logistic_regression.py TransEHR2/configs/datasets/mimic4.yaml
     python scripts/run_charlson_logistic_regression.py TransEHR2/configs/datasets/mimic4.yaml \
         --charlson_csv misc/charlson/charlson_index.csv \
-        --cohort_episodes misc/charlson/charlson_cohort.txt --model_dir models
+        --cohort_episodes misc/charlson/charlson_diagnosis_history_cohort.txt --model_dir models
     python scripts/run_charlson_logistic_regression.py TransEHR2/configs/datasets/mimic4.yaml \
         --class_weight balanced --penalty l2
 """
@@ -70,9 +70,9 @@ from TransEHR2.data.statics import decode_categorical, static_offsets
 
 TASK = 'mortality'
 SPLITS = ('train', 'val', 'test')
-DEFAULT_EXPERIMENT = 'experiment29_charlson_logreg_charlsonsubset_rev'
+DEFAULT_EXPERIMENT = 'experiment32_charlson_logreg_diagnosissubset'
 DEFAULT_CHARLSON_CSV = os.path.join('misc', 'charlson', 'charlson_index.csv')
-DEFAULT_COHORT = os.path.join('misc', 'charlson', 'charlson_cohort.txt')
+DEFAULT_COHORT = os.path.join('misc', 'charlson', 'charlson_diagnosis_history_cohort.txt')
 
 
 # ---------------------------------------------------------------------------
@@ -159,16 +159,16 @@ def load_split(data_dir, fold, split, charlson, offsets, category_map, manifest,
         return None
 
     # The cohort is applied by the loader, so `episode_indices` is exactly the row subset and
-    # order that the peri-stay-only control's inference loader produces for this partition.
-    # The manifest is what the control arm is also given, so both select the same rows in the
-    # same order and the reporter can pair them by position.
+    # order that the TransEHR2 arms' inference loader produces for this partition. The manifest
+    # is what those arms are also given, so all select the same rows in the same order and the
+    # reporter can pair them by position.
     dataset = load_dataset(base, cohort_episodes=manifest,
                            extracted_history_len_steps=extracted_history_len_steps)
     rows = dataset.episode_indices
     if rows is None:
         raise ValueError(
             f'{fold}/{split}: the loader applied no cohort, so the rows cannot be matched to '
-            f'the control arm. The episode manifest should have selected a subset.'
+            f'the TransEHR2 arms. The episode manifest should have selected a subset.'
         )
 
     ids_path = os.path.join(data_dir, fold, f'{split}_ids.pkl')
@@ -196,7 +196,7 @@ def load_split(data_dir, fold, split, charlson, offsets, category_map, manifest,
             f'Charlson index: {shown}{more}. The manifest is supposed to name only episodes '
             f'that have one, so it and the index table are out of step -- rewrite it with '
             f'compute_charlson_index.py --write_cohort. Dropping the episodes is not an '
-            f'option, because it would break the row correspondence with the control arm '
+            f'option, because it would break the row correspondence with the TransEHR2 arms '
             f'that the paired test relies on.'
         )
 
@@ -319,7 +319,7 @@ def main(argv=None):
                              f'(default: {DEFAULT_CHARLSON_CSV})')
     parser.add_argument('--cohort_episodes', default=DEFAULT_COHORT,
                         help=f'Episode manifest written by compute_charlson_index.py '
-                             f'--write_cohort. Must be the same file the control arm names in '
+                             f'--write_cohort. Must be the same file the TransEHR2 arms name in '
                              f'COHORT_EPISODES (default: {DEFAULT_COHORT})')
     parser.add_argument('--model_dir', default='models',
                         help='Directory holding one subdirectory per experiment '
@@ -367,7 +367,8 @@ def main(argv=None):
     if not os.path.exists(args.cohort_episodes):
         raise SystemExit(
             f'{args.cohort_episodes} does not exist. Write it with compute_charlson_index.py '
-            f'--write_cohort; it is what puts this arm and the control on the same episodes.'
+            f'--write_cohort; it is what puts this arm and the TransEHR2 arms on the same '
+            f'episodes.'
         )
     cohort = load_episode_manifest(args.cohort_episodes)
     print(f'Cohort: {len(cohort)} episodes from {args.cohort_episodes}')

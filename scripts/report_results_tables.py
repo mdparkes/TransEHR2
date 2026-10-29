@@ -54,8 +54,15 @@ COHORTS = (
      'patients with at least one pre-admission record',
      (25, 26, 27), 25, None),
     ('charlson',
-     'patients with a Charlson comorbidity index from an earlier hospital admission',
-     (28, 29), 28, ('mortality',)),
+     'patients with at least one set of pre-admission discharge diagnoses',
+     (30, 32, 31), 30, ('mortality',)),
+    # The same three arms, with the history-only model as the reference, so the regression is
+    # tested against a model reading the same earlier admissions rather than against peri-stay
+    # records.
+    ('charlson_history',
+     'patients with at least one set of pre-admission discharge diagnoses, history-only '
+     'reference',
+     (31, 32), 31, ('mortality',)),
 )
 
 COHORT_KEYS = tuple(key for key, *_ in COHORTS)
@@ -109,7 +116,7 @@ def main(argv=None):
     parser.add_argument('--tasks', nargs='+', choices=TASKS, default=list(TASKS),
                         help='Tasks to report (default: all three)')
     parser.add_argument('--cohorts', nargs='+', choices=COHORT_KEYS, default=list(COHORT_KEYS),
-                        help='Cohorts to report (default: both)')
+                        help='Cohorts to report (default: all)')
     parser.add_argument('--experiments', nargs='+', type=int, default=None,
                         help='Report these experiments instead of a declared cohort, in the '
                              'order their columns should appear')

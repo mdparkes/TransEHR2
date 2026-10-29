@@ -19,7 +19,7 @@ import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from generate_redo_configs import CHARLSON_EXPERIMENT, EXPERIMENTS, experiment_name
+from generate_redo_configs import CHARLSON_EXPERIMENTS, EXPERIMENTS, experiment_name
 
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -74,20 +74,37 @@ def test_the_coordinator_trains_every_generated_experiment(coordinator):
 
 
 def test_the_regression_arm_is_not_submitted_as_a_training_job(coordinator):
-    """Experiment 29 has no config and no model; a training task for it would fail every
+    """Experiment 32 has no config and no model; a training task for it would fail every
     fold, and its column comes from the regression the report job runs."""
     match = re.search(r'^EXPERIMENTS=\(([^)]*)\)', coordinator, re.M)
-    assert 29 not in [int(n) for n in match.group(1).split()]
+    assert 32 not in [int(n) for n in match.group(1).split()]
     assert 'run_charlson_logistic_regression.py' in commands(read(REPORT_JOB))
 
 
 def test_the_charlson_list_is_written_before_the_training_is_submitted(coordinator):
-    """Experiment 28 reads COHORT_EPISODES at load time, so a list written by the report job
-    would be too late -- the training would already have run on every episode."""
+    """Experiments 30 and 31 read COHORT_EPISODES at load time, so a list written by the
+    report job would be too late -- the training would already have run on every episode."""
     index_at = coordinator.index('compute_charlson_index.py')
     submit_at = coordinator.index('--array="0-$((N_FOLDS - 1))')
     assert index_at < submit_at
-    assert str(CHARLSON_EXPERIMENT) in coordinator
+    for number in CHARLSON_EXPERIMENTS:
+        assert str(number) in coordinator
+
+
+def test_the_charlson_list_is_restricted_and_its_size_checked(coordinator):
+    """Without the restriction the list is every episode with an index, which is not the
+    population the history-only arm can read; without the size check a drifted list trains."""
+    assert '--cohort "${CHARLSON_COHORT}"' in coordinator
+    assert 'CHARLSON_COHORT="diagnosis_history"' in coordinator
+    assert '--expect_n "${CHARLSON_EXPECT_N}"' in coordinator
+
+
+def test_the_regression_reads_the_list_the_training_reads(coordinator, report_job):
+    """Rows pair across arms by position, so the regression has to select by the same file."""
+    assert 'CHARLSON_EPISODES="${CHARLSON_DIR}/charlson_${CHARLSON_COHORT}_cohort.txt"' \
+        in coordinator
+    assert 'charlson_diagnosis_history_cohort.txt' in report_job
+    assert '--cohort_episodes "${CHARLSON_EPISODES}"' in report_job
 
 
 # ------------------------------------------------------------------------------------------
@@ -320,7 +337,8 @@ def test_the_report_job_stops_when_the_model_tree_is_absent(report_job):
 
 def test_the_charlson_paths_are_named_rather_than_defaulted(coordinator):
     """compute_charlson_index writes to its own default when --write_cohort is bare, which
-    agrees with CHARLSON_DIR only by coincidence; experiment 28 reads the path this names."""
+    agrees with CHARLSON_DIR only by coincidence; experiments 30 and 31 read the path this
+    names."""
     assert '--write_cohort "${CHARLSON_EPISODES}"' in coordinator
     assert '--output "${CHARLSON_CSV}"' in coordinator
 
