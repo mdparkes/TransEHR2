@@ -212,9 +212,10 @@ python scripts/generate_redo_configs.py --history_len_steps 500 --only 30 31
 #    validation and test splits, in the layout dump_finetuned_predictions.py uses.
 python scripts/run_charlson_logistic_regression.py ${DATASET_CONFIG}
 
-# 4. Train and dump the TransEHR2 arms, like any other experiment.
+# 4. Train and dump the TransEHR2 arms. Only mortality is reported, so only it is finetuned;
+#    the dumper skips a task with no finetuned weights.
 for CONFIG in TransEHR2/configs/experiments/experiment3{0,1}_*.yaml; do
-    EXPERIMENT_CONFIG=${CONFIG} sbatch --array=0-4 SLURM/slurm_run_experiment.sh
+    EXPERIMENT_CONFIG=${CONFIG} TASKS=mortality sbatch --array=0-4 SLURM/slurm_run_experiment.sh
     sbatch --array=0-0 SLURM/slurm_dump_predictions.sh ${CONFIG}
 done
 
@@ -223,7 +224,7 @@ done
 python scripts/report_results_tables.py --cohorts charlson charlson_history
 ```
 
-`run_redo.sh` does all of this; `ONLY="30 31" ./run_redo.sh launch` trains and dumps just these two arms.
+`run_table1.sh launch` does all of this and nothing else: it writes only these two configs, trains and dumps only these two arms, and its report job builds only the two `charlson` documents.
 
 The fit is unpenalized, so it is plain maximum likelihood with no regularization strength to tune, and its decision threshold is calibrated on the validation split exactly as for every other arm. Per-fold coefficients and odds ratios are written to `charlson_coefficients.csv` in the experiment directory.
 
