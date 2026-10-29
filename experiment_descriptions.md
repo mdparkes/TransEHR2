@@ -52,7 +52,7 @@ record of what that run reported.
 32 is not a TransEHR2 run. It is a logistic regression on age at admission, sex and the
 Charlson comorbidity index of the patient's most recent earlier hospital admission, fitted by
 `run_charlson_logistic_regression.py` on the index that `compute_charlson_index.py` computes.
-30 and 31 are compared against it: the same peri-stay-only model as 20 and 25, and the same
+30 and 31 are each tested against it: the same peri-stay-only model as 20 and 25, and the same
 history-only model with text as 21 and 26, on the same episodes.
 
 Their cohort is not one of the named predicates. It is the episode manifest

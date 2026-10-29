@@ -191,7 +191,7 @@ For a factorial sweep, where trials are cells of a grid rather than one-at-a-tim
 
 ## Charlson comorbidity baseline
 
-Experiment 32 is a logistic regression on age at admission, sex and the Charlson comorbidity index, a conventional severity-score reference for in-hospital mortality. It is reported against two TransEHR2 arms on the same episodes: experiment 30 reads peri-stay records only, and experiment 31 reads historical records only, with text. The index is that of the patient's most recent earlier hospital admission.
+Experiment 32 is a logistic regression on age at admission, sex and the Charlson comorbidity index, a conventional severity-score reference for in-hospital mortality. Two TransEHR2 arms are tested against it on the same episodes: experiment 30 reads peri-stay records only, and experiment 31 reads historical records only, with text. The index is that of the patient's most recent earlier hospital admission.
 
 **The cohort is an explicit episode manifest, and every arm is given the same file.** An episode belongs to the comparison when all three features exist (an index, an age and a sex) and it carries at least one pre-admission discharge diagnosis record in the extracted arrays, which is the `diagnosis_history` cohort. The first condition is not a predicate over the arrays, because whether the index could be computed depends on `diagnoses.csv`. The second is what the history-only arm reads, so without it that arm would run on episodes whose earlier diagnoses it cannot see. All arms resolve the one file by patient-episode ID through the same loader, so they select identical episodes in identical order, which is what the paired test needs.
 
@@ -219,12 +219,12 @@ for CONFIG in TransEHR2/configs/experiments/experiment3{0,1}_*.yaml; do
     sbatch --array=0-0 SLURM/slurm_dump_predictions.sh ${CONFIG}
 done
 
-# 5. Build the tables: every arm against the peri-stay-only model, and the regression
-#    against the history-only model.
-python scripts/report_results_tables.py --cohorts charlson charlson_history
+# 5. Build the table: the peri-stay-only and history-only models, each against the
+#    regression.
+python scripts/report_results_tables.py --cohorts charlson
 ```
 
-`run_table1.sh launch` does all of this and nothing else: it writes only these two configs, trains and dumps only these two arms, and its report job builds only the two `charlson` documents.
+`run_table1.sh launch` does all of this and nothing else: it writes only these two configs, trains and dumps only these two arms, and its report job builds only the `charlson` document.
 
 The fit is unpenalized, so it is plain maximum likelihood with no regularization strength to tune, and its decision threshold is calibrated on the validation split exactly as for every other arm. Per-fold coefficients and odds ratios are written to `charlson_coefficients.csv` in the experiment directory.
 
@@ -264,7 +264,7 @@ By default the `test` split supplies the reported numbers, and the `val` split i
 
 Experiment numbers are given in the order their columns should appear, left to right, and one is nominated as the control that every other column is tested against. Numbers are resolved by globbing `experiment{N}_*` under `--model-dir`, so `--experiments 20` finds `experiment20_peristay_textsubset_rev`. See `experiment_descriptions.md` for what each number is.
 
-`report_results_tables.py` declares the cohorts — `textsubset`, `historysubset`, `charlson` and `charlson_history` — with their column order and the control each is tested against, and writes one document per cohort with a numbered table per task:
+`report_results_tables.py` declares the cohorts — `textsubset`, `historysubset` and `charlson` — with their column order and the control each is tested against, and writes one document per cohort with a numbered table per task:
 
 ```shell
 python scripts/report_results_tables.py

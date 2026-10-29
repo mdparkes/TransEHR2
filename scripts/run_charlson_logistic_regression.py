@@ -8,7 +8,7 @@ split and applied to its validation and test splits. The predictions are written
 column and the corrected resampled t test compares it against the TransEHR2 arms on the same
 episodes without any special case:
 
-    python scripts/report_results_tables.py --tasks mortality --cohorts charlson charlson_history
+    python scripts/report_results_tables.py --tasks mortality --cohorts charlson
 
 Cohort and row order
 --------------------

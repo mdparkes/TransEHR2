@@ -79,7 +79,7 @@ def test_a_dump_waits_for_its_training_to_succeed(launcher):
 def test_the_report_job_builds_table_1_and_nothing_else(report_job):
     scripts = set(re.findall(r'scripts/(\w+\.py)', report_job))
     assert scripts == {'run_charlson_logistic_regression.py', 'report_results_tables.py'}
-    assert set(re.findall(r'--cohorts (\w+)', report_job)) == {'charlson', 'charlson_history'}
+    assert re.findall(r'--cohorts (\w+)', report_job) == ['charlson']
 
 
 def test_the_regression_reads_the_list_the_training_reads(launcher, report_job):

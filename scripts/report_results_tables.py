@@ -6,9 +6,10 @@ task's metrics, compares every experiment against a nominated control with the c
 resampled t test of Nadeau & Bengio (2003), controls the false discovery rate with the
 Benjamini-Hochberg procedure, and writes a numbered table per task.
 
-The experiments split into cohorts, each reported against its own peri-stay-only control:
-every model in a set is compared with the one that reads no pre-admission data at all, which is
-the contrast the tables exist to make. Column order and control are properties of the design, so
+The experiments split into cohorts, each reported against its own control. In the text and
+history cohorts that is the peri-stay-only model, the one that reads no pre-admission data at
+all. In the Charlson cohort it is the Charlson regression, the conventional reference both
+TransEHR2 arms are measured against. Column order and control are properties of the design, so
 they are declared below rather than retyped per run.
 
 A cohort may also declare which tasks it reports. The Charlson arm is a logistic regression on
@@ -53,16 +54,10 @@ COHORTS = (
     ('historysubset',
      'patients with at least one pre-admission record',
      (25, 26, 27), 25, None),
+    # The peri-stay-only and history-only models, each tested against the Charlson regression.
     ('charlson',
      'patients with at least one set of pre-admission discharge diagnoses',
-     (30, 32, 31), 30, ('mortality',)),
-    # The same three arms, with the history-only model as the reference, so the regression is
-    # tested against a model reading the same earlier admissions rather than against peri-stay
-    # records.
-    ('charlson_history',
-     'patients with at least one set of pre-admission discharge diagnoses, history-only '
-     'reference',
-     (31, 32), 31, ('mortality',)),
+     (32, 30, 31), 32, ('mortality',)),
 )
 
 COHORT_KEYS = tuple(key for key, *_ in COHORTS)
