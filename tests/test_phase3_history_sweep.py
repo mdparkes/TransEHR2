@@ -77,13 +77,33 @@ def sweep(tmp_path_factory):
 # Shape
 # ------------------------------------------------------------------------------------------
 
-def test_sweep_is_six_history_arms_plus_one_ablation(sweep):
+def named_extra(manifest, name):
+    """The extra trial called `name`.
+
+    Selecting by name rather than by position, because the extras are no longer a single
+    ablation: four of them are the noise-floor repeats and one is the shared-ladder
+    comparison, and a positional lookup would silently test whichever happened to be first.
+    """
+    matches = [t for t in extra_trials(manifest) if t['name'].endswith(name)]
+    assert len(matches) == 1, f'expected one extra trial matching {name!r}, got {matches}'
+    return matches[0]
+
+
+def noise_trials(manifest):
+    """The seeded repeats of the centre, in seed order."""
+    return sorted((t for t in extra_trials(manifest) if 'noise_seed' in t['name']),
+                  key=lambda t: t['name'])
+
+
+def test_sweep_is_six_history_arms_plus_five_extras(sweep):
     manifest = sweep['manifest']
-    assert len(manifest['trials']) == 7
+    assert len(manifest['trials']) == 11
     # Every trial is selected on mortality, so the two stages are the same width.
-    assert len(pretrain_trials(manifest)) == 7
-    assert len(finetune_trials(manifest)) == 7
-    assert len(extra_trials(manifest)) == 1
+    assert len(pretrain_trials(manifest)) == 11
+    assert len(finetune_trials(manifest)) == 11
+    # Four seeded repeats for the noise floor, plus the shared-ladder ablation.
+    assert len(extra_trials(manifest)) == 5
+    assert len(noise_trials(manifest)) == 4
 
 
 def test_every_history_arm_from_the_spec_is_present(sweep):
@@ -141,7 +161,7 @@ def test_ablation_differs_from_the_centre_in_exactly_one_setting(sweep):
     """A head-to-head is only a head-to-head if nothing else moved."""
     manifest = sweep['manifest']
     centre = next(t for t in manifest['trials'] if t['is_centre'])
-    ablation = extra_trials(manifest)[0]
+    ablation = named_extra(manifest, 'sharedladder')
 
     centre_config = yaml.safe_load(open(centre['config']))
     ablation_config = yaml.safe_load(open(ablation['config']))
@@ -166,7 +186,7 @@ def test_ablation_puts_the_event_stream_on_the_value_ladder(sweep):
     manifest = sweep['manifest']
     centre = yaml.safe_load(open(
         next(t for t in manifest['trials'] if t['is_centre'])['config']))
-    ablation = yaml.safe_load(open(extra_trials(manifest)[0]['config']))
+    ablation = yaml.safe_load(open(named_extra(manifest, 'sharedladder')['config']))
 
     assert centre['EVENT_LADDER_P_MAX'] < centre['VALUE_LADDER_P_MAX'], (
         'the centre no longer runs a narrowed event ladder, so this ablation is pointed the '
@@ -175,6 +195,69 @@ def test_ablation_puts_the_event_stream_on_the_value_ladder(sweep):
     assert ablation['EVENT_LADDER_P_MAX'] == ablation['VALUE_LADDER_P_MAX'], (
         'the ablation must put the event stream on the value stream ladder'
     )
+
+
+# ------------------------------------------------------------------------------------------
+# The noise floor
+# ------------------------------------------------------------------------------------------
+
+def test_every_repeat_differs_from_the_centre_in_the_seeds_alone(sweep):
+    """The floor measures run-to-run variance, which it only does if nothing else varies.
+
+    A repeat that moved any other setting would measure that setting instead, and the sweep's
+    spread would then be compared against the wrong scale -- the one number the conclusion
+    rests on.
+    """
+    manifest = sweep['manifest']
+    centre = yaml.safe_load(open(
+        next(t for t in manifest['trials'] if t['is_centre'])['config']))
+
+    for trial in noise_trials(manifest):
+        config = yaml.safe_load(open(trial['config']))
+        differing = {
+            key for key in set(centre) | set(config)
+            if centre.get(key) != config.get(key)
+        }
+        assert differing == {'EXPERIMENT_NAME', 'PRETRAIN_SEED', 'FINETUNE_SEED'}, (
+            f'{trial["name"]} also moves {sorted(differing - {"EXPERIMENT_NAME"})}; a repeat '
+            f'must differ from the centre in the seeds alone'
+        )
+
+
+def test_both_stages_are_seeded_in_every_repeat(sweep):
+    """Seeding one stage would measure half the variance.
+
+    run_experiment.py calls set_seed before pretraining and again before each finetune, so a
+    finetune is determined by its own seed and the encoder it starts from. A repeat that
+    varied only PRETRAIN_SEED would hold the finetune draws fixed and understate the floor.
+    """
+    for trial in noise_trials(sweep['manifest']):
+        config = yaml.safe_load(open(trial['config']))
+        assert config['PRETRAIN_SEED'] == config['FINETUNE_SEED'], (
+            f'{trial["name"]} seeds the two stages differently, which is harmless but not '
+            f'what the spec describes'
+        )
+
+
+def test_the_centre_is_the_fifth_repeat(sweep):
+    """Five values come from four extra runs, because the centre is one of them.
+
+    The repeats sit at the uncropped condition, which is the 500 arm, so the arm supplies the
+    seed-0 draw. If the seeds ever collide the floor would be estimated from four distinct
+    runs while being reported as five.
+    """
+    manifest = sweep['manifest']
+    centre = yaml.safe_load(open(
+        next(t for t in manifest['trials'] if t['is_centre'])['config']))
+    seeds = [centre['PRETRAIN_SEED']]
+    for trial in noise_trials(manifest):
+        config = yaml.safe_load(open(trial['config']))
+        assert config['HISTORY_LEN_STEPS'] == centre['HISTORY_LEN_STEPS'], (
+            f'{trial["name"]} does not sit at the centre\'s history length, so it is not a '
+            f'repeat of it'
+        )
+        seeds.append(config['PRETRAIN_SEED'])
+    assert len(set(seeds)) == len(seeds) == 5, f'expected five distinct seeds, got {seeds}'
 
 
 def test_ablation_cannot_win_a_ranking_even_with_the_best_score(sweep):

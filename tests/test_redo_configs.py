@@ -21,7 +21,7 @@ import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from generate_redo_configs import (CHARLSON_EXPERIMENT, EXPERIMENTS, build, load_base)
+from generate_redo_configs import (CHARLSON_EXPERIMENTS, EXPERIMENTS, build, load_base)
 
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -152,22 +152,31 @@ def test_the_cohorts_are_the_three_the_tables_report(configs):
         assert cohort in COHORTS
 
 
-def test_only_the_charlson_control_is_selected_by_an_episode_list(configs):
+def test_only_the_charlson_arms_are_selected_by_an_episode_list(configs):
     """`COHORT_EPISODES` overrides the cohort predicate, so one left on another experiment
     would quietly shrink it to the Charlson population."""
     for number, config in configs.items():
-        if number == CHARLSON_EXPERIMENT:
+        if number in CHARLSON_EXPERIMENTS:
             assert config.get('COHORT_EPISODES')
             assert 'COHORT_SUBSET' not in config, (
-                'the Charlson control names both a cohort and an episode list'
+                f'experiment{number} names both a cohort and an episode list'
             )
         else:
             assert 'COHORT_EPISODES' not in config, f'experiment{number} names an episode list'
 
 
-def test_the_charlson_control_matches_the_other_peri_stay_only_models(configs):
-    """Table 1 compares it against a regression, and Tables 2 and the supplement compare the
-    same design against history arms. It has to be the same model on a different population."""
-    charlson = [bool(configs[CHARLSON_EXPERIMENT][key]) for key in SWITCHES]
-    assert charlson == [bool(configs[20][key]) for key in SWITCHES]
-    assert charlson == [bool(configs[25][key]) for key in SWITCHES]
+def test_the_charlson_arms_share_one_episode_list(configs):
+    """They are compared with each other and with the regression by paired test, which needs
+    identical episodes in identical order."""
+    lists = {configs[number]['COHORT_EPISODES'] for number in CHARLSON_EXPERIMENTS}
+    assert len(lists) == 1
+
+
+@pytest.mark.parametrize('number,same_as', [(30, (20, 25)), (31, (21, 26))])
+def test_the_charlson_arms_match_the_same_designs_in_the_other_cohorts(configs, number,
+                                                                       same_as):
+    """30 is the peri-stay-only model and 31 the history-only model with text. Each has to be
+    the same model as its counterpart in the other tables, on a different population."""
+    switches = [bool(configs[number][key]) for key in SWITCHES]
+    for other in same_as:
+        assert switches == [bool(configs[other][key]) for key in SWITCHES]

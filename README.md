@@ -191,35 +191,40 @@ For a factorial sweep, where trials are cells of a grid rather than one-at-a-tim
 
 ## Charlson comorbidity baseline
 
-Experiment 29 is a logistic regression on age at admission, sex and the Charlson comorbidity index, reported against experiment 28 — a peri-stay-only model on the same episodes — as a conventional-severity-score reference for in-hospital mortality. The index is that of the patient's most recent earlier hospital admission.
+Experiment 32 is a logistic regression on age at admission, sex and the Charlson comorbidity index, a conventional severity-score reference for in-hospital mortality. Two TransEHR2 arms are tested against it on the same episodes: experiment 30 reads peri-stay records only, and experiment 31 reads historical records only, with text. The index is that of the patient's most recent earlier hospital admission.
 
-**The cohort is an explicit episode manifest, and both arms are given the same file.** An episode belongs to the comparison exactly when all three features exist: an index, an age and a sex. That is not a predicate over the extracted arrays, because whether the index could be computed depends on `diagnoses.csv`. Both arms resolve the one file by patient-episode ID through the same loader, so they select identical episodes in identical order, which is what the paired test needs. Do not substitute the `diagnosis_history` cohort: it asks whether the *text* of an earlier admission's diagnoses survived extraction, which neither arm reads, and it excludes episodes whose codes are perfectly available.
+**The cohort is an explicit episode manifest, and every arm is given the same file.** An episode belongs to the comparison when all three features exist (an index, an age and a sex) and it carries at least one pre-admission discharge diagnosis record in the extracted arrays, which is the `diagnosis_history` cohort. The first condition is not a predicate over the arrays, because whether the index could be computed depends on `diagnoses.csv`. The second is what the history-only arm reads, so without it that arm would run on episodes whose earlier diagnoses it cannot see. All arms resolve the one file by patient-episode ID through the same loader, so they select identical episodes in identical order, which is what the paired test needs.
 
 ```shell
 # 1. Score the earlier admissions and write the cohort manifest. Reads stays.csv and
-#    diagnoses.csv per subject, then intersects with the episodes that have an age and a sex.
-#    Writes misc/charlson/charlson_index.csv and misc/charlson/charlson_cohort.txt, and fails
-#    if any fold is short of a cohort episode.
-python scripts/compute_charlson_index.py ${DATASET_CONFIG} -w 8 --write_cohort
+#    diagnoses.csv per subject, then intersects with the episodes that have an age, a sex and
+#    a pre-admission diagnosis record. Fails if the manifest does not name exactly
+#    --expect_n episodes, or if any fold is short of a cohort episode.
+python scripts/compute_charlson_index.py ${DATASET_CONFIG} -w 8 \
+    --write_cohort misc/charlson/charlson_diagnosis_history_cohort.txt \
+    --cohort diagnosis_history --expect_n 4808
 
-# 2. Generate the configs. Experiment 28 records the manifest path in COHORT_EPISODES, so
-#    write the manifest first; run_experiment.py refuses to start if the file is missing.
-python scripts/generate_revision_experiments.py
+# 2. Generate the configs. Experiments 30 and 31 record the manifest path in COHORT_EPISODES,
+#    so write the manifest first; run_experiment.py refuses to start if the file is missing.
+python scripts/generate_redo_configs.py --history_len_steps 500 --only 30 31
 
 # 3. Fit the regression: one fit per fold on that fold's training split, predicting its
 #    validation and test splits, in the layout dump_finetuned_predictions.py uses.
 python scripts/run_charlson_logistic_regression.py ${DATASET_CONFIG}
 
-# 4. Train and dump the control, like any other experiment.
-EXPERIMENT_CONFIG=TransEHR2/configs/experiments/experiment28_peristay_charlsonsubset_rev.yaml \
-TASKS=mortality \
-    sbatch --array=0-4 SLURM/slurm_run_experiment.sh
-sbatch --array=0-0 SLURM/slurm_dump_predictions.sh \
-    TransEHR2/configs/experiments/experiment28_peristay_charlsonsubset_rev.yaml
+# 4. Train and dump the TransEHR2 arms. Only mortality is reported, so only it is finetuned;
+#    the dumper skips a task with no finetuned weights.
+for CONFIG in TransEHR2/configs/experiments/experiment3{0,1}_*.yaml; do
+    EXPERIMENT_CONFIG=${CONFIG} TASKS=mortality sbatch --array=0-4 SLURM/slurm_run_experiment.sh
+    sbatch --array=0-0 SLURM/slurm_dump_predictions.sh ${CONFIG}
+done
 
-# 5. Build the table.
+# 5. Build the table: the peri-stay-only and history-only models, each against the
+#    regression.
 python scripts/report_results_tables.py --cohorts charlson
 ```
+
+`run_table1.sh launch` does all of this and nothing else: it writes only these two configs, trains and dumps only these two arms, and its report job builds only the `charlson` document.
 
 The fit is unpenalized, so it is plain maximum likelihood with no regularization strength to tune, and its decision threshold is calibrated on the validation split exactly as for every other arm. Per-fold coefficients and odds ratios are written to `charlson_coefficients.csv` in the experiment directory.
 

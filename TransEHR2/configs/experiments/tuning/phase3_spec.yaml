@@ -105,6 +105,74 @@ GRID:
 # in GPU hours.
 EXTRA_TRIALS:
 
+  # ----------------------------------------------------------------------------------------
+  # Noise floor: the same configuration, four more seeds
+  # ----------------------------------------------------------------------------------------
+  #
+  # The sweep runs one model per arm, so the spread across its six values carries no interval
+  # and on its own cannot say whether an arm differs from another or from a re-run of itself.
+  # These four trials supply the missing scale. They are identical to the centre in every
+  # setting except PRETRAIN_SEED and FINETUNE_SEED, so what varies between them is only what
+  # varies between two runs of one model: initialisation, the record-masking draws, and the
+  # shuffling order.
+  #
+  # The centre is the fifth repeat, not a seventh run. phase3_base.yaml carries
+  # PRETRAIN_SEED: 0 and FINETUNE_SEED: 0, and an extra trial inherits the arm's defaults, so
+  # the 500 arm is this set at seed 0 and the five together give the standard deviation.
+  # HISTORY_LEN_STEPS is null in the base -- use all extracted history -- which is the same
+  # condition the 500 arm reproduces, so the repeats sit at the uncropped end of the sweep.
+  #
+  # Both stages are seeded because both contribute. run_experiment.py calls set_seed once
+  # before pretraining and again before each finetune, so a finetune is determined by its own
+  # seed and the encoder it starts from; seeding only one stage would measure half the
+  # variance and understate the floor.
+  #
+  # They are extra trials rather than grid cells for the usual reason -- an empty `covers`
+  # list keeps them out of every ranking -- and here that matters more than usual: a repeat
+  # scoring above the best arm must not be selectable, or the sweep would return a history
+  # length chosen by a seed.
+  #
+  # Cost: four more allocations in each of two stages. With the array throttle at or above the
+  # trial count they add nothing to the critical path, which is one pretrain plus one finetune
+  # however wide the sweep is.
+
+  - name: noise_seed1
+    arm: tuned
+    select_on: mortality
+    overrides:
+      PRETRAIN_SEED: 1
+      FINETUNE_SEED: 1
+    description: >
+      Seeded repeat of the centre. Identical to the 500 arm except for the seeds, so the
+      spread over the repeats estimates run-to-run variability at a fixed configuration.
+
+  - name: noise_seed2
+    arm: tuned
+    select_on: mortality
+    overrides:
+      PRETRAIN_SEED: 2
+      FINETUNE_SEED: 2
+    description: >
+      Seeded repeat of the centre; see noise_seed1.
+
+  - name: noise_seed3
+    arm: tuned
+    select_on: mortality
+    overrides:
+      PRETRAIN_SEED: 3
+      FINETUNE_SEED: 3
+    description: >
+      Seeded repeat of the centre; see noise_seed1.
+
+  - name: noise_seed4
+    arm: tuned
+    select_on: mortality
+    overrides:
+      PRETRAIN_SEED: 4
+      FINETUNE_SEED: 4
+    description: >
+      Seeded repeat of the centre; see noise_seed1.
+
   - name: sharedladder
     arm: tuned
     select_on: mortality

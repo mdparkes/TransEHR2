@@ -26,7 +26,7 @@ from test_charlson_logreg import (CODE_F, CODE_MISSING, GENDER_MAP, STATIC_FEATS
                                  VARIABLE_PROPERTIES, _write_fold)
 
 from compute_charlson_index import (build_cohort, build_table, check_folds_agree,
-                                    collect_episodes, feature_availability,
+                                    cohort_members, collect_episodes, feature_availability,
                                     most_recent_earlier_admission, score_patient, write_cohort)
 from TransEHR2.data.charlson import CONDITION_KEYS, WEIGHTS
 from TransEHR2.data.cohorts import load_episode_manifest
@@ -318,6 +318,28 @@ def test_a_scored_episode_outside_the_extraction_is_dropped():
 def test_an_extracted_episode_with_no_index_is_dropped():
     cohort, _ = build_cohort({1}, {1, 2}, {1, 2}, {1, 2})
     assert cohort == [1]
+
+
+def test_an_array_side_cohort_restricts_the_manifest_and_extends_the_funnel():
+    """A member of the cohort without an index is dropped, not scored; an episode with an
+    index outside the cohort is dropped too."""
+    cohort, funnel = build_cohort({1, 2, 3}, {1, 2, 3, 4}, {1, 2, 3, 4}, {1, 2, 3, 4},
+                                  in_cohort={2, 3, 4}, cohort_name='diagnosis_history')
+    assert cohort == [2, 3]
+    assert funnel[-1] == ('  and in the diagnosis_history cohort', 2)
+    assert [count for _, count in funnel] == [3, 3, 3, 3, 2]
+
+
+def test_cohort_members_reads_the_predicate_off_every_partition(tmp_path):
+    """Membership comes from the arrays -- here a pre-admission diagnosis record -- across
+    train, val and test, so one fold covers the extraction once."""
+    data_dir = str(tmp_path / 'data')
+    _write_fold(data_dir, 'fold1', {
+        'train': [(1001, True, 55.0, CODE_F, 0.0), (1002, False, 60.0, CODE_F, 1.0)],
+        'val': [(2001, True, 70.0, CODE_F, 0.0)],
+        'test': [(3001, False, 65.0, CODE_F, 0.0)],
+    })
+    assert cohort_members(data_dir, 'fold1', 'diagnosis_history') == {1001, 2001}
 
 
 def test_the_manifest_round_trips_through_the_loader_reader(tmp_path):

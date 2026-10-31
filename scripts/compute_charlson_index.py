@@ -19,16 +19,21 @@ diagnoses is the latest `DISCHTIME` among them. That row's `HADM_ID` selects the
 The cohort
 ----------
 `--write_cohort` also writes the episode manifest the analysis runs on: the episodes for which
-all three features exist -- a Charlson index, an age and a sex. Both arms are handed that one
-file, the regression directly and the in-stay-only control through `COHORT_EPISODES` in its
-experiment config, and both resolve it by patient-episode ID through the same loader. That is
+all three features exist -- a Charlson index, an age and a sex. Every arm is handed that one
+file, the regression directly and the TransEHR2 arms through `COHORT_EPISODES` in their
+experiment configs, and all resolve it by patient-episode ID through the same loader. That is
 what puts them on the same episodes; nothing has to be argued about two predicates agreeing.
 
-Membership is deliberately *not* the array-side predicate `diagnosis_history`, which asks
-whether the text of an earlier admission's diagnoses survived extraction. Neither arm reads
-that text -- the control reads in-stay records only, and the index comes from `diagnoses.csv`
--- and it excludes episodes whose codes are perfectly available. The printed funnel shows how
-many episodes each condition removes.
+`--cohort` further restricts the manifest to one of the array-side cohorts in
+`TransEHR2.data.cohorts`. The two definitions differ: an index exists whenever an earlier
+admission discharged before the episode's `INTIME` has codes in `diagnoses.csv`, whereas
+`diagnosis_history` requires that admission's diagnosis text to have survived extraction --
+before the pre-admission cutoff and within the retained history. With
+`--cohort diagnosis_history` the manifest is the population a historical-text arm can read,
+so a TransEHR2 model reading that text can be given the same file as the regression. Members
+of the cohort without all three features are dropped and listed, and `--expect_n` halts
+before anything is written if the result is not the size the analysis is meant to run on. The printed funnel
+shows how many episodes each condition removes.
 
 Outputs
 -------
@@ -43,6 +48,9 @@ Outputs
 Usage:
     python scripts/compute_charlson_index.py TransEHR2/configs/datasets/mimic4.yaml -w 8 \
         --write_cohort
+    python scripts/compute_charlson_index.py TransEHR2/configs/datasets/mimic4.yaml -w 8 \
+        --write_cohort misc/charlson/charlson_diagnosis_history_cohort.txt \
+        --cohort diagnosis_history --expect_n 4808
     python scripts/compute_charlson_index.py TransEHR2/configs/datasets/mimic4.yaml
 """
 
@@ -63,6 +71,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from TransEHR2.data.charlson import (CONDITION_KEYS, charlson_conditions,
                                      conditions_for_code, WEIGHTS)
+from TransEHR2.data.cohorts import COHORTS
 from TransEHR2.data.statics import (MISSING_LABEL, age_observed, decode_categorical,
                                     static_offsets)
 
@@ -321,18 +330,49 @@ def feature_availability(data_dir, fold, offsets, category_map,
     return extracted, has_age, has_sex
 
 
-def build_cohort(scored, extracted, has_age, has_sex):
+def cohort_members(data_dir, fold, cohort, extracted_history_len_steps=None):
+    """The extracted episodes of one fold that a named array-side cohort keeps.
+
+    Args:
+        data_dir: Directory holding the fold subdirectories.
+        fold: Fold whose partitions to read; as for `feature_availability`.
+        cohort: A name in `TransEHR2.data.cohorts.COHORTS`.
+        extracted_history_len_steps: As for `feature_availability`.
+
+    Returns:
+        Set of patient-episode IDs.
+    """
+    from TransEHR2.data.cohorts import cohort_mask
+    from TransEHR2.data.preprocessing import load_dataset, load_episode_ids
+
+    members = set()
+    for split in ('train', 'val', 'test'):
+        base = os.path.join(data_dir, fold, split)
+        if not os.path.exists(os.path.join(base, 'metadata.pkl')):
+            continue
+        # The predicate is applied here rather than by the loader, which refuses a partition
+        # the cohort leaves empty.
+        dataset = load_dataset(base, extracted_history_len_steps=extracted_history_len_steps)
+        ids = load_episode_ids(base, n_episodes=dataset.n_extracted_episodes)
+        members.update(ids[cohort_mask(dataset, cohort)].tolist())
+    return members
+
+
+def build_cohort(scored, extracted, has_age, has_sex, in_cohort=None, cohort_name=None):
     """The episodes the analysis runs on, and the funnel that produced them.
 
     An episode belongs to the cohort exactly when all three features exist: a Charlson index,
-    an age and a sex. Defining it this way rather than by a predicate over the arrays is what
-    lets both arms be handed one list -- see `TransEHR2.data.cohorts.manifest_mask`.
+    an age and a sex -- and, when `in_cohort` is given, when it is also a member of that
+    array-side cohort. The result is one explicit list, which is what lets every arm be handed
+    the same file -- see `TransEHR2.data.cohorts.manifest_mask`.
 
     Args:
         scored: IDs with a Charlson index.
         extracted: IDs present in the extracted arrays.
         has_age: IDs with an age on record.
         has_sex: IDs with a sex on record.
+        in_cohort: IDs of an array-side cohort to restrict to, or None for no restriction.
+        cohort_name: Name of that cohort, for the funnel.
 
     Returns:
         Tuple of (cohort, funnel) where `cohort` is the sorted ID list and `funnel` is an
@@ -347,6 +387,9 @@ def build_cohort(scored, extracted, has_age, has_sex):
         ('  and with an age on record', len(with_age)),
         ('  and with a sex on record', len(with_both)),
     ]
+    if in_cohort is not None:
+        with_both = with_both & in_cohort
+        funnel.append((f'  and in the {cohort_name or "given"} cohort', len(with_both)))
     return sorted(with_both), funnel
 
 
@@ -452,11 +495,18 @@ def main(argv=None):
     parser.add_argument('--write_cohort', nargs='?', const=DEFAULT_COHORT, default=None,
                         metavar='PATH',
                         help=f'Also write the episode manifest the analysis runs on -- the '
-                             f'episodes with an index, an age and a sex. This is the file both '
-                             f'arms are given (default path: {DEFAULT_COHORT})')
+                             f'episodes with an index, an age and a sex. This is the file every '
+                             f'arm is given (default path: {DEFAULT_COHORT})')
     parser.add_argument('--cohort_fold', default=None, metavar='FOLD',
                         help='Fold whose extracted arrays supply age and sex when building the '
                              'manifest (default: the first fold that has any)')
+    parser.add_argument('--cohort', choices=COHORTS, default=None,
+                        help='Also restrict the manifest to this array-side cohort, so an arm '
+                             'that reads pre-admission records can be given the same file '
+                             '(default: no restriction)')
+    parser.add_argument('--expect_n', type=int, default=None, metavar='N',
+                        help='Halt without writing the manifest unless it names exactly N '
+                             'episodes')
     args = parser.parse_args(argv)
 
     with open(args.dataset_config) as handle:
@@ -513,13 +563,30 @@ def main(argv=None):
         data_dir, cohort_fold, offsets, variable_properties['Gender'].get('category_map', {}),
         extracted_history,
     )
+    in_cohort = None
+    if args.cohort:
+        in_cohort = cohort_members(data_dir, cohort_fold, args.cohort, extracted_history)
     cohort, funnel = build_cohort(set(frame['episode_id'].tolist()), extracted, has_age,
-                                 has_sex)
+                                 has_sex, in_cohort, args.cohort)
     width = max(len(label) for label, _ in funnel)
     for label, count in funnel:
         print(f'  {label:{width}}  {count}')
+    if in_cohort is not None:
+        # The funnel only shows what the restriction kept. The members it could not keep are
+        # the ones that would make the manifest smaller than the cohort it is named after.
+        unscorable = sorted(in_cohort - set(cohort))
+        print(f'  {args.cohort} cohort: {len(in_cohort)} episodes, {len(unscorable)} of them '
+              f'without all three features')
+        if unscorable:
+            shown = ', '.join(str(i) for i in unscorable[:20])
+            more = '' if len(unscorable) <= 20 else f', ... ({len(unscorable)} total)'
+            print(f'    {shown}{more}')
     if not cohort:
         print('\nThe cohort is empty, so there is nothing to run on.', file=sys.stderr)
+        return 1
+    if args.expect_n is not None and len(cohort) != args.expect_n:
+        print(f'\nThe manifest would name {len(cohort)} episodes, not the {args.expect_n} '
+              f'--expect_n requires. Nothing written.', file=sys.stderr)
         return 1
 
     # Every fold has to be able to select the whole manifest, or the control would train on
@@ -540,12 +607,12 @@ def main(argv=None):
         return 1
     print(f'  every fold carries all {len(cohort)} of them')
 
-    path = write_cohort(
-        args.write_cohort, cohort,
-        'Charlson analysis cohort: episodes with a Charlson index, an age and a sex.',
-    )
+    description = 'Charlson analysis cohort: episodes with a Charlson index, an age and a sex'
+    if args.cohort:
+        description += f', in the {args.cohort} cohort'
+    path = write_cohort(args.write_cohort, cohort, description + '.')
     print(f'\nWrote {len(cohort)} episode ids to {path}')
-    print('Name this file in COHORT_EPISODES for the control experiment, and pass it to '
+    print('Name this file in COHORT_EPISODES for the TransEHR2 arms, and pass it to '
           'run_charlson_logistic_regression.py --cohort_episodes.')
     return 0
 
