@@ -346,13 +346,13 @@ def draw(counts: dict, output: str, title: str, dpi: int = 300,
 
     handles = [
         Patch(facecolor=ALL_COLOUR, alpha=0.16, edgecolor=HISTORY_COLOUR,
-              label=f'All patients  ({n_all:,})'),
+              label=f'All patients ({n_all:,})'),
         Patch(facecolor=HISTORY_COLOUR, alpha=0.20, edgecolor=HISTORY_COLOUR,
-              label=f'Any pre-admission record  ({n_history:,})'),
+              label=f'Any historical record ({n_history:,})'),
         Patch(facecolor=SUMMARY_COLOUR, alpha=0.42, edgecolor=SUMMARY_COLOUR,
-              label=f'At least one discharge summary  ({n_sum:,})'),
+              label=f'At least one historical discharge summary ({n_sum:,})'),
         Patch(facecolor=DIAGNOSIS_COLOUR, alpha=0.42, edgecolor=DIAGNOSIS_COLOUR,
-              label=f'At least one discharge diagnosis  ({n_diag:,})'),
+              label=f'At least one historical discharge diagnosis ({n_diag:,})'),
     ]
     ax.legend(handles=handles, loc='upper center', bbox_to_anchor=(0.5, 0.0),
               frameon=False, fontsize=10, handlelength=1.4, borderpad=0.2)
